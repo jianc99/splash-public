@@ -260,7 +260,8 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   const std::optional<HostMemory> host = sampleHost();
   // The rule at this sample, from the one the governor last moved.
   HostRule rule = hostRule_;
-  rule.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_, growthUnitBytes_, bandWaived_);
+  rule.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_, growthUnitBytes_,
+              ledger_.hostRefusedWaitingBytes(), bandWaived_);
   MemoryGovernorSnapshot result = snapshot(host, rule);
   result.hostTelemetry = queryHostTelemetry();
   return result;
@@ -328,13 +329,15 @@ MemoryGovernor::Scope::~Scope() {
 }
 
 void MemoryGovernor::HostRule::sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
-                                      MemoryPressure system, uint64_t hysteresisBytes, bool reclaimShort) noexcept {
+                                      MemoryPressure system, uint64_t hysteresisBytes, uint64_t refusedWaitingBytes,
+                                      bool reclaimShort) noexcept {
   measured_ = host.has_value();
   headroom_ = host ? spareHeadroom(*host, spareReserve, inFlight) : 0;
   system_ = system;
+  const uint64_t reach = refusedWaitingBytes ? std::min(hysteresisBytes, refusedWaitingBytes) : hysteresisBytes;
   if (!measured_ || headroom_ < kHostMarginBytes)
     constrained_ = true;
-  else if (reclaimShort || headroom_ - kHostMarginBytes >= hysteresisBytes)
+  else if (reclaimShort || headroom_ - kHostMarginBytes >= reach)
     constrained_ = false;
 }
 
@@ -364,7 +367,8 @@ uint64_t MemoryGovernor::HostRule::deficitBytes(uint64_t refusedWaitingBytes, ui
 }
 
 void MemoryGovernor::sampleHostRule(const std::optional<HostMemory> &host) noexcept {
-  hostRule_.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_, growthUnitBytes_, bandWaived_);
+  hostRule_.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_, growthUnitBytes_,
+                   ledger_.hostRefusedWaitingBytes(), bandWaived_);
   // A waiver lasts the band it ended: the next band starts unwaived.
   if (!hostRule_.constrained())
     bandWaived_ = false;
@@ -439,12 +443,12 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
   growthUnitBytes_ = ledger_.largestGrowthUnit();
   sampleHostRule(sampleHost());
   std::optional<FreeResult> pass;
-  uint64_t deficit = 0;
   if (hostRule_.level() == MemoryPressure::Critical) {
     ledger_.dropToFloors();
     pass = hostPass(std::numeric_limits<uint64_t>::max(), true, true);
   } else {
-    deficit = hostRule_.deficitBytes(ledger_.hostRefusedWaitingBytes(), ledger_.returning().landingBytes);
+    const uint64_t deficit =
+        hostRule_.deficitBytes(ledger_.hostRefusedWaitingBytes(), ledger_.returning().landingBytes);
     // While the host lacks nothing past its margin its claim may take only
     // cache, which the pools rank above: they grow first, so that the cache
     // the pass gives back buys their units first. With a deficit it may
@@ -462,11 +466,9 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
   }
   if (pass) {
     // Only a pass while the host is short can waive the band: one that found
-    // nothing to take, since only other applications could return the rest,
-    // or one that met the deficit of the claims the host refused, which the
-    // band would hold to their wait limit otherwise (amend/M.md B3).
+    // nothing to take, since only other applications could return the rest.
     if (hostRule_.constrained())
-      bandWaived_ = pass->outcome == FreeOutcome::Short || (deficit && pass->outcome == FreeOutcome::Met);
+      bandWaived_ = pass->outcome == FreeOutcome::Short;
     if (pass->nowBytes || pass->laterBytes)
       nextHostPassMilliseconds_ = nowMilliseconds + kHostSettleMilliseconds;
   }

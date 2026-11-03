@@ -851,20 +851,37 @@ void testDeficitCountsHostRefusedClaimsNotAnIdleMargin() {
 // within two control passes (amend/M.md B3; design/M.md T6, starts held in
 // the band to their wait limit): what its refusal asked counts in the
 // deficit whatever the free() of that refusal decided, the deficit pass runs
-// in the band or not, and in the band a pass that met the deficit ends it.
-// In the band as on the M6 (the store a unit below its cap, H = 1 GiB, 1.1
-// GiB of headroom, a start of 300 MiB) and outside it as on the Studio (the
-// store at its cap, H = 0, 1.5 GiB of headroom, a start of 600 MiB).
+// in the band or not, and the band ends once the headroom clears the margin
+// by what the start asks, however the pass that freed it ended. In the band
+// as on the M6 (the store a unit below its cap, H = 1 GiB, 1.1 GiB of
+// headroom, a start of 300 MiB), over cache that frees at once and over
+// cache that frees only once its copies land (the pass Pending), and with
+// the start already within the headroom past the margin (1.2 GiB, a start
+// of 103.5 MiB, a KV extent: no pass runs); and outside it as on the Studio
+// (the store at its cap, H = 0, 1.5 GiB of headroom, a start of 600 MiB).
 void testAHostRefusedStartIsAdmittedWithinTwoPasses() {
-  for (const bool band : {true, false}) {
-    const uint64_t headroom = band ? 1100 * kMiB : 1536 * kMiB;
-    const uint64_t need = band ? 300 * kMiB : 600 * kMiB;
+  struct Case final {
+    bool band;
+    uint64_t headroom, need;
+    bool later;
+    const char *what;
+  };
+  for (const Case &scenario :
+       {Case{true, 1100 * kMiB, 300 * kMiB, false, "a start the host refused waited in the band after a pass met its deficit"},
+        Case{true, 1100 * kMiB, 300 * kMiB, true,
+             "a start the host refused waited in the band after its deficit landed"},
+        Case{true, 1200 * kMiB, 108'527'616, false,
+             "a start the host refused waited in the band although the headroom past the margin held it"},
+        Case{false, 1536 * kMiB, 600 * kMiB, false, "no pass freed for a start the host refused outside the band"}}) {
+    const bool band = scenario.band;
+    const uint64_t headroom = scenario.headroom;
+    const uint64_t need = scenario.need;
     Fixture fixture(host(headroom + kGiB + 2 * kGiB));
     FakeElasticPool experts("experts", fixture.memory, kGiB, 1, band ? 2 : 1, 3, 1, 0.2, 60.0);
     fixture.ledger().addPool(experts);
     TestSource cache("cache", &fixture.memory);
     for (uint64_t key = 1; key <= 16; ++key)
-      cache.units.push_back(unit(key, 128 * kMiB, 0.1));
+      cache.units.push_back(unit(key, 128 * kMiB, 0.1, scenario.later));
     fixture.memory.hold("cache", 2 * kGiB);
     fixture.ledger().addSource(cache);
     static_cast<void>(fixture.governor->evaluate());
@@ -882,10 +899,10 @@ void testAHostRefusedStartIsAdmittedWithinTwoPasses() {
       require(result.failure == metal::AllocationFailure::HostPressure, "the start was not refused by the host");
       static_cast<void>(fixture.governor->free(start, fixture.governor->need(start)));
       static_cast<void>(fixture.pass(1.0 + 1.5 * pass));
+      cache.land();
     }
     admitted = admitted || static_cast<bool>(fixture.allocate(start, need));
-    require(admitted, band ? "a start the host refused waited in the band after a pass met its deficit"
-                           : "no pass freed for a start the host refused outside the band");
+    require(admitted, scenario.what);
   }
 }
 

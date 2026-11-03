@@ -311,7 +311,9 @@ private:
   // amend/M.md B3, B4): its headroom h is its spare memory above the spare
   // reserve, beside what is being allocated. The band begins when h falls
   // below the margin M (kHostMarginBytes) or cannot be measured, and ends
-  // once h clears M by the largest unit a pool grows by, or once a host pass
+  // once h clears M by the largest unit a pool grows by, or by what the
+  // claims the host refused wait for while that is less (amend/M.md B3: the
+  // band never holds them once h has room for them), or once a host pass
   // finds nothing to take. Floor work passes; in-service work passes while h
   // keeps M beyond it at normal pressure, and, once nothing in place meets
   // it, as a claim the host exempts; growth within its credit passes, leaving
@@ -321,7 +323,8 @@ private:
   class HostRule final {
   public:
     void sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
-                MemoryPressure system, uint64_t hysteresisBytes, bool reclaimShort) noexcept;
+                MemoryPressure system, uint64_t hysteresisBytes, uint64_t refusedWaitingBytes,
+                bool reclaimShort) noexcept;
     [[nodiscard]] bool admits(ClaimClass cls, uint64_t bytes, bool hostExempt, uint64_t creditBytes) const noexcept;
     // What the host lacks of M and of what the claims it refused wait for,
     // beyond what is landing; nothing measured, nothing lacking.
@@ -377,8 +380,8 @@ private:
   // pool's growth runs inside does not read the pool.
   uint64_t growthUnitBytes_ = 0;
   // When the host has settled from the last pass that returned memory, and
-  // whether the last host pass in the band found nothing to take or met the
-  // deficit of the claims the host refused (the band's waiver).
+  // whether the last host pass in the band found nothing to take (the band's
+  // waiver).
   double nextHostPassMilliseconds_ = 0.0;
   bool bandWaived_ = false;
 };
