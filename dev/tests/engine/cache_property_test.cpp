@@ -230,19 +230,23 @@ public:
               "a unit released " + std::to_string(released) + " bytes, weighed at " + std::to_string(victim.bytes));
     }
     // A unit's later steps free once the transfers before them land, which
-    // the claim's retries take: what was started lands, and the query's
+    // the claim's retries take: what was started lands, the pages that frees
+    // past the landing pages counted when it started count, and the query's
     // units are taken again until they free what was weighed or none goes.
+    const auto landingOf = [&] { return cache_.returning().landingPages[static_cast<size_t>(form)]; };
     for (uint32_t retry = 0; retry < 64 && (freed < predicted || freedPages < predictedPages); ++retry) {
+      const uint64_t before = pool_.allocatedBytes();
+      const uint32_t freeBefore = pool_.freePageCount(form), landingBefore = landingOf();
       tier_.complete();
       static_cast<void>(cache_.pollTransfers());
+      const uint32_t freeAfter = pool_.freePageCount(form), landingAfter = landingOf();
+      const uint32_t landed = landingBefore - std::min(landingBefore, landingAfter);
+      freedPages += freeAfter - std::min(freeAfter, freeBefore + landed);
       std::optional<engine::Victim> unit = cache_.peek(query, nullptr);
       while (unit && unit->later && claim.timing == NeedTiming::Immediate)
         unit = cache_.peek(query, &*unit);
-      if (!unit)
-        break;
-      const uint64_t before = pool_.allocatedBytes();
       const uint32_t pagesBefore = pagesOf();
-      const FreeResult taken = cache_.take(query, *unit);
+      const FreeResult taken = unit ? cache_.take(query, *unit) : FreeResult{};
       freed += before - std::min(before, pool_.allocatedBytes()) + taken.laterBytes;
       const uint32_t pagesAfter = pagesOf();
       freedPages += pagesAfter - std::min(pagesAfter, pagesBefore);

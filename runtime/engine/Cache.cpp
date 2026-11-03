@@ -1272,6 +1272,15 @@ std::optional<engine::Victim> Cache::ReclaimPlan::weigh(Weighed weighed) {
   }
   if (!weighed.changed)
     return std::nullopt;
+  if (walk.device) {
+    // The Full extents its landings complete leave as they land: the units
+    // after it reach no further than the pages left.
+    constexpr auto full = static_cast<size_t>(kv::PageForm::Full);
+    const uint32_t completed = completedExtents(forms_[full].freePages + weighed.landing[full],
+                                                landing_[full] - weighed.landing[full], extentPages_,
+                                                walk.keeps(kv::PageForm::Full));
+    reusable_ -= std::min(reusable_, completed * extentPages_);
+  }
   return engine::Victim{.bytes = weighed.bytes + (walk.device ? laterBytes(weighed.landing) : 0),
                         .pages = weighed.pages,
                         .form = walk.form,
