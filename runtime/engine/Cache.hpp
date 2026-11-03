@@ -596,7 +596,8 @@ public:
                     const std::function<std::shared_ptr<const CompositeState>()> &copy);
   // Gives the request the matched chain up to its state. Disk-only blocks
   // get fresh pages and start their restores; the request waits on
-  // kvRestoreStatus() before it runs. Pages are admitted like ensureTokens().
+  // kvRestoreStatus() before it runs. Pages are admitted like ensureTokens(),
+  // those its moved blocks take too: from the free ones beyond `held`.
   // By the request's mode: a Spill request takes a disk-only block past the
   // dense history as an Index page and restores its index alone, and holds
   // spilled blocks as they are. A Resident request restores disk-only blocks

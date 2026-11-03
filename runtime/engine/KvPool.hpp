@@ -170,11 +170,12 @@ public:
   // that takes what both hold (ExtentStorage::copyPages) and its references,
   // as compactExtent() moves them, and frees it; all of them or none. The
   // pages of form `to` come as acquirePages() hands them out, from the free
-  // pages (the form's runway among them) and then from extents it allocates;
-  // a refused extent moves nothing and stays for the retry. std::logic_error,
-  // moving nothing, for a page that is free, already of form `to` or listed
-  // twice, and when the storage refuses the copy.
-  [[nodiscard]] KvPageMoveResult movePages(std::span<const uint32_t> pages, kv::PageForm to);
+  // pages (the form's runway among them) beyond the `held` ones and then
+  // from extents it allocates; a refused extent moves nothing and stays for
+  // the retry. std::logic_error, moving nothing, for a page that is free,
+  // already of form `to` or listed twice, and when the storage refuses the
+  // copy.
+  [[nodiscard]] KvPageMoveResult movePages(std::span<const uint32_t> pages, kv::PageForm to, uint32_t held = 0);
   [[nodiscard]] uint64_t allocatedBytes() const noexcept;
   // Pages of the form's allocated extents no request holds: free, or held
   // only by the cache.

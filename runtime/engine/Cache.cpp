@@ -3222,7 +3222,8 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
     }
   }
   if (!unspilled.empty()) {
-    const KvPageMoveResult moved = pool_.movePages(unspilled, kv::PageForm::Full);
+    const KvPageMoveResult moved =
+        pool_.movePages(unspilled, kv::PageForm::Full, held[static_cast<size_t>(kv::PageForm::Full)]);
     if (!moved.granted()) {
       giveBack();
       return {TokenAdmissionFailure::Denied, static_cast<uint32_t>(unspilled.size()),

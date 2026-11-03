@@ -4886,6 +4886,35 @@ void testUnspillOnlyAsTheOnlyHolder() {
   spill.cache.endRequest(4);
 }
 
+// A Resident request that moves spilled blocks back to Full pages takes
+// them from the free pages beyond those waiting claims ranked above it hold
+// (R1), as it takes its other pages: with every free Full page held and no
+// extent to allocate, its restore is denied and moves nothing; with none
+// held, it moves them.
+void testAnUnspillLeavesTheHeldFreePages() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
+  spill.start(1, prompt, 6);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  spill.publishState(spill.block(1, 5));
+  spill.cache.endRequest(1);
+  CacheLookup lookup = spill.cache.lookup(prompt, {});
+  spill.cache.beginRequest(2);
+  const uint32_t free = spill.pool.freePageCount(kv::PageForm::Full);
+  spill.storage.growthBlocked = true;
+  require(free >= 4 && spill.cache.restoreRequest(2, lookup, {free, 0, 0}).failure == TokenAdmissionFailure::Denied &&
+              spill.pool.freePageCount(kv::PageForm::Full) == free && spill.cache.spillSnapshot().unspills == 0,
+          "a Resident restore moved spilled blocks onto free pages waiting claims hold");
+  spill.storage.growthBlocked = false;
+  require(spill.cache.restoreRequest(2, lookup, {}).granted() && spill.cache.spillSnapshot().unspills == 4,
+          "the Resident restore did not move the spilled blocks with no page held");
+  spill.tier.complete();
+  static_cast<void>(spill.cache.pollTransfers());
+  spill.cache.checkInvariants();
+  lookup = {};
+  spill.cache.endRequest(2);
+}
+
 // A writer whose block exists moves onto its page while a write reads it,
 // whose bytes are final, whatever the mode of the request that writes it;
 // while a restore fills it, the writer keeps its own page.
@@ -6676,6 +6705,7 @@ int main() {
     testConversionWaitsForItsPagesToSpill();
     testConversionAtTheWallFindsTheRunway();
     testUnspillOnlyAsTheOnlyHolder();
+    testAnUnspillLeavesTheHeldFreePages();
     testWritersMoveOntoPagesBeingWritten();
     testQuotaGivesUpOnlyCopiesNothingReads();
     testQuotaKeepsTheSpilledLeafOfAStateInRam();

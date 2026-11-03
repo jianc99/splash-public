@@ -162,7 +162,7 @@ kv::PageForm KvPool::form(uint32_t page) const {
   return extent.form;
 }
 
-KvPageMoveResult KvPool::movePages(std::span<const uint32_t> pages, kv::PageForm to) {
+KvPageMoveResult KvPool::movePages(std::span<const uint32_t> pages, kv::PageForm to, uint32_t held) {
   std::vector<uint32_t> moving(pages.begin(), pages.end());
   std::ranges::sort(moving);
   if (std::ranges::adjacent_find(moving) != moving.end())
@@ -172,7 +172,7 @@ KvPageMoveResult KvPool::movePages(std::span<const uint32_t> pages, kv::PageForm
       throw std::logic_error("KV page " + std::to_string(page) +
                              " is free or of the form it would move to");
   }
-  const KvPageAcquisition destinations = takeFreePages(static_cast<uint32_t>(moving.size()), to);
+  const KvPageAcquisition destinations = takeFreePages(static_cast<uint32_t>(moving.size()), to, held);
   if (!destinations.granted())
     return {{}, destinations.failure};
 
