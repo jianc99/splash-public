@@ -512,6 +512,79 @@ void testARestoredStateIsPromotedInAClaim() {
   }
 }
 
+// A unit of `bytes` that leaves memory once it lands, at no cost: a claim
+// whose free() takes it waits for it.
+class LandingUnit final : public VictimSource {
+public:
+  explicit LandingUnit(uint64_t bytes) : bytes_(bytes) {}
+  [[nodiscard]] std::string_view name() const noexcept override { return "landing"; }
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
+    if (after || taken_)
+      return std::nullopt;
+    return Victim{.key = 1, .bytes = bytes_, .later = true};
+  }
+  FreeResult take(const VictimQuery &, const Victim &) override {
+    taken_ = true;
+    return {FreeOutcome::Pending, 0, bytes_};
+  }
+
+private:
+  uint64_t bytes_;
+  bool taken_ = false;
+};
+
+// R1, R2: a lane below a claim that waits for bytes lacks, when the host
+// refuses its extent, the pages it adds beyond the free ones with those the
+// claim holds left free, which its one free() takes in place from the
+// cache: its retry is granted, and it keeps its lane. A Foreground claim
+// waits for 8 pages' bytes beside 2 free pages; a Normal lane decoding
+// beside it needs a page with the host short of its margin (the base asked
+// for that page alone, was refused the held pages again, and suspended the
+// lane).
+void testALaneBelowAWaitingClaimTakesWhatItLacksBeyondTheHeldPages() {
+  test::EngineHarness harness({.memory = test::FakeMemory::Config{}});
+  constexpr uint32_t page = KvCache::pageTokens;
+  harness.engine.submit(harness.request(1, std::vector<uint32_t>(8 * page + 1, 7)));
+  harness.runUntilIdle();
+  harness.model.decodeFinishes = false;
+  EngineRequest lane = harness.request(2, std::vector<uint32_t>(page + 1, 3));
+  lane.maxNewTokens = 4 * page;
+  harness.engine.submit(std::move(lane));
+  harness.runUntil([&] { return harness.events.outputs.contains(2) && !harness.engine.commandInFlight(); },
+                   "the lane did not decode");
+  // The claim takes the landing alone: the cached chain, which costs
+  // nothing at the harness's rates, is set aside meanwhile.
+  MemoryLedger &ledger = harness.governor->ledger();
+  LandingUnit landing(8 * harness.cache.bytesPerPage(kv::PageForm::Full));
+  ledger.removeSource(harness.cache);
+  ledger.addSource(landing);
+  const ClaimId waiter = ledger.open({.cls = ClaimClass::InService, .rank = {.priority = 2}});
+  const ClaimId below = ledger.open({.cls = ClaimClass::InService, .rank = {.priority = 1}});
+  require(ledger.free(waiter, {.bytes = 8 * harness.cache.bytesPerPage(kv::PageForm::Full)}, 0, false, false)
+                  .outcome == FreeOutcome::Pending &&
+              ledger.claim(waiter).waiting && ledger.heldPages(below)[0] == 8,
+          "the Foreground claim did not wait for 8 pages' bytes");
+  ledger.close(below);
+  ledger.removeSource(landing);
+  ledger.addSource(harness.cache);
+  harness.memory->setHost(harness.memory->hostBytes() - (2ULL << 30) - kHostMarginBytes / 2, MemoryPressure::Normal);
+  harness.runUntil(
+      [&] {
+        return harness.events.outputs.at(2).size() >= 2 * page || harness.engine.snapshot().resourceSuspensions;
+      },
+      "the lane neither decoded past its next page nor was suspended");
+  const uint64_t suspensions = harness.engine.snapshot().resourceSuspensions;
+  const uint32_t free = harness.pool.freePageCount(kv::PageForm::Full);
+  require(suspensions == 0 && free >= 8,
+          "a lane below a waiting claim refused an extent by the host did not take what it lacked beyond the held "
+          "pages, or took them: " +
+              std::to_string(suspensions) + " suspensions, " + std::to_string(free) + " free pages");
+  ledger.close(waiter);
+  harness.memory->setHost(test::FakeMemory::Config{}.otherBytes, MemoryPressure::Normal);
+  harness.runUntilIdle();
+  require(harness.events.completedCount == 2 && harness.events.failedCount == 0, "the lane did not finish");
+}
+
 // L7: a command that captures a checkpoint and the prompt's replay point
 // reserves the replay point's buffers beside the checkpoint's in the replay
 // point's claim, and takes the checkpoint's only when refused. A checkpoint
@@ -686,6 +759,8 @@ std::span<const test::TestCase> rulesTests() {
       {"testQuotaWaitIsNotAMemoryClaim", testQuotaWaitIsNotAMemoryClaim},
       {"testConversionVsStoreFollowsValue", testConversionVsStoreFollowsValue},
       {"testPlacementOncePerCandidatePerState", testPlacementOncePerCandidatePerState},
+      {"testALaneBelowAWaitingClaimTakesWhatItLacksBeyondTheHeldPages",
+       testALaneBelowAWaitingClaimTakesWhatItLacksBeyondTheHeldPages},
       {"testARestoredStateIsPromotedInAClaim", testARestoredStateIsPromotedInAClaim},
       {"testAReplayPointBesideACheckpointIsReservedInAClaim", testAReplayPointBesideACheckpointIsReservedInAClaim},
       {"testEnginesOnOneGovernorOfferTheCacheOnce", testEnginesOnOneGovernorOfferTheCacheOnce},

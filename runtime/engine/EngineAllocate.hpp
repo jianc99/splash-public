@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <limits>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -44,13 +45,15 @@ inline bool memoryDenied(const model::ModelMemoryAdmission &admission) noexcept 
 inline bool memoryDenied(const StateBuffers &buffers) noexcept { return !buffers.granted(); }
 
 // The part of a refused need that memory already allocated meets in place:
-// the pages of the refused form it lacks beyond the free ones not held for
-// claims ranked above it (`held`), the pooled state buffers a lane's
+// the pages of the refused form it lacks beyond the free ones, with those
+// claims ranked above it hold (`held`) left free, as a page is handed out
+// only beyond them (KvPool::acquirePages); the pooled state buffers a lane's
 // activation lacks, one state's buffers.
 inline std::optional<Need> inPlace(const TokenAdmission &admission, const std::array<uint32_t, 3> &held) {
-  const uint32_t heldPages = held[static_cast<size_t>(admission.form)];
-  const uint32_t free = admission.availablePages > heldPages ? admission.availablePages - heldPages : 0;
-  return Need{.pages = admission.additionalPages > free ? admission.additionalPages - free : 0,
+  const uint64_t wanted = uint64_t{admission.additionalPages} + held[static_cast<size_t>(admission.form)];
+  return Need{.pages = static_cast<uint32_t>(
+                  std::min<uint64_t>(wanted > admission.availablePages ? wanted - admission.availablePages : 0,
+                                     std::numeric_limits<uint32_t>::max())),
               .form = admission.form};
 }
 
