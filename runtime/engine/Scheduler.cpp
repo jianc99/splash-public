@@ -130,6 +130,7 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
     throw std::invalid_argument("resource replay must leave an input token");
   request.spec.prefillTokens = replayTokens;
   request.promptProcessed = processed;
+  request.rowsCounted = processed;
   request.phase = Phase::Prefill;
   request.suspended = false;
 }
@@ -697,8 +698,12 @@ std::vector<uint64_t> Scheduler::commit(const BatchPlan &plan, const PlanInputs 
         leftOut.push_back(id);
     counters_.passCommands += plan.passes > 1;
     ++counters_.prefillBatches;
-    for (const BatchItem &item : plan.items)
-      counters_.prefillRows += item.tokenCount;
+    for (const BatchItem &item : plan.items) {
+      Request &request = get(item.requestId);
+      const uint32_t end = item.promptOffset + item.tokenCount;
+      counters_.prefillRows += end - std::clamp(request.rowsCounted, item.promptOffset, end);
+      request.rowsCounted = std::max(request.rowsCounted, end);
+    }
     // What planning counted for this plan, as next() made it, and the lanes
     // now overdue, which stay so to their prompt's end.
     if (lastPlanned_ && samePlan(lastPlanned_->plan, plan)) {
@@ -866,6 +871,8 @@ void Scheduler::dropStaleDecodeDebt() noexcept {
 double Scheduler::prefillMilliseconds(const model::CommandWork &work) const noexcept {
   return cost_.price(work);
 }
+
+double Scheduler::weightReadMillisecondsPerByte() const noexcept { return cost_.weightReadRate(); }
 
 double Scheduler::decodeTokenMilliseconds() const noexcept {
   return decodeTokenWeight_ > 0.0 ? decodeTokenTime_ / decodeTokenWeight_ : 0.0;
