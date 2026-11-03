@@ -712,7 +712,8 @@ void testSourceOrderIsKeptWithinASource() {
 
 // A source's units keyed by their place in its order, as the cache's
 // reclaims are (steps from its state as it stands): taking one moves every
-// unit after it up a place.
+// unit after it up a place. Cumulative, taking one takes every unit before
+// it too, as taking a reclaim takes the steps before it.
 class PlacedSource final : public VictimSource {
 public:
   [[nodiscard]] std::string_view name() const noexcept override { return "placed"; }
@@ -725,12 +726,19 @@ public:
     return victim;
   }
   FreeResult take(const VictimQuery &, const Victim &victim) override {
-    taken.push_back(units.at(victim.key).first);
-    units.erase(units.begin() + static_cast<std::ptrdiff_t>(victim.key));
-    return {.nowBytes = victim.bytes};
+    const size_t first = cumulative ? 0 : victim.key;
+    uint64_t bytes = 0;
+    for (size_t place = first; place <= victim.key; ++place) {
+      taken.push_back(units.at(place).first);
+      bytes += units[place].second.bytes;
+    }
+    units.erase(units.begin() + static_cast<std::ptrdiff_t>(first),
+                units.begin() + static_cast<std::ptrdiff_t>(victim.key + 1));
+    return {.nowBytes = bytes};
   }
   std::vector<std::pair<uint64_t, Victim>> units;  // the test's name for each unit, and the unit
   std::vector<uint64_t> taken;
+  bool cumulative = false;
 };
 
 // free() takes the units its dry run chose from a source whose keys are
@@ -752,6 +760,38 @@ void testUnitsKeyedByTheirPlaceAreTakenAsChosen() {
   require(placed.taken == std::vector<uint64_t>{1, 3, 4} && other.taken == std::vector<uint64_t>{5} &&
               placed.units.size() == 1 && placed.units.front().first == 2,
           "free() did not take the units its dry run chose from a source keyed by place");
+}
+
+// A state whose buffers the model's pool keeps, refilling those a lane
+// starts from (QwenStateStorage::idleBytes), here every state's, meets none
+// of a need of bytes alone. Between two units free() chooses from a source
+// whose units are cumulative, as the cache's reclaims are, it goes with the
+// later one, at its cost: free() takes what its dry run weighed, the units
+// after them as weighed too, or nothing once that cost passes the benefit.
+void testAStateThePoolKeepsGoesWithTheNextUnitOfItsSource() {
+  for (const double benefit : {3.1, 3.3}) {
+    MemoryLedger ledger;
+    PlacedSource placed;
+    placed.cumulative = true;
+    const Victim state{.stateBuffers = 1, .cost = {.onceSeconds = 0.1}};
+    placed.units = {{1, unit(0, kGiB, 1.0)}, {2, state}, {3, unit(0, kGiB, 1.0)}, {4, state}, {5, unit(0, kGiB, 1.0)}};
+    ledger.addSource(placed);
+    ledger.setBufferBytes([](uint32_t) { return uint64_t{0}; });
+    ClaimSpec spec = request(1, RequestPriority::Normal);
+    spec.benefitSeconds = benefit;
+    const ClaimId claim = ledger.open(spec);
+    FreeResult freed;
+    try {
+      freed = ledger.free(claim, {.bytes = 3 * kGiB}, 0, false, false);
+    } catch (const std::logic_error &error) {
+      require(false, std::string("free() took other units than its dry run weighed: ") + error.what());
+    }
+    require(benefit < 3.2 ? freed.outcome == FreeOutcome::Short && placed.taken.empty()
+                          : freed.outcome == FreeOutcome::Met && freed.nowBytes == 3 * kGiB &&
+                                placed.taken == std::vector<uint64_t>{1, 2, 3, 4, 5},
+            benefit < 3.2 ? "free() took units whose cost with the states they take passed the benefit"
+                          : "free() did not take the states with the units after them, as its dry run weighed");
+  }
 }
 
 // At equal cost per byte: a unit that frees memory now, then the source
@@ -1931,6 +1971,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testCheapestPerByteFirstAcrossSources", testCheapestPerByteFirstAcrossSources},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
       {"testUnitsKeyedByTheirPlaceAreTakenAsChosen", testUnitsKeyedByTheirPlaceAreTakenAsChosen},
+      {"testAStateThePoolKeepsGoesWithTheNextUnitOfItsSource", testAStateThePoolKeepsGoesWithTheNextUnitOfItsSource},
       {"testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst",
        testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst},
       {"testClassBoundsEligibility", testClassBoundsEligibility},

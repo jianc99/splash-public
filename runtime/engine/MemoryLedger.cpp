@@ -94,7 +94,8 @@ struct MemoryLedger::Account final {
 
 // One unit a dry run chose: a source's (by index, after the units of the
 // source it passed over since the source's previous choice), or a pool's
-// unit or pending growth (by account).
+// unit or pending growth (by account). A unit the run carries to a later
+// one of its source is a choice of its own, before that one.
 struct MemoryLedger::Choice final {
   size_t source = 0;
   uint32_t passed = 0;
@@ -277,7 +278,15 @@ bool MemoryLedger::copyDemand() const noexcept {
 // the units' cost would pass the claim's benefit. A unit the claim's class
 // may not take is skipped, not stopped at. A unit's state buffers count for
 // a need of bytes as the bytes the model's pool releases of them beyond
-// those of the units chosen before (setBufferBytes).
+// those of the units chosen before (setBufferBytes). A unit whose buffers
+// the pool keeps (they refill those a lane starts from) meets none of a
+// need of bytes alone: it goes with the next unit the run chooses from its
+// source, its cost and buffers counted with that unit's, since the buffers
+// after it count only beside its own and the cache weighs each of its units
+// as a step from where the units before it leave the cache (R2 step 2: the
+// same units in the same order). A unit that meets none of the need
+// otherwise, or that an Immediate claim cannot take since it lands later,
+// is skipped (VictimSource: taking a later unit leaves it where it was).
 MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQuery &query, uint64_t lackingBytes,
                                           uint32_t lackingPages, std::optional<AccountId> growing) const {
   const Lacking lack{.bytes = lackingBytes,
@@ -321,7 +330,9 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
   struct Head final {
     std::optional<Victim> victim;
     size_t source = 0;
-    uint32_t passed = 0;  // the source's units passed over since its last choice
+    uint32_t passed = 0;  // the source's units passed over since its last choice or carried unit
+    // The units it carries to its next choice.
+    std::vector<Choice> carried;
     std::optional<AccountId> pool;
     bool pending = false;
     // A pool's reading, and the bytes above its floor the run has taken.
@@ -376,6 +387,26 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     ++head.passed;
     advance(head);
   };
+  const auto carry = [&](Head &head) {
+    head.carried.push_back(
+        Choice{.source = head.source, .passed = std::exchange(head.passed, 0), .victim = *head.victim});
+    advance(head);
+  };
+  // The head's unit with the units it carries, as one.
+  const auto withCarried = [](const Head &head) {
+    Victim unit = *head.victim;
+    for (const Choice &carried : head.carried) {
+      const Victim &each = carried.victim;
+      unit.bytes = plus(unit.bytes, each.bytes);
+      if (each.form == unit.form)
+        unit.pages += each.pages;
+      unit.stateBuffers += each.stateBuffers;
+      unit.later = unit.later || each.later;
+      unit.cost.onceSeconds += each.cost.onceSeconds;
+      unit.cost.ratePerSecond += each.cost.ratePerSecond;
+    }
+    return unit;
+  };
 
   DryRun run;
   const auto counted = [&](const Victim &victim) {
@@ -387,23 +418,36 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
   for (;;) {
     Head *best = nullptr;
     double bestPrice = 0.0;
+    bool bestLater = false;
     for (Head &head : heads) {
-      // Skip what this claim may not take or what meets none of its need;
-      // keep a unit that lands later in an Immediate claim's way, to note
-      // that the run reached it.
-      while (head.victim && (!mayTake(*head.victim) || lack.share(counted(*head.victim)) == 0.0))
-        pass(head);
+      // Skip what this claim may not take, carry a unit whose buffers the
+      // pool keeps, and skip what meets none of its need otherwise; keep a
+      // unit that lands later in an Immediate claim's way, to note that the
+      // run reached it.
+      while (head.victim) {
+        if (!mayTake(*head.victim))
+          pass(head);
+        else if (lack.share(counted(withCarried(head))) > 0.0)
+          break;
+        else if (lack.bytes && head.victim->stateBuffers && !(immediate && head.victim->later))
+          carry(head);
+        else
+          pass(head);
+      }
       if (!head.victim)
         continue;
-      const double price = head.victim->cost.at(spec.holdSeconds) / lack.share(counted(*head.victim));
-      if (!best || price < bestPrice || (price == bestPrice && !head.victim->later && best->victim->later)) {
+      const Victim unit = counted(withCarried(head));
+      const double price = unit.cost.at(spec.holdSeconds) / lack.share(unit);
+      if (!best || price < bestPrice || (price == bestPrice && !unit.later && bestLater)) {
         best = &head;
         bestPrice = price;
+        bestLater = unit.later;
       }
     }
     if (!best)
       break;
-    const Victim victim = counted(*best->victim);
+    const Victim units = withCarried(*best);
+    const Victim victim = counted(units);
     if (victim.later && victim.kind == VictimKind::Memory)
       run.uncopied = true;
     if (victim.later && immediate) {
@@ -415,11 +459,13 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
       break;
     run.cost += cost;
     run.bytes = plus(run.bytes, victim.bytes);
-    run.bufferBytes = plus(run.bufferBytes, victim.bytes - best->victim->bytes);
+    run.bufferBytes = plus(run.bufferBytes, victim.bytes - units.bytes);
     if (victim.form == lack.form)
       run.pages += victim.pages;
     run.buffers += victim.stateBuffers;
     run.later = run.later || victim.later;
+    run.chosen.insert(run.chosen.end(), best->carried.begin(), best->carried.end());
+    best->carried.clear();
     run.chosen.push_back(Choice{
         .source = best->source, .passed = best->passed, .pool = best->pool, .pending = best->pending, .victim = victim});
     best->passed = 0;
@@ -433,9 +479,10 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
   return run;
 }
 
-// Takes what a covered dry run chose, in its order: a source's unit by its
-// place in the source's order as it stands, past the units the run passed
-// over (VictimSource), a pool's units by releasing what the run's choices of
+// Takes what a covered dry run chose, in its order: a source's unit, each
+// it carried before the one it went with, by its place in the source's
+// order as it stands, past the units the run passed over (VictimSource),
+// a pool's units by releasing what the run's choices of
 // them still lack, pending growth by cancelling it. The run sized a pool's
 // units after its first at the first's bytes, and a later one may be larger
 // (the store's last live chunk is the rest of a size, the chunk before it
