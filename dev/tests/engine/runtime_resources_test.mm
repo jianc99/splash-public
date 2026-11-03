@@ -1360,6 +1360,39 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
           "a warm-up's sample is not its command's work and time");
 }
 
+// What a prefill would read on demand is the routed experts it streams, as
+// the store expects them of its blocks, and no row of a streamed PLE table:
+// Flash-Next's fixture of a table three times its row cache's working
+// memory, whose rows a prompt's ids read, streams it through --ple-memory's
+// smallest row cache, and its experts too under a budget 384 MiB above the
+// least of a start that loads them, whose Spill floors then hold 220,313 of
+// the window's 262,144 tokens and leave nothing beside them (measured on the
+// fixture: the experts stream from 256 to 512 MiB above it and load whole
+// at 128 and 1024). The fixture runs no command: no hyper-connection kernel
+// takes its 256-wide hidden state. What a command then read, the store's
+// reads alone, is checked on a real Flash-Next start
+// (model_runtime_oracle_test, requireWeightReadsAreTheStoresAlone).
+void testWeightReadsAreStreamedExpertsOnly(const char *metallibPath) {
+  const test::TemporaryDirectory root("splash-weight-reads");
+  RuntimeResourcesConfig config = flashNextConfig(metallibPath, root.path(), 491'520);
+  const model::StreamableWeights weights =
+      model::streamableWeights(config.modelRoot, config.model, {.streamExperts = true, .streamTable = true});
+  config.pleMemory = {StreamedSetting::Mode::Size, weights.tableMinimumBytes};
+  config.cacheDisk = {.automatic = true};
+  config.diskVolume = reading(localVolume(500 * kGiB));
+  config.maximumMemoryBytes = startStreamed(config).minimumRequired + 384 * kMiB;
+  const std::unique_ptr<RuntimeResources> resources = RuntimeResources::create(config, 0);
+  const model::RuntimeContext context = resources->modelContext();
+  const model::ExpertStore *store = context.model.expertStore();
+  require(store && context.model.streamedTable(), "the Flash-Next start did not stream its experts and PLE table");
+  const std::unique_ptr<model::Runtime> runtime = runtimeOf(*resources);
+  const uint32_t layers = std::get<model::Qwen4ExpLayout>(config.model.target).layers;
+  const std::array<model::PrefillLane, 1> group{{{.position = 0, .rows = 4 * kChunk}}};
+  const uint64_t experts = store->expectedPrefillReadBytes(4 * kChunk, 0, layers);
+  require(experts && runtime->prefillWork(group, 0, 1).weightReadBytes == experts,
+          "a prefill's expected weight reads are not its streamed experts' alone");
+}
+
 // A streamed MoE start's runtime: a prefill group's rows in a pass per
 // layer and no streamed history. Its pool is the expert store's, whose bytes
 // are Metal's: a unit taken above its floor and given back again moves the
@@ -1565,6 +1598,7 @@ int main(int argc, char **argv) {
       testEngineFollowsTheGovernor(argv[1]);
       testDenseRuntimeBoundary(argv[1]);
       testSpilledRuntimeBoundary(argv[1]);
+      testWeightReadsAreStreamedExpertsOnly(argv[1]);
       {
         const test::TemporaryDirectory root("splash-moe");
         const RuntimeResourcesConfig moe = moeConfig(argv[1], root.path());

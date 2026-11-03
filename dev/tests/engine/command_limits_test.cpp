@@ -1,13 +1,15 @@
 // What one prefill command of a runtime may hold (model::commandLimits) and
 // what a command or a pass of it computes (model::prefillCommandWork), at the
 // layouts of the families the runtime serves: Qwen3.8-27B, Qwen3.6-35B-A3B,
-// Flint and Qwen3.8-Flash-Next. Every family's bound of one attention layer's
-// pairs is a full chunk's at the end of its native window of 262,144 tokens,
-// as Bootstrap set it, not that times its attention layers; a streamed 35B's
-// group of 8192 rows fits it up to position 61,183, half the rows up to
-// 128,511, and passes never lower a layer's pairs; Flint past its native
-// window exceeds it as a dense target does, its full-history layers being the
-// heaviest; Flash-Next keeps its group within 3.2 % of it at any depth. A
+// Qwen3.5-122B-A10B, Flint and Qwen3.8-Flash-Next. Every family's bound of
+// one attention layer's pairs is a full chunk's at the end of its native
+// window of 262,144 tokens, as Bootstrap set it, not that times its
+// attention layers; a streamed 35B's group of 8192 rows fits it up to
+// position 61,183, half the rows up to 128,511; a 122B's group past it
+// exceeds it in every pass, one that runs no attention layer too, as passes
+// never lower a layer's pairs; Flint past its native window exceeds it as a
+// dense target does, its full-history layers being the heaviest; Flash-Next
+// keeps its group within 3.2 % of it at any depth. A
 // command holds its chunks' rows, a pass a layer (one with the Neural
 // Engine's FFN split), one lane past a chunk, and one lane's streamed history
 // where K/V spills. A pass counts the pairs and block-index scores of its own
@@ -82,17 +84,28 @@ void testPairCapIsTodaysPerLayerCap() {
 
 void testStreamedGroupHalvesPast61K() {
   const model::RuntimeGeometry geometry = geometryOf<model::Qwen3_6MoeLayout>(true);
-  const uint32_t layers = geometry.target.layers;
   require(layerPairs(geometry, 61'183, 4 * kChunk) <= kLayerPairs &&
               layerPairs(geometry, 61'184, 4 * kChunk) > kLayerPairs,
           "a streamed 35B's group of 8192 rows does not fit the bound up to position 61,183 alone");
   require(layerPairs(geometry, 128'511, 2 * kChunk) <= kLayerPairs &&
               layerPairs(geometry, 128'512, 2 * kChunk) > kLayerPairs,
           "half a streamed 35B's group does not fit the bound up to position 128,511 alone");
-  for (const uint32_t passes : {2u, 19u, layers})
-    for (uint32_t pass = 0; pass < passes; ++pass)
-      require(layerPairs(geometry, 61'184, 4 * kChunk, pass, passes) == layerPairs(geometry, 61'184, 4 * kChunk),
-              "a pass of " + std::to_string(passes) + " lowered the heaviest layer's pairs");
+}
+
+// Qwen3.5-122B-A10B's 48 layers, every fourth attention (layers 3, 7, ...,
+// 47): a group of 8192 rows at position 70,000 computes in each attention
+// layer more pairs than one layer may, and every pass of 19 counts them,
+// those that run no attention layer too (pass 0 runs layers 0-1, pass 2
+// layers 5-6), as a pass does not split a layer.
+void testLayerPairsIgnorePasses() {
+  const model::RuntimeGeometry geometry =
+      geometryOf(model::kQwen3_5_122BLayout, model::kQwen3_5_122BLayout.kvLayout(), true, false);
+  const uint64_t whole = layerPairs(geometry, 70'000, 4 * kChunk);
+  require(geometry.target.layers == 48 && geometry.target.attentionLayerCount() == 12 && whole > kLayerPairs,
+          "a 122B group of 8192 rows at position 70,000 kept within the bound of one layer's pairs");
+  for (uint32_t pass = 0; pass < 19; ++pass)
+    require(layerPairs(geometry, 70'000, 4 * kChunk, pass, 19) == whole,
+            "pass " + std::to_string(pass) + " of 19 did not count the heaviest attention layer's pairs of the target");
 }
 
 void testFlintHalvesPastNativeLikeDense() {
@@ -195,6 +208,7 @@ int main() {
   try {
     testPairCapIsTodaysPerLayerCap();
     testStreamedGroupHalvesPast61K();
+    testLayerPairsIgnorePasses();
     testFlintHalvesPastNativeLikeDense();
     testFlashNextKeepsItsGroupAtAnyDepth();
     testLimitsAreTheRuntimes();

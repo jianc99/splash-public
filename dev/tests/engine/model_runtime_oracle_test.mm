@@ -12,6 +12,7 @@
 #include "engine/NativeArguments.hpp"
 #include "engine/Types.hpp"
 #include "metal/BackendInstrumentation.hpp"
+#include "model/ExpertStore.hpp"
 #include "model/KvBlockCache.hpp"
 #include "model/KvCopyRead.hpp"
 #include "model/KvHistoryStream.hpp"
@@ -20,6 +21,7 @@
 #include "model/Qwen4Steps.hpp"
 #include "model/RuntimeInstrumentation.hpp"
 #include "model/QwenState.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/SpilledKvReads.hpp"
 #include "model/SsdReaders.hpp"
 #include "model/VerifyBudget.hpp"
@@ -1899,6 +1901,50 @@ void requirePrefillPassesMatchWhole(model::Runtime &executor, const kv::PageStor
   }
   std::cout << "prefill_passes_match_whole=PASS passes=3," << passes << (vision ? " images=PASS" : " images=SKIP")
             << " lanes=2\n";
+}
+
+// A command's sample counts as weights read on demand the bytes the expert
+// store read for it, and no row a streamed PLE table read (WorkCount), on a
+// target whose experts and table both stream (--expert-memory,
+// --ple-memory): a warm-up of a chunk, whose rows the table reads as the
+// command is encoded, and the first decode of `prompt`, whose verify reads
+// inside the command the rows of the answer it starts, n-grams no command
+// before it took. Each reads rows of the table. (runtime_resources_test's
+// start that streams a table runs no command.)
+void requireWeightReadsAreTheStoresAlone(model::Runtime &executor, const model::LoadedModel &model,
+                                         const std::vector<uint32_t> &prompt) {
+  const model::ExpertStore *store = model.expertStore();
+  const model::SparseRowStore *table = model.streamedTable();
+  if (!store || !table) {
+    std::cout << "weight_reads=SKIP (the target does not stream both its experts and a PLE table)\n";
+    return;
+  }
+  uint64_t storeBefore = store->readBytes(), tableBefore = table->stats().readBytes;
+  const model::WarmupStepResult warmup = executor.warmupPrefill(model::ExecutionLimits::prefillTokenBudget);
+  const uint64_t warmupStore = store->readBytes() - storeBefore, warmupTable = table->stats().readBytes - tableBefore;
+  require(warmupTable, "the warm-up read no row of the streamed PLE table");
+  require(warmupStore && warmup.sample.work.weightReadBytes == warmupStore,
+          "a warm-up's weight reads are not the bytes the expert store read for it alone");
+  constexpr uint64_t id = 600;
+  const std::vector<uint32_t> pages = pageRange(0, 8);
+  beginCold(executor, makeRequest(id, prompt, 16), 0);
+  requireOpen(prefillChunk(executor, id, 0, prompt, pages), "the weight reads' decode");
+  const BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}}, .decodeStage = DecodeStage::Regular};
+  const ModelBatchItem item = withRevision({id, prompt.size(), 0, pages});
+  storeBefore = store->readBytes();
+  tableBefore = table->stats().readBytes;
+  const std::unique_ptr<ModelBatchTicket> ticket = executor.submit(plan, std::span(&item, 1), {});
+  const std::vector<ModelStepResult> decoded = ticket->wait();
+  require(decoded.size() == 1 && decoded[0].failure.empty(), "the weight reads' decode failed");
+  const uint64_t decodeStore = store->readBytes() - storeBefore, decodeTable = table->stats().readBytes - tableBefore;
+  require(decodeTable, "the decode read no row of the streamed PLE table");
+  require(ticket->sample().work.weightReadBytes == decodeStore,
+          "a decode's weight reads are not the bytes the expert store read for it alone");
+  executor.end(id);
+  while (executor.reclaimIdleState(false, IdleMemory::Buffers)) {
+  }
+  std::cout << "weight_reads=PASS warmup_experts=" << warmupStore << " warmup_table=" << warmupTable
+            << " decode_experts=" << decodeStore << " decode_table=" << decodeTable << '\n';
 }
 
 // A command's ticket holds the buffers of the states it captures once the
@@ -4189,7 +4235,9 @@ int main(int argc, char **argv) {
     // --ple-memory SIZE and --expert-memory SIZE stream a Qwen3.8-Flash-Next
     // target's PLE table and a MoE target's routed experts
     // (tools/LoadOptions.hpp); a streamed table's TOKENS line equals the
-    // resident table's. --prefill-groups-only: a prefill group
+    // resident table's, and where both stream a warm-up's and a decode's
+    // weight reads are the store's alone (requireWeightReadsAreTheStoresAlone).
+    // --prefill-groups-only: those, a prefill group
     // against its chunks' commands (requirePrefillGroupMatchesItsChunks),
     // and a command in passes against it whole
     // (requirePrefillPassesMatchWhole), then stop. A block-sparse target's K/V that spilled reads what its
@@ -4528,6 +4576,7 @@ int main(int argc, char **argv) {
       return 0;
     }
 
+    requireWeightReadsAreTheStoresAlone(executor, model, targetTokens->productionSeed);
     const std::vector<uint32_t> &samplingSeedTokens = targetTokens->samplingSeed;
     if (prefillGroupsOnly) {
       requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
