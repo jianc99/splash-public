@@ -63,14 +63,12 @@ inline const TimingProfile &fourMillisecondRows() {
 }
 
 // What one of the fake model's prefill commands may hold (Executor::groupRows,
-// passes, groupsOnlySpilling), for a fixture to set before it builds the
-// engine, which takes it then (Spilling's shape).
-inline std::function<void(Executor &)> commandShape(uint32_t groupRows, uint32_t passes = 1,
-                                                     bool groupsOnlySpilling = false) {
+// passes), for a fixture to set before it builds the engine, which takes it
+// then (Spilling's shape).
+inline std::function<void(Executor &)> commandShape(uint32_t groupRows, uint32_t passes = 1) {
   return [=](Executor &model) {
     model.groupRows = groupRows;
     model.passes = passes;
-    model.groupsOnlySpilling = groupsOnlySpilling;
   };
 }
 

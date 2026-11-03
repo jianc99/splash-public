@@ -12,12 +12,14 @@
 
 namespace splash::test {
 
-// The times a command reports (ModelBatchTicket): none unless a test sets
-// them, as a fake runs no kernels, and its sample, whose wall is wallMilliseconds.
+// The times a command takes: none unless a test sets them, as a fake runs
+// no kernels, and its sample (ModelBatchTicket::sample), whose wall is
+// wallMilliseconds. Of the wall, what a profile's command waits on its host
+// steps, and of that on its history's reads (prefillTimes).
 struct CommandTimes final {
   double wallMilliseconds = 0.0;
-  double hostMilliseconds = 0.0;
-  double streamMilliseconds = 0.0;
+  double hostWaitMilliseconds = 0.0;
+  double historyWaitMilliseconds = 0.0;
   model::CommandSample sample{};
 };
 

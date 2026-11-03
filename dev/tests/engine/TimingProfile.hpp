@@ -80,7 +80,7 @@ struct TimingProfile final {
 // targets whose commands were not recorded one by one).
 struct MeasuredCommand final {
   uint32_t rows = 0;
-  double wallMilliseconds = 0, hostMilliseconds = 0;
+  double wallMilliseconds = 0, hostWaitMilliseconds = 0;
   bool warmup = false;  // a prompt of one repeated token
 };
 struct MeasuredPrompt final {
@@ -145,8 +145,8 @@ struct MeasuredPrompt final {
   const double host =
       std::max(layers * profile.hostFloorMilliseconds, reads - profile.hiddenShare * std::min(reads, compute));
   return {.wallMilliseconds = profile.turnaroundMilliseconds + compute + host,
-          .hostMilliseconds = host,
-          .streamMilliseconds = stream,
+          .hostWaitMilliseconds = host,
+          .historyWaitMilliseconds = stream,
           .sample = {.work = work}};
 }
 // A command of the profile's measured routing.

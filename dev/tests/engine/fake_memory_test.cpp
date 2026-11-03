@@ -264,8 +264,8 @@ void testTheStorageAllocatesThroughMemory() {
 // from the pooled ones first, back to the pool as it ends; a state's buffers,
 // from those the cache let go of first; a decoding lane's floor and a
 // prefill's staging until it ends; a reclaim gives pooled buffers back; a
-// refusal is the request's and holds nothing; and the expert store's hooks
-// and pools() are the experts pool.
+// refusal is the request's and holds nothing; and pools() is the experts
+// pool.
 void testTheModelAllocatesThroughMemory() {
   FakeMemory memory(sixteen());
   metal::MetalBackend backend("");
@@ -273,11 +273,10 @@ void testTheModelAllocatesThroughMemory() {
   test::Executor model;
   model.memory = &memory;
   model.admission = governor->allocationAdmission();
-  model.growthAdmission = governor->allocationAdmission();
   model.laneFootprintBytes = 256 * kMiB;
   model.spilledReadFloorBytes = 64 * kMiB;
   model.stagingPageBytes = kMiB;
-  std::optional<test::ClaimScope> claim(std::in_place, *governor, engine::ClaimClass::InService);
+  const test::ClaimScope claim(*governor, engine::ClaimClass::InService);
   ModelRequest request;
   request.id = 1;
   request.maxNewTokens = 1;
@@ -291,8 +290,10 @@ void testTheModelAllocatesThroughMemory() {
   require(model.spilledReadShortfall(1, {}) == 64 * kMiB &&
               model.spilledReadShortfall(1, {.kind = WorkKind::Prefill, .pages = 10}) == 10 * kMiB,
           "the shortfall is not what a reservation would allocate");
-  require(model.reserveSpilledReads(1).granted() && model.reserveHistoryStaging(1, 10).granted() &&
-              model.reserveHistoryStaging(1, 6).granted() && memory.held("spilled_reads") == 74 * kMiB,
+  require(model.reserveSpilledReads(1, {}).granted() &&
+              model.reserveSpilledReads(1, {.kind = WorkKind::Prefill, .pages = 10}).granted() &&
+              model.reserveSpilledReads(1, {.kind = WorkKind::Prefill, .pages = 6}).granted() &&
+              memory.held("spilled_reads") == 74 * kMiB,
           "the reads' memory was not allocated");
   require(model.spilledReadShortfall(1, {}) == 0 &&
               model.spilledReadShortfall(1, {.kind = WorkKind::Prefill, .pages = 12}) == 2 * kMiB,
@@ -317,12 +318,6 @@ void testTheModelAllocatesThroughMemory() {
   FakeElasticPool experts("experts", memory, kGiB, 1, 3, 6, 3, 1.0, 50.0);
   model.experts = &experts;
   require(model.pools().size() == 1 && model.pools()[0] == &experts, "the model does not report its pool");
-  require(model.releaseExpertChunk() == kGiB && model.releaseExpertsToFloor() == kGiB && experts.units() == 1 &&
-              model.releaseExpertChunk() == 0,
-          "the store's hooks did not give back the pool's units");
-  claim.emplace(*governor, engine::ClaimClass::Growth);
-  require(model.expertGrowthBytes() == kGiB && model.growExperts().granted() && experts.units() == 2,
-          "the store's hooks did not take a unit back");
 }
 
 // The pool keeps the buffers one lane starts from: once four lanes have

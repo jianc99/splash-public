@@ -100,12 +100,12 @@ void testTheFixedPartExceedsTheHostWait() {
       if (command.rows < 300)
         continue;
       const test::CommandTimes times = timesOf(*profile, command);
-      require(times.wallMilliseconds - command.rows * profile->rowMilliseconds > times.hostMilliseconds,
+      require(times.wallMilliseconds - command.rows * profile->rowMilliseconds > times.hostWaitMilliseconds,
               std::string(profile->name) + ": a command's fixed part is only its host wait");
     }
   }
-  const double turn = timesOf(test::kM6FlashNextQ2, {.rows = 300}).hostMilliseconds;
-  const double group = timesOf(test::kM6FlashNextQ2, {.rows = 6144}).hostMilliseconds;
+  const double turn = timesOf(test::kM6FlashNextQ2, {.rows = 300}).hostWaitMilliseconds;
+  const double group = timesOf(test::kM6FlashNextQ2, {.rows = 6144}).hostWaitMilliseconds;
   require(turn > 2 * group, "a short turn does not wait on the host longer than a group");
 }
 
@@ -125,7 +125,7 @@ void testHalvingTheResidencyAddsItsReadTime() {
     const test::CommandTimes after = test::prefillTimes(*profile, halfWork);
     require(halfWork.weightReadBytes > fullWork.weightReadBytes && after.wallMilliseconds > before.wallMilliseconds &&
                 std::abs((after.wallMilliseconds - before.wallMilliseconds) -
-                         (after.hostMilliseconds - before.hostMilliseconds)) < 1e-6,
+                         (after.hostWaitMilliseconds - before.hostWaitMilliseconds)) < 1e-6,
             std::string(profile->name) + ": a smaller store did not cost a prefill its reads");
     const double decodeAdded = test::decodeTimes(*profile, 1, 8, share / 2, 0).wallMilliseconds -
                                test::decodeTimes(*profile, 1, 8, share, 0).wallMilliseconds;
@@ -148,14 +148,14 @@ void testAStoreLessCommandPaysItsHistoryReads() {
     return test::prefillTimes(profile, work.prefillWork({&lane, 1}, 0, 1));
   };
   const test::CommandTimes resident = times(0);
-  require(resident.hostMilliseconds == 0,
-          "a store-less command waits " + std::to_string(resident.hostMilliseconds) + " ms on the host");
+  require(resident.hostWaitMilliseconds == 0,
+          "a store-less command waits " + std::to_string(resident.hostWaitMilliseconds) + " ms on the host");
   const double compute = resident.wallMilliseconds - profile.turnaroundMilliseconds;
   for (const uint32_t pages : {1u, 2048u}) {
     const test::CommandTimes spilled = times(pages);
     const double unhidden =
-        spilled.streamMilliseconds - profile.hiddenShare * std::min(spilled.streamMilliseconds, compute);
-    require(spilled.streamMilliseconds > 0 &&
+        spilled.historyWaitMilliseconds - profile.hiddenShare * std::min(spilled.historyWaitMilliseconds, compute);
+    require(spilled.historyWaitMilliseconds > 0 &&
                 std::abs(spilled.wallMilliseconds - resident.wallMilliseconds - unhidden) < 1e-6,
             std::to_string(pages) + " Index pages add " +
                 std::to_string(spilled.wallMilliseconds - resident.wallMilliseconds) + " ms, not their reads' " +

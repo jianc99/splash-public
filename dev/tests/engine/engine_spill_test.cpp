@@ -972,9 +972,7 @@ void testAWaitingFloorKeepsTheMemoryOnItsWayBack() {
 // own: the other decodes first. A held lane keeps its wait and retries once
 // memory lands or after the backoff, so a tick that runs nothing leaves the
 // loop a later wakeup. Where the lane that yields first holds its floor
-// already, it decodes within what it holds while the other waits, and the
-// hot block cache does not grow toward its target until the other has its
-// floor.
+// already, it decodes within what it holds while the other waits.
 void testAHeldSpillLaneLeavesTheFloorToTheWaiter() {
   for (const bool holdsFloor : {false, true}) {
     Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16});
@@ -1025,13 +1023,9 @@ void testAHeldSpillLaneLeavesTheFloorToTheWaiter() {
             "the lanes did not decode before their pages spilled");
     std::optional<double> shortFloor;
     std::optional<double> longFloor;
-    std::optional<uint32_t> growthAtRefusal;
-    uint32_t growthWhileWaiting = 0;
     size_t shortOutputs = 0;
-    size_t shortOutputsAtRefusal = 0;
+    std::optional<size_t> shortOutputsAtRefusal;
     for (uint32_t step = 0; step < 4000 && !(shortFloor && longFloor); ++step) {
-      // The growth of a tick that grants the floor follows it.
-      const uint32_t growthBefore = spill.model.growthAttempts;
       const bool ran = spill.engine.tick(spill.now += 50);
       if (!ran && !spill.engine.commandInFlight()) {
         const std::optional<double> wakeup = spill.engine.nextWakeupMilliseconds();
@@ -1042,16 +1036,13 @@ void testAHeldSpillLaneLeavesTheFloorToTheWaiter() {
       if (step % 8 == 0)
         spill.tier.complete();
       // From the refusal that follows the first, a write is on its way.
-      if (refusals > 1 && !growthAtRefusal) {
-        growthAtRefusal = spill.model.growthAttempts;
+      if (refusals > 1 && !shortOutputsAtRefusal)
         shortOutputsAtRefusal = spill.events.outputs.at(2).size();
-      }
       if (!shortFloor && spill.model.spilledReadFloors.contains(2))
         shortFloor = spill.now;
       if (!longFloor && spill.model.spilledReadFloors.contains(3)) {
         longFloor = spill.now;
-        shortOutputs = spill.events.outputs.at(2).size() - shortOutputsAtRefusal;
-        growthWhileWaiting = growthBefore - growthAtRefusal.value_or(growthBefore);
+        shortOutputs = spill.events.outputs.at(2).size() - shortOutputsAtRefusal.value_or(0);
       }
     }
     require(budget && shortFloor && longFloor && spill.events.failedCount == 0,
@@ -1062,8 +1053,6 @@ void testAHeldSpillLaneLeavesTheFloorToTheWaiter() {
               "way back");
     } else {
       require(shortOutputs > 1, "a lane that holds its floor did not decode while another waited");
-      require(growthWhileWaiting == 0,
-              "the hot block cache grew while a lane waited for memory on its way back");
     }
     spill.model.decodeFinishes = true;
     spill.runUntilIdle();
@@ -2197,10 +2186,9 @@ void testLoneSpillLaneEndsAtTheWall() {
 // The hot block cache grows toward its planned size as its pool's growth
 // in the governor's control pass, which takes free room and displaces other
 // memory only where its unit is worth more than what it displaces (amend/M.md
-// B4; memory_ledger_test): a decoding lane's reads take its floor alone, the
-// engine asks the model for no growth of that cache, and no unit of the
-// expert store goes, at the engine's limit and while the host refuses
-// growth. The lane decodes all the same.
+// B4; memory_ledger_test): a decoding lane's reads take its floor alone, and
+// no unit of the expert store goes, at the engine's limit and while the host
+// refuses growth. The lane decodes all the same.
 void testHotCacheGrowthIsNotTheEngines() {
   for (const bool paused : {false, true}) {
     Spilling spill(Spilling::Governed{}, 64);
@@ -2212,9 +2200,9 @@ void testHotCacheGrowthIsNotTheEngines() {
     // From here the limit leaves no room for growth.
     spill.limit(spill.held());
     spill.runUntilIdle();
-    require(spill.model.growthAttempts == 0 && experts.shrinks == 0 && spill.events.completedCount == 1 &&
-                spill.events.failedCount == 0 && spill.events.usage.at(1).second == 20,
-            "the engine grew the hot block cache, or took the expert store for it");
+    require(experts.shrinks == 0 && spill.events.completedCount == 1 && spill.events.failedCount == 0 &&
+                spill.events.usage.at(1).second == 20,
+            "the engine took the expert store for the hot block cache");
   }
 }
 

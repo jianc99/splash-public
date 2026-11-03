@@ -233,11 +233,6 @@ private:
 // tests' knobs and records.
 class Executor final : public model::Model {
 public:
-  // The model's own reclaim steps, in the order they ran: pooled buffers
-  // given back, a cache it can rebuild, and a chunk of its expert store
-  // given back or taken back.
-  enum class ReclaimStep : uint8_t { Buffers, Cache, ExpertRelease, ExpertGrowth };
-
   explicit Executor(
       uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth)
       : maximumLanes(maximumLanes) {}
@@ -570,10 +565,6 @@ public:
       submitObserver();
     return ticket;
   }
-  uint32_t prefillGroupRows(bool spills) const noexcept override {
-    return spills || !groupsOnlySpilling ? groupRows : model::ExecutionLimits::prefillTokenBudget;
-  }
-  uint32_t prefillPasses() const noexcept override { return passes; }
   // A command holds groupRows rows in up to `passes` passes, the rows of one
   // lane at most past a chunk, and streams the history of one lane at most.
   model::CommandLimits commandLimits() const noexcept override {
@@ -694,47 +685,30 @@ public:
   // The production model reserves a decoding lane's floor of the hot block
   // cache, which the fake refuses for the requests in refusedSpilledReads,
   // and while spilledReadsRoom reports no memory for the request's, with
-  // spilledReadsRefusal's cause. The lane holds it until it is suspended or
-  // ends.
-  model::ModelMemoryAdmission reserveSpilledReads(uint64_t id) override {
-    if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
-      return {.allocationFailure = spilledReadsRefusal};
-    if (!spilledReadFloors.contains(id))
-      if (const metal::AllocationResult result = allocateReads(id, spilledReadFloorBytes); !result)
-        return {.allocationFailure = result.failure};
-    spilledReadFloors.insert(id);
-    return {.ok = true};
-  }
-  // It stages the history a prefill command streams, as many pages as the
-  // command reads, which the fake refuses for the requests in
+  // spilledReadsRefusal's cause; the lane holds it until it is suspended or
+  // ends. It stages the history a prefill command streams, as many pages as
+  // the command reads, which the fake refuses for the requests in
   // refusedStaging.
-  model::ModelMemoryAdmission reserveHistoryStaging(uint64_t id, uint32_t pages) override {
+  model::ModelMemoryAdmission reserveSpilledReads(uint64_t id, model::SpilledReadNeed need) override {
+    if (need.kind == WorkKind::Decode) {
+      if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
+        return {.allocationFailure = spilledReadsRefusal};
+      if (!spilledReadFloors.contains(id))
+        if (const metal::AllocationResult result = allocateReads(id, spilledReadFloorBytes); !result)
+          return {.allocationFailure = result.failure};
+      spilledReadFloors.insert(id);
+      return {.ok = true};
+    }
     if (refusedStaging.contains(id))
       return {.allocationFailure = metal::AllocationFailure::EngineBudget};
     const auto found = historyStaging.find(id);
-    if (const uint32_t held = found == historyStaging.end() ? 0 : found->second; pages > held)
-      if (const metal::AllocationResult result = allocateReads(id, uint64_t{pages - held} * stagingPageBytes);
+    if (const uint32_t held = found == historyStaging.end() ? 0 : found->second; need.pages > held)
+      if (const metal::AllocationResult result = allocateReads(id, uint64_t{need.pages - held} * stagingPageBytes);
           !result)
         return {.allocationFailure = result.failure};
     uint32_t &staged = historyStaging[id];
-    staged = std::max(staged, pages);
+    staged = std::max(staged, need.pages);
     stagings.push_back(id);
-    return {.ok = true};
-  }
-  // A lane holds its floor once granted it, and a prefill the pages of
-  // history staged for it.
-  bool holdsSpilledReads(uint64_t id, uint32_t pages) const override {
-    if (!pages)
-      return spilledReadFloors.contains(id);
-    const auto staged = historyStaging.find(id);
-    return staged != historyStaging.end() && staged->second >= pages;
-  }
-  // It grows that cache toward its planned size, which the fake refuses
-  // with refusedGrowth.
-  model::ModelMemoryAdmission growSpilledReads() override {
-    ++growthAttempts;
-    if (refusedGrowth)
-      return {.allocationFailure = *refusedGrowth};
     return {.ok = true};
   }
   uint64_t reclaimIdleState(bool keepLane, model::IdleMemory scope) noexcept override {
@@ -747,8 +721,6 @@ public:
     reclaimedIdleStateBytes += released;
     if (released && kvGrowthBlocked)
       *kvGrowthBlocked = false;
-    if (released)
-      reclaimSteps.push_back(ReclaimStep::Buffers);
     if (released || scope == model::IdleMemory::Buffers)
       return released;
     ++cacheReclaims;
@@ -756,74 +728,7 @@ public:
       return 0;
     const uint64_t unit = cacheUnits.back();
     cacheUnits.pop_back();
-    reclaimSteps.push_back(ReclaimStep::Cache);
     return unit;
-  }
-  // The production model's expert store gives back its last live chunk
-  // above the floor, and takes back the next one toward its cap while
-  // memory admits it (model::ExpertStore). The fake's chunks above the floor
-  // are expertChunks, those given back releasedExpertChunks, each the last
-  // to go first; expertGrowthRoom, when set, says whether memory admits the
-  // next, refused with expertGrowthRefusal otherwise, and expertAdmission,
-  // when set, admits its bytes as the production store's admission does
-  // (Runtime::growExperts), refused with the admission's cause.
-  // expertReleaseObserver runs as a chunk goes, before it is logged. With
-  // `experts`, the hooks act on that pool instead, growing under
-  // growthAdmission.
-  uint64_t releaseExpertChunk() override {
-    if (experts) {
-      if (!experts->state().releaseUnitBytes)
-        return 0;
-      if (expertReleaseObserver)
-        expertReleaseObserver();
-      reclaimSteps.push_back(ReclaimStep::ExpertRelease);
-      return experts->release(1);
-    }
-    if (expertChunks.empty())
-      return 0;
-    if (expertReleaseObserver)
-      expertReleaseObserver();
-    const uint64_t chunk = expertChunks.back();
-    expertChunks.pop_back();
-    releasedExpertChunks.push_back(chunk);
-    reclaimSteps.push_back(ReclaimStep::ExpertRelease);
-    return chunk;
-  }
-  uint64_t releaseExpertsToFloor() override {
-    uint64_t bytes = 0;
-    while (const uint64_t chunk = releaseExpertChunk())
-      bytes += chunk;
-    ++expertsToFloor;
-    return bytes;
-  }
-  uint64_t expertGrowthBytes() const override {
-    if (experts)
-      return experts->state().growUnitBytes;
-    return releasedExpertChunks.empty() ? 0 : releasedExpertChunks.back();
-  }
-  model::ModelMemoryAdmission growExperts() override {
-    ++expertGrowthAttempts;
-    if (experts) {
-      const uint32_t before = experts->units();
-      if (const metal::AllocationResult result = experts->grow(growthAdmission); !result)
-        return {.allocationFailure = result.failure};
-      if (experts->units() > before)
-        reclaimSteps.push_back(ReclaimStep::ExpertGrowth);
-      return {.ok = true};
-    }
-    if (releasedExpertChunks.empty())
-      return {.ok = true};
-    if (expertGrowthRoom && !expertGrowthRoom())
-      return {.allocationFailure = expertGrowthRefusal};
-    if (expertAdmission) {
-      const metal::AllocationResult admitted = expertAdmission(releasedExpertChunks.back(), [] {});
-      if (!admitted)
-        return {.allocationFailure = admitted.failure};
-    }
-    expertChunks.push_back(releasedExpertChunks.back());
-    releasedExpertChunks.pop_back();
-    reclaimSteps.push_back(ReclaimStep::ExpertGrowth);
-    return {.ok = true};
   }
   std::optional<std::string> provideMask(uint64_t id,
                                          std::span<const uint32_t> words) override {
@@ -1002,18 +907,11 @@ public:
   // take them once no buffer is idle; cacheReclaims counts those steps.
   std::vector<uint64_t> cacheUnits;
   uint32_t cacheReclaims = 0;
-  std::vector<ReclaimStep> reclaimSteps;
-  // The expert store's chunks above its floor and those given back, of their
-  // bytes (releaseExpertChunk, growExperts).
+  // An expert store's chunks above its floor and those given back, of their
+  // bytes, which a test's own weight memory moves between them; the model
+  // reads neither.
   std::vector<uint64_t> expertChunks;
   std::vector<uint64_t> releasedExpertChunks;
-  std::function<void()> expertReleaseObserver;
-  std::function<bool()> expertGrowthRoom;
-  metal::AllocationFailure expertGrowthRefusal = metal::AllocationFailure::EngineBudget;
-  metal::AllocationAdmission expertAdmission;
-  uint32_t expertGrowthAttempts = 0;
-  // The calls that gave every chunk above the floor back at once.
-  uint32_t expertsToFloor = 0;
   // Rows each state captured from then on holds (RowsHoldingState); the
   // executor must outlive the cache that keeps those states.
   uint64_t stateHeldRows = 0;
@@ -1061,22 +959,18 @@ public:
   std::unordered_map<uint64_t, uint32_t> outputLimits;
   // The prefill steps each request took.
   std::unordered_map<uint64_t, uint32_t> prefillChunks;
-  // The most rows of a prefill command (Model::prefillGroupRows,
-  // CommandLimits::commandRows): a chunk's, or a prefill group's, for every
-  // lane, as where experts stream, or with groupsOnlySpilling only for a
-  // lane whose history spills.
+  // The most rows of a prefill command (CommandLimits::commandRows): a
+  // chunk's, or a prefill group's, as where experts stream.
   uint32_t groupRows = model::ExecutionLimits::prefillTokenBudget;
-  bool groupsOnlySpilling = false;
   // The most passes over its layers a prefill command runs in
-  // (Model::prefillPasses, CommandLimits::maximumPasses).
+  // (CommandLimits::maximumPasses).
   uint32_t passes = 1;
   // The tokens a decode step emits.
   uint32_t decodeTokens = 1;
   // The masks the model took.
   uint32_t providedMasks = 0;
-  // Requests whose floor of the hot block cache is refused
-  // (reserveSpilledReads), and those whose history's staging is
-  // (reserveHistoryStaging).
+  // Requests whose floor of the hot block cache is refused, and those whose
+  // history's staging is (reserveSpilledReads).
   std::unordered_set<uint64_t> refusedSpilledReads;
   std::function<bool(uint64_t)> spilledReadsRoom;
   metal::AllocationFailure spilledReadsRefusal = metal::AllocationFailure::EngineBudget;
@@ -1087,8 +981,6 @@ public:
   std::unordered_set<uint64_t> spilledReadFloors;
   std::unordered_map<uint64_t, uint32_t> historyStaging;
   std::vector<uint64_t> stagings;
-  std::optional<metal::AllocationFailure> refusedGrowth;
-  uint32_t growthAttempts = 0;
   // Blocks of KV the SSD cache holds that each request's next step reports
   // it could not read (ModelStepResult::unreadableKvBlocks).
   std::unordered_map<uint64_t, std::vector<uint64_t>> unreadableBlocks;
@@ -1102,13 +994,12 @@ public:
   // (spilledReadFloorBytes) and a prefill's staging (stagingPageBytes a page)
   // as "spilled_reads" until the lane is suspended or ends.
   FakeMemory *memory = nullptr;
-  metal::AllocationAdmission admission, growthAdmission;
+  metal::AllocationAdmission admission;
   uint64_t spilledReadFloorBytes = 0, stagingPageBytes = 0;
   uint64_t heldStateBytes = 0;
   std::unordered_map<uint64_t, uint64_t> spilledReadBytes;
-  // The expert store as an elastic pool (pools(), the store's hooks), whose
-  // residency prices the timed commands' reads and which their routing
-  // serves.
+  // The expert store as an elastic pool (pools()), whose residency prices
+  // the timed commands' reads and which their routing serves.
   FakeElasticPool *experts = nullptr;
   // With it (time()), the model reports the profile's work and its commands
   // take the profile's time and sample its work; with a clock too, each
