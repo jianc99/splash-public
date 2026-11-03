@@ -502,6 +502,16 @@ resolve it.
 | G10 | dense, resident, Flint and Apple9 cells against the base: work and TTFT within 2 % by the interval rule (TTFT cells on each round's worst), failing once surely worse, and no G4 failure; undecided goes to the owner |
 | Floor | the Flash-Next store held at its cap becomes the floor default only when no metric is worse than the value default's and one is better; mixed results go to the owner |
 
+Where a run's Neural Engine FFN split holds contended units at its fewest
+rows (`ane_ffn.minimum_rows` while `ane_ffn.state` is `split`, or `stopped`,
+which keeps them; a prompt's last rows, fewer than twice them, run as one
+unit or two even ones), G4's bound is the larger of the run's own and what
+the engine prices those units at: the longest, over the sample intervals
+whose prefill commands since the longest contended unit before the
+interval's start (at least those of the interval before) averaged fewer
+than twice those rows, of `metrics.decode_gap_causes.prefill_predicted_ms`
+per `prefill_unit` gap. A run without the split keeps the run's own bound.
+
 Each candidate churn run also reports, with nothing judged on them, its
 prefill hole share (the streamed experts' prefill host steps, pickup, work
 and resume, over `metrics.prefill_wall_ms`), its SSD-busy share (its
