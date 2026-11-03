@@ -1193,13 +1193,13 @@ void testAHeldLaneEndsItsCommandAtItsCapacity() {
 }
 
 // A command that a lane's arrival would regroup, while a lane it yields before
-// waits for memory on its way back, loses only the passes the regroup costs: a
-// Resident prompt's command in passes, planned again with a short arrival,
-// keeps the KV it holds and runs without the arrival, which takes no page while
-// the Spill lane waits for its floor, and is not planned again at every
-// boundary. The arrival runs once the lane has its floor. So it does where the
-// command's lane is cancelled meanwhile, which ends it at once and leaves the
-// memory to the waiting lane.
+// waits for memory on its way back, keeps its passes: a Resident prompt's
+// command in passes keeps the KV it holds and runs its passes on without the
+// arrival, which takes no page while the Spill lane waits for its floor, as a
+// regroup abandons the command only once the lanes it adds hold their memory
+// (amend/S.md D2). The arrival runs once the lane has its floor. So it does
+// where the command's lane is cancelled between its passes, which ends it at
+// once and leaves the memory to the waiting lane.
 void testAJoinerHeldBackLeavesACommandItsPasses() {
   for (const bool cancelled : {false, true}) {
     Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16}, 0,
@@ -1269,9 +1269,11 @@ void testAJoinerHeldBackLeavesACommandItsPasses() {
         if (transfer->submitted && transfer->write != WriteClass::Reclaim)
           transfer->ready = true;
     };
-    for (uint32_t tick = 0; tick < 200 && passesOf(3, 0) < 2; ++tick)
+    for (uint32_t tick = 0; tick < 200 && !passesOf(3, 1) && passesOf(3, 0) < 2; ++tick)
       step();
-    require(passesOf(3, 0) == 2, "the arrival did not regroup the command");
+    require(passesOf(3, 0) == 1 && passesOf(3, 1) == 1,
+            "a command the held-back arrival would regroup did not keep its passes: its first ran " +
+                std::to_string(passesOf(3, 0)) + " times");
     if (cancelled) {
       step();
       spill.engine.cancel(3);
@@ -1281,8 +1283,8 @@ void testAJoinerHeldBackLeavesACommandItsPasses() {
     } else {
       for (uint32_t tick = 0; tick < 200 && !passesOf(3, 3); ++tick)
         step();
-      require(passesOf(3, 0) == 2 && passesOf(3, 3) == 1,
-              "a command planned again with an arrival held back did not run its passes to its last without it");
+      require(passesOf(3, 0) == 1 && passesOf(3, 3) == 1,
+              "a command an arrival held back would regroup did not run its passes to its last without it");
     }
     require(spill.cache.holdsIndexPages(2) && spill.events.outputs.at(2).size() == outputs,
             "the Spill lane did not wait for its floor");

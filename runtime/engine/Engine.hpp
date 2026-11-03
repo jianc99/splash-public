@@ -957,6 +957,11 @@ private:
   // end, which takes nothing where the lane holds it.
   [[nodiscard]] std::optional<Denied> reserveReads(Request &active, const BatchItem &scheduled,
                                                    const PlanContext &plan);
+  // The lanes a plan that supersedes the command between its passes adds to
+  // it, each given its memory for the plan as prepare() gives it, its KV
+  // and then its reads of KV only the SSD cache holds: those refused, each
+  // refusal noted.
+  [[nodiscard]] std::vector<uint64_t> growJoiners(const BatchPlan &plan, double nowMilliseconds);
   // What a command none of whose lanes runs does about the memory they were
   // refused (`denied`): waits for memory on its way back, makes the lane
   // that yields first yield, or, alone with nothing on its way back, ends

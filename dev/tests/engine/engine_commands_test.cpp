@@ -750,12 +750,14 @@ void testAStartThatWouldNotSupersedeACommandWaitsForItsEnd() {
   }
 }
 
-// A lane that prepare refuses memory the other lanes of its command fit in
-// waits for the command's end, as a lane any command leaves out does: a
+// A plan that supersedes the command between its passes and shares a lane
+// with it abandons the command only once the lanes it adds hold their
+// memory (amend/S.md D2: its prepare returns Runnable), and a lane refused
+// waits for the command's end, as a lane its first pass left out does: a
 // short prompt's command in passes, planned again with a short arrival
-// whose KV the engine's limit then refuses, runs its passes to its last
-// without it, rather than its first again at every boundary, and the
-// arrival runs once memory allows.
+// whose KV the engine's limit refuses, keeps its passes and runs them to
+// its last without it, rather than its first again, and the arrival runs
+// once memory allows.
 void testARefusedLaneWaitsForItsCommandsEnd() {
   PassingEngine passing;
   passing.submit(1, 300);
@@ -770,8 +772,12 @@ void testARefusedLaneWaitsForItsCommandsEnd() {
   for (const PassingEngine::Command &command : passing.commands)
     if (command.kind == WorkKind::Prefill && command.lanes == std::vector<uint64_t>{1})
       passes.push_back(command.pass);
-  require(passes == std::vector<uint32_t>{0, 0, 1, 2, 3, 4, 5},
-          "a command planned again with a lane prepare refused did not run its passes to its last without it");
+  std::string ran;
+  for (const uint32_t pass : passes)
+    ran += " " + std::to_string(pass);
+  require(passes == std::vector<uint32_t>{0, 1, 2, 3, 4, 5},
+          "a command whose superseding plan's new lane was refused its KV did not keep its passes: it ran passes" +
+              ran);
   require(passing.events.completedCount == 2 && passing.events.failedCount == 0,
           "the refused prompt did not run once memory allowed");
 }

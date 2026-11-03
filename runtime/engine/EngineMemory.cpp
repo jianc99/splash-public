@@ -541,6 +541,36 @@ std::optional<Engine::Denied> Engine::reserveReads(Request &active, const BatchI
                 plan.prefill ? "prefill history staging" : "hot KV cache"};
 }
 
+std::vector<uint64_t> Engine::growJoiners(const BatchPlan &plan, double now) {
+  const PlanContext context{.prefill = true, .supersedes = true, .now = now};
+  std::vector<uint64_t> refused;
+  const auto deny = [&](const Denied &entry) {
+    noteRefusal(request(entry.requestId), now, entry.denial);
+    refused.push_back(entry.requestId);
+  };
+  std::vector<const BatchItem *> granted;
+  for (const BatchItem &item : plan.items) {
+    if (betweenPasses(item.requestId))
+      continue;
+    Request &active = request(item.requestId);
+    if (const std::optional<Denied> kv = growLane(active, workEndOf(active, item, true), context))
+      deny(*kv);
+    else
+      granted.push_back(&item);
+  }
+  // Its reads once every lane has its KV, as in prepare(): a lane that
+  // converts moves the landed pages of the others to the index form too.
+  for (const BatchItem *item : granted) {
+    Request &active = request(item->requestId);
+    if (config_.spill.capable &&
+        (cache_.holdsIndexPages(item->requestId) ||
+         (plan.passes > 1 && gainsIndexPages(active.kvMode, item->promptOffset))))
+      if (const std::optional<Denied> memory = reserveReads(active, *item, context))
+        deny(*memory);
+  }
+  return refused;
+}
+
 Engine::Prepared Engine::refuse(std::span<const Denied> denied, const PlanContext &plan) {
   const bool spill = config_.spill.capable;
   // Partial admissions execute at their actual width. If no lane fits, the

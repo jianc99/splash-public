@@ -322,13 +322,27 @@ bool Engine::tick(double now) {
     // A command between its passes yields, whole, to a plan that supersedes
     // it (Scheduler::abandonsPasses), and its lanes that ended meanwhile
     // end. One that holds a lane of it is abandoned before it takes shape,
-    // its lanes then taking part in it as any lane does; any other once it
-    // runs, so that the command goes on while that one waits for memory.
+    // its lanes then taking part in it as any lane does, but only once the
+    // lanes it adds hold their memory for it (amend/S.md D2: its prepare
+    // returns Runnable): abandoned for lanes then refused, the command would
+    // run its passes again from its first for no one. Those refused wait
+    // for its end, as the lanes its first pass left out do; a claim of
+    // theirs that took the command (EngineVictims) gave it up already. Any
+    // other plan abandons it once it runs, so that the command goes on while
+    // that one waits for memory.
     const bool supersedes = scheduler_.abandonsPasses(*plan, in);
     if (supersedes && std::ranges::any_of(plan->items, [&](const BatchItem &item) {
           return betweenPasses(item.requestId);
         })) {
-      abandonPasses();
+      const std::vector<uint64_t> refusedJoiners = growJoiners(*plan, now);
+      if (!passCommand_) {
+        settleEndedBetweenPasses();
+      } else if (refusedJoiners.empty()) {
+        abandonPasses();
+      } else {
+        std::vector<uint64_t> &leftOut = passCommand_->progress.leftOut;
+        leftOut.insert(leftOut.end(), refusedJoiners.begin(), refusedJoiners.end());
+      }
       continue;
     }
     std::vector<ModelBatchItem> items;
