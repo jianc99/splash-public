@@ -82,7 +82,7 @@ struct MemoryLedger::Account final {
   // Growth the ledger decided that has not landed yet: held for this account
   // against every other until it grows, a claim cancels it or critical
   // pressure drops the pool to its floor; and what its victims free once
-  // their transfers land, the host's credit for it.
+  // their transfers land, which it waits for.
   uint64_t pendingGrowth = 0;
   uint64_t pendingLaterBytes = 0;
   uint64_t grows = 0;
@@ -716,20 +716,20 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 
 // R3 with amend/M.md B4. Pending growth grows once its bytes are free for
 // it, taking what its victims left once they landed as a claim's retry
-// takes it, on the host's credit of what its victims freed (the host's
-// footprint is then where it was), stays pending while the host refuses
-// it, and is cancelled once that take finds it short. Free room beyond
-// what the waiting claims, the lanes' projected growth and every pending
-// growth hold goes to the pools, the one whose next unit is worth most
-// first, while the host admits each unit and, once claims take a pool's
-// units, while a unit is worth its expected retake. At most one unit per
-// pass then displaces other memory,
-// outside critical pressure, when the victims cost less than the unit is
-// worth beyond its cycle: with the host's consent the victims need only meet
-// what the room lacks, and what its own victims free later is the pool's
-// pending growth; without it they free a whole unit now, which the growth
-// then takes from the host's footprint again (its credit), and what the
-// room lacks besides. The room is the pass's less what the pass has grown.
+// takes it, without the host's consent on the host's credit of what that
+// take releases (the host's footprint is then where it was), and is
+// cancelled once that take finds it short. Free room beyond what the
+// waiting claims, the lanes' projected growth and every pending growth hold
+// goes to the pools, the one whose next unit is worth most first, while the
+// host admits each unit and, once claims take a pool's units, while a unit
+// is worth its expected retake. At most one unit per pass then displaces
+// other memory, outside critical pressure, when the victims cost less than
+// the unit is worth beyond its cycle: with the host's consent the victims
+// need only meet what the room lacks, and what its own victims free later
+// is the pool's pending growth; without it they free a whole unit now,
+// which the growth then takes from the host's footprint again (its
+// credit), and what the room lacks besides. The room is the pass's less
+// what the pass has grown.
 bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
   bool acted = false;
   uint64_t waitingBytes = 0;
@@ -779,25 +779,31 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       const uint64_t others = less(pendingGrowthBytes(), account.pendingGrowth);
       // Of its victims' bytes at most what is in flight now has not landed.
       const uint64_t landed = less(account.pendingLaterBytes, returning().landingBytes);
-      bool met = less(less(freeBytes, grownBytes), plus(plus(others, waitingBytes), laneDemandBytes_)) >=
-                 account.pendingGrowth;
-      uint64_t credit = landed;
+      const bool consents = host.admits(account.pendingGrowth);
+      bool met = consents && less(less(freeBytes, grownBytes), plus(plus(others, waitingBytes), laneDemandBytes_)) >=
+                                 account.pendingGrowth;
+      uint64_t credit = 0;
       // Once they have landed, it takes what they left, as a claim's retry
       // does: the extents a demotion's landing empties, which only a take
       // releases, and the steps of its units still to go, within the
       // unit's worth beyond its cycle; what that starts lands for a later
-      // pass. Short, the growth is no longer worth what it takes, and holds
-      // nothing.
+      // pass. Without the host's consent it frees the whole unit now, its
+      // credit, as a displacement does: a landing frees its page into a
+      // kept extent, which leaves the host's footprint only as a take
+      // releases it, and the host's pass or a claim may have taken it for
+      // itself since. Short, the growth is no longer worth what it takes,
+      // and holds nothing.
       if (!met && landed >= account.pendingLaterBytes) {
         const Candidate next = candidate(index);
         const ClaimId claim = open({.cls = ClaimClass::Growth,
+                                    .timing = consents ? NeedTiming::CanWait : NeedTiming::Immediate,
                                     .holdSeconds = kValueHorizonSeconds,
                                     .benefitSeconds = std::max(0.0, next.benefit - next.cycle)});
         const FreeResult freed = freeFor(claim.value, {.bytes = account.pendingGrowth}, less(freeBytes, grownBytes),
-                                         false, false, AccountId{static_cast<uint8_t>(index)}, false);
+                                         false, false, AccountId{static_cast<uint8_t>(index)}, !consents);
         close(claim);
         met = freed.outcome == FreeOutcome::Met;
-        credit = std::max(credit, freed.nowBytes);
+        credit = consents ? 0 : freed.nowBytes;
         if (freed.outcome == FreeOutcome::Pending)
           account.pendingLaterBytes = freed.laterBytes;
         else if (freed.outcome == FreeOutcome::Short)

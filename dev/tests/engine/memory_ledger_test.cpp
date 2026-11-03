@@ -533,18 +533,20 @@ void testPendingGrowthIsReservedAgainstOthers() {
 }
 
 // Pending growth keeps its bytes until it grows, on the host's credit of
-// what its victims freed as they landed (amend/M.md B4): the host consents
-// to a store unit and the displacement demotes 1 GiB of cache for it; other
-// applications then take 1.5 GiB, so that once the demotion lands the host
-// would not admit the unit on its own. While other transfers in flight
-// could still hold the victims' bytes, the growth waits, pending; once they
-// land, it grows, the engine's footprint back where it was.
+// what its victims freed (amend/M.md B4): the host consents to a store unit
+// and the displacement demotes 1 GiB of cache for it; other applications
+// then take 612 MiB, so that the host would not admit the unit on its own.
+// While other transfers in flight could still hold the victims' bytes, the
+// growth waits, pending; once they land, it releases the extent its
+// demotion emptied and grows on what that gave back, the engine's
+// footprint back where it was.
 void testPendingGrowthGrowsOnItsLandedVictims() {
-  // 2148 MiB of headroom beside the engine's 7.5 GiB, then 612 MiB.
-  Fixture fixture(host(2148 * kMiB + 7680 * kMiB, MemoryPressure::Normal, {at(11000.0, 612 * kMiB + 7680 * kMiB)}),
+  // 2148 MiB of headroom beside the engine's 7.5 GiB, then 1.5 GiB.
+  Fixture fixture(host(2148 * kMiB + 7680 * kMiB, MemoryPressure::Normal, {at(11000.0, 1536 * kMiB + 7680 * kMiB)}),
                   8 * kGiB);
   FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
   TestSource cache("cache", &fixture.memory);
+  cache.landsIntoExtents = true;
   fixture.memory.hold("cache", kGiB);
   fixture.memory.hold("weights", 3584 * kMiB);
   cache.units = {unit(1, kGiB, 0.5, true)};
@@ -566,6 +568,38 @@ void testPendingGrowthGrowsOnItsLandedVictims() {
   require(experts.units() == 4 && fixture.governor->snapshot().reservedBytes == 0 &&
               fixture.memory.total() == 7680 * kMiB,
           "the pending growth did not grow on its landed victims' credit");
+}
+
+// Pending growth without the host's consent grows only on what its own
+// take gives the host back (amend/M.md B4: its footprint where it was): its
+// demotion lands into a kept extent, which a warning's host pass, short of
+// its margin, takes first at no cost; the growth's take then finds nothing
+// else that frees memory now within the unit's worth, and the store stays
+// as it was, the host's footprint where the pass left it.
+void testPendingGrowthCreditsOnlyWhatItsTakeReleases() {
+  // 3 GiB of headroom beside the engine's 7.5 GiB, then 512 MiB under
+  // macOS's warning.
+  Fixture fixture(host(3 * kGiB + 7680 * kMiB, MemoryPressure::Normal,
+                       {at(11000.0, 512 * kMiB + 7680 * kMiB, MemoryPressure::Warning)}),
+                  8 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
+  TestSource cache("cache", &fixture.memory);
+  cache.landsIntoExtents = true;
+  fixture.memory.hold("cache", kGiB);
+  fixture.memory.hold("weights", 3584 * kMiB);
+  cache.units = {unit(1, kGiB, 0.5, true)};
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  serve(ledger, experts, 400.0, 0.0, 10.0);
+  static_cast<void>(fixture.pass(10.5));
+  require(cache.taken == std::vector<uint64_t>{1} && fixture.governor->snapshot().reservedBytes == kGiB,
+          "the displacement did not pend on its demotion");
+  cache.land();
+  static_cast<void>(fixture.pass(11.5));
+  require(cache.taken == std::vector<uint64_t>{1, 1001} && experts.units() == 3 &&
+              fixture.memory.total() == 6656 * kMiB,
+          "the pending growth grew on the extent the host's pass gave back");
 }
 
 // Pending growth whose take finds what it still lacks worth more than the
@@ -2184,6 +2218,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testPendingGrowthIsReservedAgainstOthers", testPendingGrowthIsReservedAgainstOthers},
       {"testPendingGrowthGrowsOnItsLandedVictims", testPendingGrowthGrowsOnItsLandedVictims},
       {"testPendingGrowthTakesWhatItsLandedVictimsLeave", testPendingGrowthTakesWhatItsLandedVictimsLeave},
+      {"testPendingGrowthCreditsOnlyWhatItsTakeReleases", testPendingGrowthCreditsOnlyWhatItsTakeReleases},
       {"testAShortPendingGrowthHoldsNothing", testAShortPendingGrowthHoldsNothing},
       {"testTakenPendingGrowthIsCancelled", testTakenPendingGrowthIsCancelled},
       {"testOneHostRule", testOneHostRule},
