@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shlex
 import statistics
@@ -527,6 +528,99 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
             void(
                 f"ample start: macOS's memory pressure level was {level} before the run"
             )
+
+
+def ssd_cache(run: Run, tolerance: float) -> dict | None:
+    """A churn run's SSD cache in its /status samples (disk, on every
+    tree): the most it held within its limit (active KV, which may use the
+    volume's whole room, can take it past), the smallest limit it came
+    within the tolerance of (it filled it; None where it never did), its
+    smallest limit, the volume's free space at Ready, and the range of
+    limits under which it would have held within the tolerance of what it
+    held: from 1 - tolerance of the most it held up to, where it filled a
+    limit, that limit over 1 - tolerance. None for a run with no samples."""
+    disks = [sample["status"]["disk"] for sample in run.samples]
+    if not disks:
+        return None
+    held = max(min(disk["used_bytes"], disk["limit_bytes"]) for disk in disks)
+    filled = min(
+        (
+            disk["limit_bytes"]
+            for disk in disks
+            if disk["used_bytes"] >= (1 - tolerance) * disk["limit_bytes"]
+        ),
+        default=None,
+    )
+    return {
+        "held": held,
+        "filled": filled,
+        "limit": min(disk["limit_bytes"] for disk in disks),
+        "free": disks[0]["volume_available_bytes"],
+        "range": (
+            (1 - tolerance) * held,
+            math.inf if filled is None else filled / (1 - tolerance),
+        ),
+    }
+
+
+def compared_trees(cell: dict, tree: str) -> set[str]:
+    """The trees a churn cell's gates compare a tree under test with: the
+    floor = cap control's its reference; a candidate's the release, best
+    measured and SSD references and G3's, G6's and G10's."""
+    rule = cell.get("floor_rule") or {}
+    if tree == rule.get("candidate"):
+        return {rule["reference"]}
+    if tree not in cell.get("candidates", ["cand"]):
+        return set()
+    return {
+        *(cell.get("release") or {}).values(),
+        *cell.get("best_measured", []),
+        *cell.get("ssd", []),
+        cell.get("kept_decodes_reference"),
+        cell.get("ample_gate"),
+        cell.get("point_gate"),
+    } - {None}
+
+
+def compare_ssd_caches(cell: dict, runs: list[Run], tolerance: float) -> None:
+    """Voids each usable run of a tree under test whose SSD cache is not
+    comparable with that of a usable run of a tree its cell's gates compare
+    it with: no limit lies in both runs' ranges (ssd_cache). Under
+    --max-cache-disk auto the limit is a quarter of the volume's free space
+    beyond a floor (docs/server.md), so it moves with whatever else the disk
+    holds that day; it shapes a run only where the run fills it, and the
+    gates would credit the code with a cache held back in one run and not
+    in the other, or held back at different limits. The tolerance is the
+    gates' own: a cache that holds within it is within their resolution."""
+
+    def gib(size):
+        return f"{size / 2**30:.2f} GiB"
+
+    def held(cache):
+        return f"held at most {gib(cache['held'])}" + (
+            f", filling its {gib(cache['filled'])} limit"
+            if cache["filled"] is not None
+            else f" under a {gib(cache['limit'])} limit"
+        )
+
+    used = [run for run in runs if not run.invalid]
+    for run in used:
+        trees = compared_trees(cell, run.tree)
+        for other in (r for r in used if r.tree in trees):
+            mine, theirs = ssd_cache(run, tolerance), ssd_cache(other, tolerance)
+            if mine is None or theirs is None:
+                continue
+            if max(mine["range"][0], theirs["range"][0]) > min(
+                mine["range"][1], theirs["range"][1]
+            ):
+                reason = (
+                    f"SSD cache not comparable with {other.tree}'s {other.label}: "
+                    f"this run {held(mine)} ({gib(mine['free'])} free at Ready); "
+                    f"{other.label} {held(theirs)}"
+                )
+                run.invalid.append(reason)
+                run.voided.append(reason)
+                break
 
 
 # ---------------------------------------------------------- per-run facts
@@ -1956,6 +2050,11 @@ def analyze(spec: dict, results: list[Path]) -> dict:
         invalid += copies
     for run in runs:
         validate(run, spec, cells[run.cell])
+    for name, cell in cells.items():
+        compare_ssd_caches(
+            cell, [r for r in runs if r.cell == name], spec["gates"]["tolerance"]
+        )
+    for run in runs:
         if run.invalid:
             invalid.append(
                 unused_entry(cells[run.cell], run.label, run.tree, run.invalid)

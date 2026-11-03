@@ -1827,6 +1827,87 @@ class GateTests(unittest.TestCase):
             ],
         )
 
+    def test_an_ssd_cache_held_back_unlike_the_references_voids_the_run(self):
+        # --max-cache-disk auto limits the SSD cache to a quarter of the
+        # volume's free space beyond 10 GiB, so the free disk sets it. main's
+        # sMNb held at most 10.71 GiB under 12.04 GiB (11.50 of 12.93 GB on
+        # 62.6 GB free). On 50 GiB free a cand run's limit is 10 GiB: one that
+        # fills it was held back where sMNb was not, and is voided; one that
+        # held 8 GiB met neither limit, and counts. In the ample cell ntie's
+        # sNFb filled its 10.49 GiB (11.26 GB): a cand run on a cleaned disk
+        # holding 12.11 GiB under 14.90 GiB had room sNFb lacked, and is
+        # voided; one that filled 10.49 GiB counts, though r150's s150Fb,
+        # in none of that cell's gates, filled its 11.38 GiB.
+        spec = matrix.load_spec(SPEC)
+        names = ("s-fn-churn-18g", "s-fn-churn-ample")
+        spec = {**spec, "cells": [c for c in spec["cells"] if c["name"] in names]}
+        model = spec["models"]["fn-q2"]["model"]
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        for label, order, free, limit, held in (
+            ("sMNb", None, 58.3, 12.04, 10.71),
+            ("s-fn-churn-18g-cand-B1", [0, 1, 2], 50.0, 10.0, 9.95),
+            ("s-fn-churn-18g-cand-B2", [0, 1, 2], 50.0, 10.0, 8.0),
+            ("sNFb", None, 51.96, 10.49, 10.42),
+            ("sMFb", None, 54.6, 11.14, 10.82),
+            ("s150Fb", None, 55.5, 11.38, 11.34),
+            ("s-fn-churn-ample-cand-A1", [2, 0, 1], 69.6, 14.9, 12.11),
+            ("s-fn-churn-ample-cand-B1", [0, 1, 2], 51.96, 10.49, 10.45),
+        ):
+            samples = [
+                status(
+                    t,
+                    disk__limit_bytes=limit * 2**30,
+                    disk__used_bytes=used * 2**30,
+                    disk__volume_available_bytes=free * 2**30,
+                )
+                for t, used in ((0, 0), (900, held))
+            ]
+            churn_run(self.directory, label, done, samples)
+            if order:
+                (self.directory / f"{label}.meta.json").write_text(
+                    json.dumps(
+                        {
+                            "label": label,
+                            "cell": label.rsplit("-cand-", 1)[0],
+                            "tree_name": "cand",
+                            "order": order,
+                            "model": model,
+                            "complete": True,
+                        }
+                    )
+                )
+        document = matrix.analyze(spec, [self.directory])
+        self.assertEqual(
+            [
+                (u["label"], u["reasons"])
+                for u in document["invalid"]
+                if u["reasons"] != ["not run"]
+            ],
+            [
+                (
+                    "s-fn-churn-18g-cand-B1",
+                    [
+                        "SSD cache not comparable with main's sMNb: this run held "
+                        "at most 9.95 GiB, filling its 10.00 GiB limit (50.00 GiB "
+                        "free at Ready); sMNb held at most 10.71 GiB under a "
+                        "12.04 GiB limit"
+                    ],
+                ),
+                (
+                    "s-fn-churn-ample-cand-A1",
+                    [
+                        "SSD cache not comparable with ntie's sNFb: this run held "
+                        "at most 12.11 GiB under a 14.90 GiB limit (69.60 GiB "
+                        "free at Ready); sNFb held at most 10.42 GiB, filling its "
+                        "10.49 GiB limit"
+                    ],
+                ),
+            ],
+        )
+
     def test_scheduler_readouts_and_the_owners_conflict_report(self):
         # s-fn-churn-18g cand: 12 plans in 15 minutes left a request out for
         # the Index-page lane limit, past S's bound of 5 (amend/S.md D1);

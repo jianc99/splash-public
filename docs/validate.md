@@ -426,7 +426,13 @@ every round it was to run completed its N requests. An ample-memory run counts
 only if the experts were at their cap at Ready and macOS's memory pressure
 level was normal before `run.py` started the server, where it recorded one
 (the engine's `memory_pressure` is its band state, and right after the load
-macOS's own level can read warning for tens of seconds). G8 is
+macOS's own level can read warning for tens of seconds). A churn run of a
+tree under test counts only if its SSD cache is comparable with that of every
+run of the trees its cell's gates compare it with: `--max-cache-disk auto` sets
+the limit from the volume's free space that day, so some limit must hold
+each run within the gates' 2 % of what it held, from 98 % of the most it held
+within its limit up to, where it came within 2 % of its limit, that limit
+over 0.98 (the reason gives both runs' caches and this run's free space). G8 is
 judged on every candidate run of every scenario: a run whose server
 restarted, failed a request, had a Metal failure, or exited, was not ready in
 time or, once ready, did not let its scenario end (a request or `/status` it
