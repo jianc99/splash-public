@@ -1,0 +1,30 @@
+{
+  "source": "M6 ~/dev/vr16/churn/mSMa.status.jsonl (ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0): the 22 of its 68 prefill commands that ran alone and whole between two 2-s status samples, nothing in flight at either (amend/S.md S7): per command its number among the run's commands (scheduler.prefill_batches), the samples' deltas of model_timing.prefill.total_wall_ms, streamed_experts.prefill.read_bytes and kv_spill.history_stream.bytes, its lane's prompt_processed less its rows, its rows, and streamed_experts.resident at the first sample; expert_bytes is the least streamed_experts.arena_bytes / slots",
+  "experts": 24576,
+  "expert_bytes": 1382400,
+  "columns": ["command", "wall_ms", "weight_read_bytes", "spilled_kv_read_bytes", "position", "rows", "resident_experts"],
+  "commands": [
+    [37, 2591.797, 14119632896, 63897600, 9216, 512, 5128],
+    [38, 2599.168, 14301708288, 70287360, 9728, 512, 5128],
+    [39, 3295.92, 13079281664, 76677120, 10240, 512, 5128],
+    [40, 3950.956, 12234670080, 83066880, 10752, 512, 5128],
+    [41, 3695.896, 13432078336, 89456640, 11264, 512, 5128],
+    [42, 2617.73, 14369226752, 95846400, 11776, 512, 5128],
+    [43, 2684.056, 14892482560, 102236160, 12288, 512, 5128],
+    [44, 2625.649, 14485602304, 108625920, 12800, 512, 5128],
+    [45, 2614.299, 14411251712, 115015680, 13312, 512, 5128],
+    [46, 2678.037, 14846345216, 121405440, 13824, 512, 5128],
+    [47, 2688.394, 14830649344, 127795200, 14336, 512, 5128],
+    [48, 2711.56, 14974058496, 134184960, 14848, 512, 5128],
+    [49, 2699.489, 14915780608, 140574720, 15360, 512, 5128],
+    [50, 2757.802, 15297544192, 146964480, 15872, 512, 5128],
+    [54, 2743.719, 15151218688, 172523520, 17920, 512, 5128],
+    [55, 4404.079, 13767213056, 178913280, 18432, 512, 5128],
+    [56, 2764.814, 15289745408, 185303040, 18944, 512, 5128],
+    [57, 2716.355, 15057534976, 191692800, 19456, 512, 5128],
+    [58, 2746.847, 15352709120, 198082560, 19968, 512, 5128],
+    [61, 2726.661, 15208398848, 217251840, 21504, 512, 5128],
+    [62, 2749.696, 15311732736, 223641600, 22016, 512, 5128],
+    [63, 2813.488, 15566307328, 230031360, 22528, 512, 5128]
+  ]
+}

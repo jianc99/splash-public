@@ -42,8 +42,8 @@ std::string_view costTermName(CostTerm term) noexcept {
   return "";
 }
 
-CostModel::CostModel(double decodeGapMilliseconds) noexcept
-    : resolution_(decodeGapMilliseconds * kPassOverheadShare) {
+CostModel::CostModel(double decodeGapMilliseconds, double decay) noexcept
+    : resolution_(decodeGapMilliseconds * kPassOverheadShare), decay_(decay) {
   precision_.fill(1.0);
   unit_[kUnits] = 1.0;
 }
@@ -163,7 +163,7 @@ void CostModel::observe(const model::CommandWork &realized, const model::Command
   errors_[errorCount_++ % kErrorSamples] = std::fabs(price(expected) - milliseconds) / milliseconds;
   // A command's passes decay the sums once together, and their bytes sum to
   // the command's.
-  const double decay = std::pow(kDecay, weight);
+  const double decay = std::pow(decay_, weight);
   realizedWeight_ = decay * realizedWeight_ + double(realized.weightReadBytes);
   expectedWeight_ = decay * expectedWeight_ + double(expected.weightReadBytes);
   realizedSpilled_ = decay * realizedSpilled_ + double(realized.spilledKvReadBytes);
@@ -194,6 +194,19 @@ void CostModel::observe(const model::CommandWork &realized, const model::Command
   timeSquares_ = decay * timeSquares_ + time * time / weight;
   commands_ = decay * commands_ + weight;
   ++samples_;
+  solve();
+}
+
+void CostModel::age(uint32_t commands) {
+  const double decay = std::pow(decay_, commands);
+  for (double *sum :
+       {&realizedWeight_, &expectedWeight_, &realizedSpilled_, &expectedSpilled_, &timeSquares_, &commands_})
+    *sum *= decay;
+  for (CostVector &row : normal_)
+    for (double &sum : row)
+      sum *= decay;
+  for (double &sum : moment_)
+    sum *= decay;
   solve();
 }
 
