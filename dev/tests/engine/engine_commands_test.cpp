@@ -1181,59 +1181,77 @@ void testAnEndedLaneLeavesAStartResident() {
           "a start counted a lane that had ended between its command's passes");
 }
 
+// The fixture of the two tests below: a governed target whose prefill
+// commands hold a chunk each, in passes where a lane of their priority
+// decodes (Scheduler::planPrefill), and whose model takes a state's buffers
+// through the governor (Executor::memory), beside a lane that decodes
+// within its one page and holds no state. Whatever frees memory for a
+// state's buffers there is a lane's conversion: no state is cached, no
+// extent is empty but the Index runway, and nothing of the decoding lane's
+// converts (amend/M.md B7: its pages hold no block past its dense history
+// and tail window). Its commands take the test's times, which train
+// nothing: their shapes follow the seed.
+struct ConvertingLanes final {
+  ConvertingLanes() {
+    spill.model.memory = &spill.host.memory;
+    spill.model.admission = spill.host.governor.allocationAdmission();
+    test::seedAsStartup(spill.engine, spill.model);
+    spill.model.commandTimes = [](const BatchPlan &, std::span<const ModelBatchItem>) { return test::CommandTimes{}; };
+    EngineRequest decoding = request(kDecoding, {1});
+    decoding.maxNewTokens = 20;
+    spill.engine.submit(std::move(decoding));
+    spill.runUntil([&] { return spill.events.outputs.contains(kDecoding); }, "the lane beside did not decode");
+  }
+  static constexpr uint64_t kDecoding = 9;
+  Spilling spill{Spilling::Governed{}, 256, false, {4}, 0,
+                 test::commandShape(model::ExecutionLimits::prefillTokenBudget, 4)};
+};
+
 // A lane in passes whose replay point the first pass's preparation is
 // refused, with nothing but the lane itself to give memory back, converts
 // to Spill there: the plan made with it Resident goes back to the scheduler
 // (Prepared::Replan), and the one made again runs in passes, the lane
 // holding the staging its pages that land between them need (the model
-// checks a lane reads no Index page without it).
+// checks a lane reads no Index page without it). Its conversion is offered
+// for what its pages past its dense history and tail window free as they
+// spill (amend/M.md B7), which its first command wrote: the prompt's
+// replay point, at its last page, is in its second.
 void testALaneThatConvertsInItsFirstPassReplans() {
-  Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4));
-  std::vector<std::tuple<uint64_t, uint32_t, uint32_t>> prefills;
-  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
-    if (plan.kind == WorkKind::Prefill)
-      prefills.emplace_back(plan.items.front().requestId, plan.pass, plan.passes);
+  ConvertingLanes fixture;
+  Spilling &spill = fixture.spill;
+  // Each prefill pass of the prompt: its pass, its command's passes, the
+  // conversions before it and the Index pages the prompt read.
+  struct Pass final {
+    uint32_t pass, passes;
+    uint64_t converted;
+    uint32_t indexPages;
+  };
+  std::vector<Pass> prefills;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    if (plan.kind == WorkKind::Prefill && items.front().requestId == 2)
+      prefills.push_back({plan.pass, plan.passes, spill.engine.snapshot().spill.converted,
+                          items.front().pageSources ? items.front().pageSources->indexPages() : 0});
     return test::CommandTimes{};
   };
-  // As testALaneBetweenItsPassesDoesNotConvert, a chain whose copies are on
-  // the SSD cache, here of 13 pages.
-  spill.storage.budgetPages = 9;
-  spill.engine.submit(Spilling::prompt(1, 1, 7, 200));
-  spill.runUntilIdle();
-  std::vector<uint32_t> history(7 * KvCache::pageTokens + 1, 1);
-  history.insert(history.end(), spill.events.outputs.at(1).begin(), spill.events.outputs.at(1).end());
-  spill.storage.budgetPages = std::numeric_limits<uint32_t>::max();
-  spill.engine.submit(request(2, history));
-  spill.runUntilIdle();
-  // Nothing ordinary is left in memory: the chain is on the SSD cache alone.
-  for (int step = 0; step < 100; ++step) {
-    spill.tier.complete();
-    static_cast<void>(spill.cache.pollTransfers());
-    if (!spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress &&
-        !spill.cache.transfersInFlight())
-      break;
-  }
-  // The next turn restores it, Resident, its copies kept, and runs in
-  // passes up to its replay point, at the chain's end, which the engine's
-  // limit refuses until the lane has converted; a state outweighs every
-  // extent the pool could give back, as one does.
-  test::seedAsStartup(spill.engine, spill.model);
-  spill.model.stateBytes = 100'000;
-  const auto replay = static_cast<uint32_t>((history.size() - 1) / KvCache::pageTokens * KvCache::pageTokens);
+  // Once its first command has run, the engine's limit leaves no room
+  // beyond what the engine holds.
+  bool closed = false;
   spill.model.reservationObserver = [&] {
-    spill.model.denyReservationAt = spill.engine.snapshot().spill.converted > 1 ? 0 : replay;
+    if (!closed && spill.model.requests.contains(2) && spill.model.requests.at(2).position != 0) {
+      closed = true;
+      spill.host.leaveRoom(0);
+    }
   };
-  spill.engine.submit(request(3, history));
+  spill.engine.submit(Spilling::prompt(2, 2, 79, 1));
   spill.runUntilIdle();
-  require(spill.events.failedCount == 0 && spill.events.completedCount == 3 &&
-              spill.engine.snapshot().spill.converted == 2,
+  require(closed && spill.events.failedCount == 0 && spill.events.completedCount == 2 &&
+              spill.engine.snapshot().spill.converted == 1,
           "the lane did not convert in its first pass and finish");
-  using Pass = std::tuple<uint64_t, uint32_t, uint32_t>;
-  require(spill.engine.snapshot().replans >= 1 && std::ranges::any_of(prefills,
-                                                                      [](const Pass &each) {
-                                                                        return std::get<0>(each) == 3 &&
-                                                                               std::get<2>(each) > 1;
-                                                                      }),
+  require(prefills.front().converted == 0 && prefills.front().passes > 1 && spill.engine.snapshot().replans >= 1 &&
+              std::ranges::any_of(prefills,
+                                  [](const Pass &each) {
+                                    return each.converted == 1 && each.passes > 1 && each.indexPages != 0;
+                                  }),
           "the command the lane converted in was not planned again and run in passes");
 }
 
@@ -1244,7 +1262,8 @@ void testALaneThatConvertsInItsFirstPassReplans() {
 // again runs, the converted lane holding the staging its pages that land
 // between passes need.
 void testACommandAnyLaneConvertsInReplans() {
-  Spilling spill(256, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4));
+  ConvertingLanes fixture;
+  Spilling &spill = fixture.spill;
   // Each prefill command's lanes and passes.
   using Command = std::pair<std::vector<uint64_t>, uint32_t>;
   std::vector<Command> prefills;
@@ -1257,9 +1276,15 @@ void testACommandAnyLaneConvertsInReplans() {
     }
     return test::CommandTimes{};
   };
-  test::seedAsStartup(spill.engine, spill.model);
+  // Once the short prompt has started, the engine's limit leaves room for
+  // one state's buffers: its replay point, which it reserves first as the
+  // command's leader, takes them, and the long prompt's is refused.
+  bool closed = false;
   spill.model.reservationObserver = [&] {
-    spill.model.denyReservationAt = spill.engine.snapshot().spill.converted ? 0 : 79 * KvCache::pageTokens;
+    if (!closed && spill.model.requests.contains(1)) {
+      closed = true;
+      spill.host.leaveRoom(test::State().bytes());
+    }
   };
   // The long prompt's first chunk runs in passes; the short one, which
   // arrives before its last, too late to join it, leads the next command.
@@ -1268,9 +1293,12 @@ void testACommandAnyLaneConvertsInReplans() {
                  "the long prompt did not run three passes");
   spill.engine.submit(Spilling::prompt(1, 1, 1, 1));
   spill.runUntilIdle();
-  require(spill.events.failedCount == 0 && spill.events.completedCount == 2 &&
+  require(closed && spill.events.failedCount == 0 && spill.events.completedCount == 3 &&
               spill.engine.snapshot().spill.converted == 1 && prefills.front() == Command{{2}, 4} &&
-              spill.engine.snapshot().replans >= 1,
+              spill.engine.snapshot().replans >= 1 &&
+              std::ranges::any_of(prefills, [](const Command &command) {
+                return command.first == std::vector<uint64_t>{1, 2};
+              }),
           "the command a lane converted in was not planned again");
 }
 
