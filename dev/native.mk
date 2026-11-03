@@ -716,9 +716,13 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # the 24 GB M6, 11-02: the spill runtime's arenas 2.27 GB, four FP32 lane
 # states 1.11 GB, 17 Full extents 1.84 GB, the hot block cache's floor for
 # two lanes 0.61 GB, Index extents and staging). On a 24 GB Mac all three
-# runs take ORACLE_ARGS="--expert-memory 6656M", or 5632M where the
-# installation serves vision, whose default checks alone fit only up to
-# about 7700M (docs/validate.md).
+# runs take ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M", or
+# "--expert-memory 5632M --ple-memory 237M" where the installation serves
+# vision, whose default checks alone fit only up to about 7700M of experts
+# (docs/validate.md). Without --ple-memory the oracle loads
+# Qwen3.8-Flash-Next's PLE table whole (the weights then need 37555 MiB, M6
+# 11-03) where splash serve streams it; 237M is the row cache splash serve
+# gives it on the M6.
 ORACLE_ARGS ?=
 VISION_FIXTURE_FAMILY := import json, pathlib, sys; \
 	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
