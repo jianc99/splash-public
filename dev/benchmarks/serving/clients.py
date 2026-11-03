@@ -215,16 +215,16 @@ class Recorder:
 
 
 def poll_status(
-    port: int, recorder: Recorder, until, period: float, reduce=None
+    port: int, recorder: Recorder, until, period: float, observe=None
 ) -> None:
     """Records /status every `period` seconds until until() is true; with
-    `reduce`, also an event of what it returns for each sample."""
+    `observe`, also hands it each sample."""
     while not until():
         try:
             status = get_json(port, "/status", timeout=30)
             recorder.sample(status)
-            if reduce is not None:
-                recorder.emit("status", **reduce(status))
+            if observe is not None:
+                observe(status)
         except Exception as error:  # recorded: a run with gaps in its samples says so
             recorder.emit("status_error", error=str(error)[:200])
         time.sleep(period)
@@ -314,9 +314,10 @@ def run_churn(
     """A churn run. Workers send requests until `minutes` have passed and
     finish the one they have in flight; the run ends 4 s after the last. A
     request the server keeps streaming `timeout` seconds after its send ends
-    its worker; the end record lists it, as every request still open, with
-    its open gap or, before its first token, as unanswered, and the run
-    raises Deadline."""
+    its worker with a deadline record of its chunk times; the end record
+    lists it, as every request still open, with its open gap or, before its
+    first token, as unanswered, and the run raises Deadline. Each /status
+    sample also logs churn_status_event's values as an event."""
     model = served_model(port)
     recorder = Recorder(directory, label)
     end = recorder.start + minutes * 60
@@ -329,10 +330,18 @@ def run_churn(
         chunks: list[float] = []
         with recorder.lock:
             open_streams[tag] = chunks
+        sent = time.time()
         try:
             stream = Stream(port, churn_body(model, messages), timeout, chunks=chunks)
         except Deadline as error:
-            recorder.emit("deadline", tag=tag, chunks=len(chunks), error=str(error))
+            # Its chunk times, as a done record's, for its gaps' causes.
+            recorder.emit(
+                "deadline",
+                tag=tag,
+                start=round(sent - recorder.start, 1),
+                chunks_ms=[round((t - sent) * 1000) for t in chunks],
+                error=str(error),
+            )
             with recorder.lock:
                 expired.append(tag)
             raise
@@ -380,10 +389,13 @@ def run_churn(
             if answer is not None:
                 previous = churn_resend(messages, answer)
 
+    def observe(status):
+        recorder.emit("status", **churn_status_event(status))
+
     done = threading.Event()
     poller = threading.Thread(
         target=poll_status,
-        args=(port, recorder, done.is_set, poll_seconds, churn_status_event),
+        args=(port, recorder, done.is_set, poll_seconds, observe),
         daemon=True,
     )
     poller.start()
@@ -467,6 +479,10 @@ TTFT_GAUGES = (
     "state.entries",
     "kv.pages_cache",
 )
+# memory_governor.claims' fields a round reports at their largest over the
+# /status samples taken while it ran (amend/M.md A62/A65: a round whose
+# starts waited for memory is memory-staggered).
+TTFT_CLAIMS = ("waiting", "bytes", "oldest_ms")
 
 
 def ttft_corpus() -> str:
@@ -593,6 +609,16 @@ def counter_deltas(before: dict, after: dict) -> dict:
     return out
 
 
+def largest_claims(claims: list) -> dict | None:
+    """Each TTFT_CLAIMS field at its largest over these
+    memory_governor.claims, None where no sample had any (a tree before
+    schema 7)."""
+    claims = [c for c in claims if c]
+    if not claims:
+        return None
+    return {field: max(c.get(field, 0) for c in claims) for field in TTFT_CLAIMS}
+
+
 def ttft_request_record(stream: Stream, recorder: Recorder) -> dict:
     lat = stream.metrics.get("request_latency") or {}
     first = stream.first or stream.ended
@@ -634,9 +660,15 @@ def run_ttft(
     model = served_model(port)
     recorder = Recorder(directory, label)
     done = threading.Event()
+    # The memory claims of the samples since the round began.
+    claims: list = []
+
+    def observe(status):
+        claims.append(dig(status, "memory_governor.claims"))
+
     poller = threading.Thread(
         target=poll_status,
-        args=(port, recorder, done.is_set, poll_seconds),
+        args=(port, recorder, done.is_set, poll_seconds, observe),
         daemon=True,
     )
     poller.start()
@@ -664,6 +696,7 @@ def run_ttft(
             for messages in requests:
                 digest.update(json.dumps(messages).encode())
             before = wait_idle(port, settle)
+            claims.clear()
             barrier, streams = threading.Barrier(n), [None] * n
 
             def send(i, requests=requests, barrier=barrier, streams=streams):
@@ -718,6 +751,9 @@ def run_ttft(
                 "prompt": [x["prompt"] for x in ranked],
                 "prefilled": [x["prefilled"] for x in ranked],
                 **counter_deltas(before, after),
+                "memory_governor.claims": largest_claims(
+                    [*claims, dig(after, "memory_governor.claims")]
+                ),
             }
             recorder.emit("round", **record)
             records.append(record)

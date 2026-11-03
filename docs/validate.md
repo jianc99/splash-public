@@ -348,7 +348,7 @@ schema, and the client times what a user sees.
 | Scenario | Requests |
 | --- | --- |
 | `churn` | three clients, each sending 1500-token answers to prompts that grow every round (about 8K tokens, then more; `CHURN_BASE`/`CHURN_STEP` words), every fourth round resending its conversation, the first requests in a fixed arrival order (`--order 2,0,1` or `0,1,2`, 0.6 s apart), for `--minutes`; `/status` every 2 s |
-| `ttft` | for each N of `--n`, on a fresh server: N conversations cache an ~8K-token prefix one at a time, then send it with distinct ~300-token suffixes at the same instant, `--rounds` times; `/status` every 0.5 s |
+| `ttft` | for each N of `--n`, on a fresh server: N conversations cache an ~8K-token prefix one at a time, then send it with distinct ~300-token suffixes at the same instant, `--rounds` times, each round recording its `/status` counters' changes and the largest `memory_governor.claims` its samples showed; `/status` every 0.5 s |
 | `serve1` | one request at a time on an idle server, cold prompts of about `--sizes` tokens (300, 2K and 14K): time to first token and decode milliseconds per token; the `/status` each request waited idle for, and one after the last |
 | `warm` | per cached depth of `--sizes`, a fresh cold prefix, then 2 discarded and 8 measured ~300-token suffixes after it: the server's prompt time of each (`--trial` picks the texts, the same for every tree); `/status` as `serve1` |
 
@@ -358,9 +358,9 @@ intervals between consecutive chunks after the first. Each request may take
 the machine's recorded runs, `longest_request_s` in the spec; `run.py`'s
 default is twice the longest on any machine): one the server keeps streaming
 past it, though its keepalives hold the connection open, ends the scenario as
-the server's failure; in `churn` its client stops, and the end record lists
-every request still open, with its open gap or, before its first token, as
-unanswered.
+the server's failure; in `churn` its client stops with a record of the
+request's chunk times, and the end record lists every request still open,
+with its open gap or, before its first token, as unanswered.
 
 ```sh
 .venv/bin/python -m dev.benchmarks.serving.run --tree TREE --machine m6 \
@@ -400,10 +400,20 @@ runs per tree and order, recorded reference runs, gates).
   the load window, every client served, health and gaps); `check --running
   GPUQ` lists queued jobs running past twice the time the first finished job
   of their type took on that Mac (20 minutes per churn run without one).
-- `analyze --results DIR... --out DIR` applies the gates to every cell with
-  results and writes `verdict.json` and `verdict.md`: PASS, FAIL or
-  INCONCLUSIVE with the numbers (a candidate none of whose runs is usable
-  gets its gates INCONCLUSIVE, naming its runs), the trades for the owner,
+- `analyze --results DIR... --build cand=BUILD_ID --out DIR` applies the
+  gates to every cell with results, on the runs of each tree's build under
+  test (`--build NAME=BUILD_ID`, cand's at least, as its
+  `build/engine/build-identity.json` names it): a run whose `run.py` build id
+  is another, a single cell's comparison whose candidate rounds ran another,
+  or a second copy of a label in another results directory is not used (a
+  comparison that ended in an error before it wrote its rounds names no
+  build and is judged on that error). It reads every run of a cell, planned
+  or a rerun (a rerun takes the next repeat number); an ABBA set whose cand
+  runs are all of another build is passed over. It writes `verdict.json`
+  and `verdict.md`: PASS, FAIL or INCONCLUSIVE with the numbers (a candidate
+  none of whose runs is usable gets its gates INCONCLUSIVE, naming its runs,
+  and a churn cell without a complete run of its prices its work gates),
+  the trades for the owner,
   every run it did not use and why, a run a cell plans that left no record
   as not run, and per fixed-order set of each churn cell the per-run numbers
   of `bin/cmp.py` and `pertag.py`.
@@ -415,10 +425,22 @@ one `/status` counts in `requests.failed`), it saw no `serious` or `critical`
 thermal sample, it served the cell's model, no process it did not start was
 among the top five by CPU at 24 % or more (`foreign_cpu_percent` in the spec,
 whose note gives its source), and, on the M5 Pro, its owner neither touched
-it (HIDIdleTime under 10 s) nor had a process the run did not start hold a
-display or system sleep assertion. A TTFT run's concurrency counts only where
+it (HIDIdleTime under 10 s) nor had an app hold a display or system sleep
+assertion: a process the run did not start other than powerd, which holds one
+itself whenever the display is on. A TTFT run's concurrency counts only where
 every round it was to run completed its N requests. An ample-memory run counts
-only if the experts were at their cap with pressure normal at Ready. G8 is
+only if the experts were at their cap at Ready and macOS's memory pressure
+level was normal before `run.py` started the server, where it recorded one
+(the engine's `memory_pressure` is its band state, and right after the load
+macOS's own level can read warning for tens of seconds). A churn run of a
+tree under test is compared only if its SSD cache is comparable with that of
+every usable run of the trees its cell's gates compare it with (the floor =
+cap control's with cand's): `--max-cache-disk auto` sets
+the limit from the volume's free space that day, so some limit must hold
+each run within the gates' 2 % of what it held, from 98 % of the most it held
+within its limit up to, where it came within 2 % of its limit, that limit
+over 0.98 (the reason gives both runs' caches and this run's free space); one
+that is not is still judged on its G4, G8 and G9. G8 is
 judged on every candidate run of every scenario: a run whose server
 restarted, failed a request, had a Metal failure, or exited, was not ready in
 time or, once ready, did not let its scenario end (a request or `/status` it
@@ -450,15 +472,15 @@ resolve it.
 | Gate | Rule |
 | --- | --- |
 | G1, G2 | work and decode rate against 1.5.0: within 5 % only with a clear gain on TTFT, completion latency, freezes (1.5.0's own runs with a decode gap at or past the machine's G4 floor while the candidate holds G4) or concurrent TTFT, else no loss at all; completion latency: no loss at all |
-| G3 | TTFT against main within 2 %, failing once surely worse; under a memory cap also when G2 passes, no decode froze, and the TTFT is not surely worse than the cell's best tree that kept decoding |
-| G4 | per candidate run: contended prefill p95 and client gap p99 within the run's own bound (`max(decode_gap_target_ms, u/0.1)` with its estimate's p95 error), every client gap under the smallest stall rejected on that machine |
+| G3 | TTFT against main within 2 %, failing once surely worse; under a memory cap also when G2 passes, no decode froze, and the TTFT is not surely worse than the cell's best tree that kept decoding, INCONCLUSIVE when only a usable run of that tree is missing |
+| G4 | per candidate run: contended prefill p95 and the p99 of the client gaps between token events (chunks less than half the shortest decode command apart are one event's) within the run's own bound (`max(decode_gap_target_ms, u/0.1)` with its estimate's p95 error), every client gap under the smallest stall rejected on that machine |
 | G5 | concurrent TTFT: per N the median of each round's worst, at most the reference's times one plus its own spread |
 | G6 | ample memory: work, latency and TTFT within 2 % of the best measured tree, failing once surely worse |
-| G7 | single requests (`test-performance-real` against the base, `serve1`, `warm`): `abba.compare` on every metric, in session |
+| G7 | single requests (`test-performance-real` against the base, `serve1`, `warm`): `abba.compare` on every metric, in session; a single cell's job removes an earlier comparison before its make and copies only the one its make wrote |
 | G8, G9 | no restart, failed request, Metal failure or tick past 5 s; warm start within the base's plus the warm-up; memory accounts summing to the charged bytes, nothing owed at the end, no claim waiting past the resource wait |
 | SSD | disk and expert bytes per unit of work not surely above both release references |
 | Tags | no tag whose every candidate run is past the references' worst by their own spread |
-| G10 | dense, resident, Flint and Apple9 cells against the base: work and TTFT point estimates within 2 %, and no G4 failure |
+| G10 | dense, resident, Flint and Apple9 cells against the base: work and TTFT within 2 % by the interval rule (TTFT cells on each round's worst), failing once surely worse, and no G4 failure; undecided goes to the owner |
 | Floor | the Flash-Next store held at its cap becomes the floor default only when no metric is worse than the value default's and one is better; mixed results go to the owner |
 
 Each candidate churn run also reports, with nothing judged on them, its
@@ -470,4 +492,22 @@ sample interval's `prefill_rows` per committed command, p10, p50, p90 and
 max, with its pass commands and units) and its
 `scheduler.index_page_conflicts` per 15 minutes; a run past 5 per 15
 minutes (`index_page_conflicts_per_15min`, the scheduler's bound) is
-reported to the owner.
+reported to the owner. It counts its client gaps above its G4 bound by
+cause, those of a request it ended at its deadline and those the end
+record lists as open among them, each gap taking the first of these that
+the `/status` samples from 2 s before it to 2 s after it show: a claim
+waiting for memory, the experts' size changing, a compaction, a replan, a
+history-stream wait, a committed prefill command; else it is
+unattributed. It reports the share
+of the commands that trained each `scheduler.estimate` whose time it
+clamped; per use of the streamed experts the share of those read (not
+resident) that were read ahead, over the sample intervals in which a
+history stream read and over the rest; the most of its `phys_footprint`
+macOS held compressed and the largest share of it that was; and its
+unbooked memory (`phys_footprint` less the accounts) as its change since
+the first ready sample, at its largest while no request was live and while
+one was, with that sample's context. A growth past 256 MiB
+(`unbooked_growth_bytes`) is reported for the fix round to book. Where
+`memory_governor.host_telemetry` is absent or null, as on the references,
+the last two read not reported; `verdict.json` keeps their per-sample
+series beside the run's numbers.

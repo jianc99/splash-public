@@ -5,26 +5,35 @@
         --tools ~/dev/vr16/cand --out ~/bench/1.6.0 --jobs ~/gpuq/pending --first 20
     python3 -m dev.benchmarks.serving.matrix check RUN_DIR LABEL [--minutes 15]
     python3 -m dev.benchmarks.serving.matrix check --running ~/gpuq
-    python3 -m dev.benchmarks.serving.matrix analyze --spec SPEC --results DIR... --out DIR
+    python3 -m dev.benchmarks.serving.matrix disk --spec SPEC --results DIR... --cell CELL
+    python3 -m dev.benchmarks.serving.matrix analyze --spec SPEC --results DIR... \\
+        --build cand=<build id>[,<build id>...] --out DIR
 
 plan writes one job script per run, each holding the machine's GPU lock
 around run.py, interleaved so that no tree owns the start or end of a
 machine's queue (--references plans the reference runs a cell still lacks).
 check judges one run on its own (completion, structural minimum, health,
 bounded gaps), or lists the queued jobs running past twice their expected
-time. analyze applies the spec's gates (DESIGN-1.6.0 §8.3 as amended by
-amend/V.md §5 and the owner's rulings) to every cell with results and writes
-verdict.json and verdict.md: PASS, FAIL or INCONCLUSIVE with the numbers, the
-trades for the owner, the runs it did not use and why (a planned run that
-left no record as not run), and per fixed-order set of each churn cell the
-numbers of bin/cmp.py and pertag.py.
+time. disk refuses (exit 1) a churn run whose free disk would leave its SSD
+cache incomparable with its references'. analyze applies the spec's gates
+(DESIGN-1.6.0 §8.3 as amended by amend/V.md §5 and the owner's rulings) to
+every cell with results, on the runs of each tree's builds under test
+(--build; several pooled when the change between them is behaviour-neutral;
+a rerun takes the next repeat number, and one copy of a label counts), and
+writes verdict.json and
+verdict.md: PASS, FAIL or INCONCLUSIVE with the numbers, the trades for the
+owner, the runs it did not use and why (a planned run that left no record as
+not run), and per fixed-order set of each churn cell the numbers of
+bin/cmp.py and pertag.py.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import shlex
 import statistics
 import sys
@@ -41,7 +50,16 @@ from dev.benchmarks.serving.stats import FAIL, INCONCLUSIVE, PASS
 # forensics' yardstick, bin/cmp.py): run.py polls /status through the drain,
 # the references churn_ord.py recorded stopped 5 s after the window.
 WORK_SECONDS = 900
+# Content chunks closer than this are one token event's: the server sends
+# each token of an event as its own chunk, back to back (server/backend.py
+# CallbackStreamer.put_tokens), DFlash2 committing about eight a lane per
+# command, while a lane's next event comes a decode command later, at least
+# 17.3 ms (Flint at width 1, the shortest measured: dev/tests/engine/
+# TimingProfile.cpp). Half of that is the split farthest from both.
+TOKEN_EVENT_MS = 17.3 / 2
 THERMAL_VOID = ("serious", "critical")
+# The suffix of a single cell's backend regression result beside its label.
+SINGLE_RESULTS = ".backend-regression.json"
 HIGHER_IS_BETTER = {"work": True, "decode": True, "latency": False, "ttft": False}
 
 
@@ -104,12 +122,12 @@ def run_label(cell: str, tree: str, order: str, repeat: int) -> str:
     )
 
 
-def abba_runs(cell: dict) -> list[tuple[str, str, int]]:
-    """The runs of an in-session ABBA cell, set by set: reference, cand,
-    cand, reference."""
+def abba_runs(cell: dict, sets: int) -> list[tuple[str, str, int]]:
+    """The runs of `sets` sets of an in-session ABBA cell, set by set:
+    reference, cand, cand, reference."""
     reference = cell["abba"]["reference"]
     runs = []
-    for index in range(cell["abba"].get("sets", 1)):
+    for index in range(sets):
         first, second = 2 * index + 1, 2 * index + 2
         runs += [
             (reference, "-", first),
@@ -120,19 +138,21 @@ def abba_runs(cell: dict) -> list[tuple[str, str, int]]:
     return runs
 
 
-def locate(results: list[Path], label: str) -> Path | None:
-    """The results directory holding a run: its run.py meta.json, written
-    also for a run that did not reach its scenario, or its client's
+def holds(directory: Path, label: str) -> bool:
+    """Whether a results directory holds a run: its run.py meta.json,
+    written also for a run that did not reach its scenario, or its client's
     records."""
-    for directory in results:
-        if (
-            (directory / f"{label}.meta.json").exists()
-            or (directory / f"{label}.events.jsonl").exists()
-            or (directory / f"{label}.jsonl").exists()
-            or any(directory.glob(f"{label}-n*.events.jsonl"))
-        ):
-            return directory
-    return None
+    return (
+        (directory / f"{label}.meta.json").exists()
+        or (directory / f"{label}.events.jsonl").exists()
+        or (directory / f"{label}.jsonl").exists()
+        or any(directory.glob(f"{label}-n*.events.jsonl"))
+    )
+
+
+def locate(results: list[Path], label: str) -> Path | None:
+    """The first results directory holding a run."""
+    return next((directory for directory in results if holds(directory, label)), None)
 
 
 # ------------------------------------------------------------------ runs
@@ -149,11 +169,12 @@ def run_files(directory: Path, label: str, kind: str) -> list[Path]:
 
 
 class Run:
-    """One run's records: its done requests, the requests the server failed,
-    its end, /status samples and events (a ttft run's over its levels) and
-    meta, and the reasons it may not be used: `invalid` all of them,
-    `voided` those not the server's own failure. A churn run's work is read
-    at `window` seconds."""
+    """One run's records: its done requests, the requests the server failed
+    and those the client ended at their deadline, its end, /status samples
+    and events (a ttft run's over its levels) and meta, and the reasons it
+    may not be used: `invalid` all of them, `voided` those not the server's
+    own failure, nor an SSD cache not comparable with its references'. A
+    churn run's work is read at `window` seconds."""
 
     def __init__(
         self,
@@ -177,13 +198,27 @@ class Run:
         self.invalid: list[str] = []
         self.voided: list[str] = []
         out = directory / f"{label}.out"
-        self.complete = out.exists() and out.read_text().rstrip().endswith("DONE")
+        text = out.read_text() if out.exists() else ""
+        self.complete = text.rstrip().endswith("DONE")
+        # The build run.py measured: its meta.json's, or for a run killed
+        # before it wrote one, the build its .out named before the server
+        # started ("root ... build ID").
+        self.build = self.meta.get("build_id") or next(
+            (
+                line.rsplit(" build ", 1)[1]
+                for line in text.splitlines()
+                if line.startswith("root ") and " build " in line
+            ),
+            None,
+        )
         events = [
             e
             for path in run_files(directory, label, "events")
             for e in read_jsonl(path)
         ]
         self.done = {e["tag"]: e for e in events if e.get("kind") == "done"}
+        # Churn's requests the client ended at their deadline.
+        self.expired = [e for e in events if e.get("kind") == "deadline"]
         # Churn's HTTP errors but context_length_exceeded (error events of
         # streams the server had begun among them), and each request of a
         # failed TTFT round.
@@ -225,12 +260,18 @@ class Run:
         return self.done[tag]["t"] - self.done[tag]["start"]
 
     def client_gaps(self) -> tuple[list[float], float]:
-        """Every gap after each request's first token, in seconds, and the
-        largest, counting the open gaps the end record lists."""
+        """Every gap between token events after each request's first, in
+        seconds, as metrics.decode_gap_ms counts them (chunks less than
+        TOKEN_EVENT_MS apart are one event's), and the largest, counting
+        the open gaps the end record lists."""
         gaps = []
         for record in self.done.values():
             chunks = record.get("chunks_ms") or []
-            gaps += [(b - a) / 1000 for a, b in zip(chunks, chunks[1:])]
+            gaps += [
+                (b - a) / 1000
+                for a, b in zip(chunks, chunks[1:])
+                if b - a >= TOKEN_EVENT_MS
+            ]
         opened = list(((self.end or {}).get("open_gaps") or {}).values())
         return gaps, max(gaps + opened, default=0.0)
 
@@ -278,10 +319,11 @@ class Run:
 
 
 def load_runs(spec: dict, results: list[Path]) -> list[Run]:
-    """The churn runs of the spec's cells found in the results: new runs by
-    their meta.json, the runs each cell plans also by their client's records
-    (a run killed before it wrote its meta.json), and recorded ones by the
-    labels each cell lists."""
+    """The churn runs of the spec's cells found in the results, every copy
+    of a label (analyze keeps one: usable): new runs by their meta.json, the
+    runs each cell plans also by their client's records (a run killed before
+    it wrote its meta.json), and recorded ones by the labels each cell
+    lists."""
     cells = {cell["name"]: cell for cell in spec["cells"]}
     runs, found = [], set()
 
@@ -325,11 +367,82 @@ def not_run(cell: dict, runs: list[Run]) -> list[tuple[str, str]]:
     ]
 
 
-def assertion_pid(holder: str) -> int | None:
-    """The pid of a `pmset -g assertions` line ("pid 330(powerd): ...")."""
+def cell_metas(results: list[Path], cell: dict) -> list[dict]:
+    """The meta.json of every run.py run of a cell in the results, planned
+    or not (a rerun takes the next repeat number)."""
+    metas = [
+        json.loads(path.read_text())
+        for directory in results
+        for path in sorted(directory.glob("*.meta.json"))
+    ]
+    return [meta for meta in metas if meta.get("cell") == cell["name"]]
+
+
+def runs_of(
+    cell: dict, labels: list[tuple[str, str]], results: list[Path]
+) -> list[Run]:
+    """Every copy in the results of each (tree, label), label by label, a
+    label taking the tree it is first listed with."""
+    trees: dict[str, str] = {}
+    for tree, label in labels:
+        trees.setdefault(label, tree)
+    return [
+        Run(directory, label, cell["name"], tree)
+        for label, tree in trees.items()
+        for directory in results
+        if holds(directory, label)
+    ]
+
+
+def other_build(spec: dict, tree: str | None, build: str | None) -> str | None:
+    """Why a run of a tree that measured `build` (Run.build, or the build a
+    comparison's rounds name) did not measure one of the tree's builds under
+    test, analyze --build's, or None: cand-floorcap and cand-27b-q4 are
+    cand's, and a tree without one takes any. A tree may have several: the
+    release binary's confirmation runs pooled with the earlier binary's
+    runs when the change between them is behaviour-neutral (AMENDMENTS,
+    Final test start)."""
+    expected = spec["trees"].get((tree or "").split("-")[0], {}).get("build_id")
+    if expected is None:
+        return None
+    builds = [expected] if isinstance(expected, str) else expected
+    if build in builds:
+        return None
+    return (
+        f"build {build or 'not recorded'}, not the build under test {', '.join(builds)}"
+    )
+
+
+def usable(spec: dict, cell: dict, runs: list[Run]) -> tuple[list[Run], list[dict]]:
+    """Of a cell's runs found in the results, one per label, the first of
+    its tree's build under test, and every other listed with why: one of
+    another build, or one more copy of a label (metric_values keys runs by
+    label)."""
+    kept: dict[str, Run] = {}
+    unused = []
+    for run in runs:
+        reason = other_build(spec, run.tree, run.build)
+        if reason is None and run.label in kept:
+            reason = f"also in {kept[run.label].directory}, whose run is used"
+        if reason:
+            unused.append(unused_entry(cell, run.label, run.tree, [reason]))
+        else:
+            kept[run.label] = run
+    return list(kept.values()), unused
+
+
+def app_assertion(holder: str, ours: set) -> bool:
+    """Whether a `pmset -g assertions` line ("pid 351(powerd): ...") is an
+    app's: held by a process the run did not start other than powerd. macOS's
+    power manager holds "Powerd - Prevent sleep while display is on" itself
+    whenever the display is on, on the M5 Pro (displaysleep 0) always: every
+    sample of its six references of 11-01 shows it, at HIDIdleTime 11,263 s
+    or more. It is a system process following the display, not an app in
+    use; the owner's use shows in HIDIdleTime."""
     _, found, rest = holder.partition("pid ")
-    digits = rest.split("(", 1)[0].strip()
-    return int(digits) if found and digits.isdigit() else None
+    digits, _, rest = rest.partition("(")
+    pid = int(digits) if found and digits.strip().isdigit() else None
+    return pid not in ours and rest.partition(")")[0] != "powerd"
 
 
 def validate(run: Run, spec: dict, cell: dict) -> None:
@@ -393,10 +506,7 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
             if s.get("hid_idle_s") is not None and s["hid_idle_s"] < floor
         ]
         held = [
-            h
-            for s in run.idle
-            for h in s.get("holders", [])
-            if assertion_pid(h) not in ours
+            h for s in run.idle for h in s.get("holders", []) if app_assertion(h, ours)
         ]
         if touched:
             void(
@@ -425,10 +535,151 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
             else value(first, "streamed_experts.chunks")
             == value(first, "streamed_experts.cap_chunks")
         )
-        if not at_cap or first.get("memory_pressure") != "normal":
+        if not at_cap:
+            void("ample start: the experts were not at their cap at Ready")
+        # amend/V.md A10's pressure is the host's own before the run, macOS's
+        # level as run.py takes it before it starts the server. /status at
+        # Ready does not show it: memory_pressure is the engine's band state
+        # (AMENDMENTS X9), warning in 33-95 % of the recorded ample runs'
+        # samples, and right after the load macOS's own level read warning
+        # for the first 42-44 s of sNFb and sNFa, then normal to their end.
+        level = value(meta, "host_at_start.pressure_level")
+        if level not in (None, 1):
             void(
-                "ample start: the experts were not at their cap with pressure normal at Ready"
+                f"ample start: macOS's memory pressure level was {level} before the run"
             )
+
+
+def ssd_cache(run: Run, tolerance: float) -> dict | None:
+    """A churn run's SSD cache in its /status samples (disk, on every
+    tree): the most it held within its limit (active KV, which may use the
+    volume's whole room, can take it past), the smallest limit it came
+    within the tolerance of (it filled it; None where it never did), its
+    smallest limit, the volume's free space at Ready, and the range of
+    limits under which it would have held within the tolerance of what it
+    held: from 1 - tolerance of the most it held up to, where it filled a
+    limit, that limit over 1 - tolerance. None for a run with no samples."""
+    disks = [sample["status"]["disk"] for sample in run.samples]
+    if not disks:
+        return None
+    held = max(min(disk["used_bytes"], disk["limit_bytes"]) for disk in disks)
+    filled = min(
+        (
+            disk["limit_bytes"]
+            for disk in disks
+            if disk["used_bytes"] >= (1 - tolerance) * disk["limit_bytes"]
+        ),
+        default=None,
+    )
+    return {
+        "held": held,
+        "filled": filled,
+        "limit": min(disk["limit_bytes"] for disk in disks),
+        "free": disks[0]["volume_available_bytes"],
+        "range": (
+            (1 - tolerance) * held,
+            math.inf if filled is None else filled / (1 - tolerance),
+        ),
+    }
+
+
+def compared_trees(cell: dict, tree: str) -> set[str]:
+    """The trees a churn cell's gates compare a tree under test with: the
+    floor = cap control's its reference; a candidate's the release, best
+    measured and SSD references and G3's, G6's and G10's."""
+    rule = cell.get("floor_rule") or {}
+    if tree == rule.get("candidate"):
+        return {rule["reference"]}
+    if tree not in cell.get("candidates", ["cand"]):
+        return set()
+    return {
+        *(cell.get("release") or {}).values(),
+        *cell.get("best_measured", []),
+        *cell.get("ssd", []),
+        cell.get("kept_decodes_reference"),
+        cell.get("ample_gate"),
+        cell.get("point_gate"),
+    } - {None}
+
+
+def compare_ssd_caches(cell: dict, runs: list[Run], tolerance: float) -> None:
+    """Leaves out of the comparisons (run.invalid) each usable run of a tree
+    under test whose SSD cache is not comparable with that of a usable run
+    of a tree its cell's gates compare it with: no limit lies in both runs'
+    ranges (ssd_cache). Under --max-cache-disk auto the limit is a quarter
+    of the volume's free space beyond a floor (docs/server.md), so it moves
+    with whatever else the disk holds that day; it shapes a run only where
+    the run fills it, and the gates would credit the code with a cache held
+    back in one run and not in the other, or held back at different limits.
+    The tolerance is the gates' own: a cache that holds within it is within
+    their resolution. Such a run is not voided: its G4, G8 and G9 do not
+    depend on the disk, and it is judged on them. A tree compared with a
+    tree under test (the floor = cap control with cand) is checked after
+    it, against its runs still usable."""
+
+    def gib(size):
+        return f"{size / 2**30:.2f} GiB"
+
+    def held(cache):
+        return f"held at most {gib(cache['held'])}" + (
+            f", filling its {gib(cache['filled'])} limit"
+            if cache["filled"] is not None
+            else f" under a {gib(cache['limit'])} limit"
+        )
+
+    used = [run for run in runs if not run.invalid]
+    under_test = {run.tree for run in used if compared_trees(cell, run.tree)}
+    for run in sorted(
+        used, key=lambda r: bool(compared_trees(cell, r.tree) & under_test)
+    ):
+        trees = compared_trees(cell, run.tree)
+        for other in (r for r in used if r.tree in trees and not r.invalid):
+            mine, theirs = ssd_cache(run, tolerance), ssd_cache(other, tolerance)
+            if mine is None or theirs is None:
+                continue
+            if max(mine["range"][0], theirs["range"][0]) > min(
+                mine["range"][1], theirs["range"][1]
+            ):
+                reason = (
+                    f"SSD cache not comparable with {other.tree}'s {other.label}: "
+                    f"this run {held(mine)} ({gib(mine['free'])} free at Ready); "
+                    f"{other.label} {held(theirs)}"
+                )
+                run.invalid.append(reason)
+                break
+
+
+def ssd_window(cell: dict, runs: list[Run], tree: str, tolerance: float) -> dict:
+    """The free disk at a run's start under which compare_ssd_caches keeps
+    a run of `tree` comparable with every valid run of the trees its cell
+    compares it with, whatever the run holds: its limit L must reach
+    (1 - tolerance) of the highest lower end of their ranges (where it fills
+    L) and (1 - tolerance) L may not pass the lowest upper end (where it
+    holds L). L is a quarter of the free space beyond the engine's floor
+    (docs/server.md), the floor as the references' own first samples show
+    it (free + held - 4 x limit). Bounds are None where nothing sets them."""
+    trees = compared_trees(cell, tree)
+    caches = [
+        (run, cache)
+        for run in runs
+        if run.tree in trees and not run.invalid
+        for cache in [ssd_cache(run, tolerance)]
+        if cache is not None
+    ]
+    if not caches:
+        return {"low": None, "high": None, "references": []}
+    floors = [
+        first["volume_available_bytes"] + first["used_bytes"] - 4 * first["limit_bytes"]
+        for first in (run.samples[0]["status"]["disk"] for run, _ in caches)
+    ]
+    floor = statistics.median(floors)
+    low = max(cache["range"][0] for _, cache in caches) * (1 - tolerance)
+    high = min(cache["range"][1] for _, cache in caches) / (1 - tolerance)
+    return {
+        "low": 4 * low + floor,
+        "high": None if math.isinf(high) else 4 * high + floor,
+        "references": sorted(run.label for run, _ in caches),
+    }
 
 
 # ---------------------------------------------------------- per-run facts
@@ -692,58 +943,58 @@ def gap_bound(status: dict, share: float) -> dict | None:
     }
 
 
+def rose(path: str):
+    """A gap cause shown by a counter that rose across the samples."""
+    return lambda around: value(around[-1], path, 0) > value(around[0], path, 0)
+
+
+# The causes of a decode gap (Borrowed item 4, owner 21:05), in the order
+# gap_causes tries them on the /status samples around the gap: a claim
+# waiting in any of them, the experts' size changing between any two, or a
+# counter rising across them. Nearly every churn window commits a prefill
+# command, so a prefill unit comes last.
 GAP_CAUSES = (
-    ("claim wait", lambda a, b: value(b, "memory_governor.claims.waiting", 0) > 0),
-    ("store resize", lambda a, b: store_size(a) != store_size(b)),
     (
-        "compaction",
-        lambda a, b: (
-            value(b, "kv.extent_compactions", 0) > value(a, "kv.extent_compactions", 0)
+        "claim wait",
+        lambda around: any(
+            value(s, "memory_governor.claims.waiting", 0) > 0 for s in around
         ),
     ),
-    (
-        "replan",
-        lambda a, b: (
-            value(b, "scheduler.replans", 0) > value(a, "scheduler.replans", 0)
-        ),
-    ),
-    (
-        "history wait",
-        lambda a, b: (
-            value(b, "kv_spill.history_stream.wait_ms.total", 0)
-            > value(a, "kv_spill.history_stream.wait_ms.total", 0)
-        ),
-    ),
-    (
-        "prefill unit",
-        lambda a, b: (
-            value(b, "scheduler.prefill_batches", 0)
-            > value(a, "scheduler.prefill_batches", 0)
-        ),
-    ),
+    ("store resize", lambda around: len({store_size(s) for s in around}) > 1),
+    ("compaction", rose("kv.extent_compactions")),
+    ("replan", rose("scheduler.replans")),
+    ("history wait", rose("kv_spill.history_stream.wait_ms.total")),
+    ("prefill unit", rose("scheduler.prefill_batches")),
 )
 
 
 def gap_causes(run: Run, bound_s: float) -> dict:
-    """Each client gap above the bound, attributed to the first cause the
-    samples around it show, in GAP_CAUSES order, else unattributed."""
+    """Every client gap above the bound, attributed to the first cause in
+    GAP_CAUSES the samples from 2 s before it to 2 s after it show, else
+    unattributed: those between the chunks of each request that ended or
+    that the client ended at its deadline (a gap summary lists only those
+    of a second or more), and each gap the end record lists as open, ending
+    at that record."""
+    gaps = [
+        ((later - earlier) / 1000, record["start"] + later / 1000)
+        for record in [*run.done.values(), *run.expired]
+        for chunks in [record.get("chunks_ms") or []]
+        for earlier, later in zip(chunks, chunks[1:])
+    ] + [
+        (length, run.end["t"])
+        for length in ((run.end or {}).get("open_gaps") or {}).values()
+    ]
     causes: dict[str, int] = {}
-    for record in run.done.values():
-        for end, length in (record.get("gap") or {}).get("long", []):
-            if length <= bound_s:
-                continue
-            around = [
-                s["status"]
-                for s in run.samples
-                if end - length - 2 <= s["t"] <= end + 2
-            ]
-            cause = "unattributed"
-            if len(around) >= 2:
-                cause = next(
-                    (name for name, test in GAP_CAUSES if test(around[0], around[-1])),
-                    cause,
-                )
-            causes[cause] = causes.get(cause, 0) + 1
+    for length, end in gaps:
+        if length <= bound_s:
+            continue
+        around = [
+            s["status"] for s in run.samples if end - length - 2 <= s["t"] <= end + 2
+        ]
+        cause = "unattributed"
+        if len(around) >= 2:
+            cause = next((name for name, shows in GAP_CAUSES if shows(around)), cause)
+        causes[cause] = causes.get(cause, 0) + 1
     return causes
 
 
@@ -779,6 +1030,132 @@ def prefill_shares(status: dict) -> dict:
         else None,
         "ssd_busy_share": prefill.get("read_bytes", 0) * seed / wall if seed else None,
     }
+
+
+def clamped_shares(status: dict) -> dict:
+    """Borrowed item 6 (owner 21:05), reported for stage 2 to decide on: per
+    command estimate (scheduler.estimate.prefill, decode) the commands or
+    passes that trained it since the server started, those whose time it
+    clamped, and their share; None for an estimate the status lacks or
+    nothing trained."""
+    shares = {}
+    for kind in ("prefill", "decode"):
+        estimate = value(status, f"scheduler.estimate.{kind}") or {}
+        samples, clamped = estimate.get("samples"), estimate.get("clamped", 0)
+        shares[kind] = (
+            {"samples": samples, "clamped": clamped, "share": clamped / samples}
+            if samples
+            else None
+        )
+    return shares
+
+
+def prefetch_coverage(run: Run) -> dict:
+    """DESIGN §0 Q6, reported only: per use of the streamed experts
+    (prefill, decode), of the experts its loads read (not resident) those
+    read ahead, Δprefetched over Δread, over the sample intervals in which a
+    history stream read (kv_spill.history_stream.bytes rose) and over the
+    rest; coverage None where they read none, and None for a use the status
+    lacks."""
+    coverage = {}
+    for use in ("prefill", "decode"):
+        read, ahead = (
+            f"streamed_experts.{use}.read",
+            f"streamed_experts.{use}.prefetched",
+        )
+        if value(run.last, ahead) is None:
+            coverage[use] = None
+            continue
+        parts = {"history_stream": [0, 0], "rest": [0, 0]}
+        for earlier, later in zip(run.samples, run.samples[1:]):
+            a, b = earlier["status"], later["status"]
+            streamed = value(b, "kv_spill.history_stream.bytes", 0) > value(
+                a, "kv_spill.history_stream.bytes", 0
+            )
+            part = parts["history_stream" if streamed else "rest"]
+            part[0] += value(b, read, 0) - value(a, read, 0)
+            part[1] += value(b, ahead, 0) - value(a, ahead, 0)
+        coverage[use] = {
+            name: {
+                "read": read_count,
+                "prefetched": prefetched,
+                "coverage": prefetched / read_count if read_count else None,
+            }
+            for name, (read_count, prefetched) in parts.items()
+        }
+    return coverage
+
+
+def host_memory(run: Run, growth_bound: float) -> tuple[dict, dict]:
+    """Borrowed items 2 and 9 (owner 21:05), reported only, from the samples
+    whose memory_governor.host_telemetry macOS filled ("not reported" where
+    every sample lacks it or has null: the references and every tree before
+    M3a), and the series they come from.
+
+    compressed: the most bytes of the engine's phys_footprint macOS held
+    compressed and the largest share of it they were; the fix round changes
+    a rule only if the engine's own memory is compressed.
+
+    unbooked: phys_footprint less the ledger's accounts, both of one
+    snapshot, as its change since the first sample with `ready` true,
+    against the live context (each active request's encoded prompt and
+    generated tokens): its largest change while no request was live and
+    while one was, with that sample's context, and whether either passed
+    `growth_bound`, past which the fix round books it."""
+    telemetry = [
+        (s["t"], s["status"], value(s["status"], "memory_governor.host_telemetry"))
+        for s in run.samples
+    ]
+    telemetry = [(t, status, host) for t, status, host in telemetry if host]
+    if not telemetry:
+        return {"compressed": "not reported", "unbooked": "not reported"}, {}
+    compressed = [
+        (
+            t,
+            host["compressed_bytes"],
+            host["compressed_bytes"] / host["phys_footprint_bytes"],
+        )
+        for t, _, host in telemetry
+    ]
+    readouts = {
+        "compressed": {
+            "max_bytes": max(c for _, c, _ in compressed),
+            "max_share": round(max(share for _, _, share in compressed), 4),
+        },
+        "unbooked": "no sample with ready true",
+    }
+    series = {"compressed": [[t, c, round(share, 4)] for t, c, share in compressed]}
+    ready = next(
+        (i for i, (_, status, _) in enumerate(telemetry) if status.get("ready")), None
+    )
+    if ready is None:
+        return readouts, series
+    unbooked = []
+    for t, status, host in telemetry[ready:]:
+        booked = sum(
+            a["current_bytes"] for a in value(status, "memory_governor.accounts", [])
+        )
+        context = sum(
+            lane["prompt_processed"] + lane["generated_tokens"]
+            for lane in status.get("active_requests") or []
+        )
+        unbooked.append((t, host["phys_footprint_bytes"] - booked, context))
+    at_ready = unbooked[0][1]
+    growth = [[t, held - at_ready, tokens] for t, held, tokens in unbooked]
+    idle = max((g for _, g, tokens in growth if not tokens), default=None)
+    live, live_tokens = max(
+        ((g, tokens) for _, g, tokens in growth if tokens), default=(None, None)
+    )
+    readouts["unbooked"] = {
+        "at_ready_bytes": at_ready,
+        "growth_idle_max_bytes": idle,
+        "growth_live_max_bytes": live,
+        "context_tokens_at_live_max": live_tokens,
+        "bound_bytes": growth_bound,
+        "past_bound": any(g > growth_bound for _, g, _ in growth),
+    }
+    series["unbooked"] = growth
+    return readouts, series
 
 
 def g8_failures(run: Run, gates: dict) -> list[str]:
@@ -867,6 +1244,7 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
             f"{gates['value_horizon_seconds']} s of their regrow"
         )
     units = counter_delta(run, "scheduler.prefill_units")
+    memory, facts["series"] = host_memory(run, gates["unbooked_growth_bytes"])
     facts["readouts"] = {
         "store": store,
         "relative_error": value(last, "scheduler.estimate.prefill.relative_error"),
@@ -892,6 +1270,9 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
         "first_start": run.meta.get("first_start"),
         **queue_readouts(run),
         **prefill_shares(last),
+        "clamped": clamped_shares(last),
+        "prefetch_coverage": prefetch_coverage(run),
+        **memory,
     }
     return facts
 
@@ -989,8 +1370,9 @@ def churn_cell(
         )
 
     # G4, G8 and G9 are judged on every candidate run (amend/V.md §5) but
-    # the voided: one the server's own failures made unusable fails G8; one
-    # run.py refused to measure or its surroundings voided (heat, other
+    # the voided, also on one the server's own failures made unusable (it
+    # fails G8) or whose SSD cache is not comparable with its references';
+    # one run.py refused to measure or its surroundings voided (heat, other
     # processes, the laptop's owner) is listed under the runs not used, to be
     # repeated, and judged on G8 alone, which fails on the server's own
     # failures it also shows. G4 holds for a tree when none of its runs
@@ -1008,7 +1390,16 @@ def churn_cell(
         g4_holds[run.tree] = g4_holds.get(run.tree, True) and not any(
             f.startswith("G4") for f in facts["failures"]
         )
-        record(f"G4 G8 G9 {run.label}", FAIL if facts["failures"] else PASS, facts)
+        series = facts.pop("series")
+        record(
+            f"G4 G8 G9 {run.label}",
+            FAIL if facts["failures"] else PASS,
+            facts,
+            series=series,
+        )
+        unbooked = facts["readouts"]["unbooked"]
+        if isinstance(unbooked, dict) and unbooked["past_bound"]:
+            record(f"unbooked memory {run.label}", "report", unbooked)
         conflicts = facts["readouts"]["index_page_conflicts_per_15min"]
         if (
             conflicts is not None
@@ -1062,12 +1453,20 @@ def churn_cell(
             # freezes or concurrent TTFT; without one, not at all. Completion
             # latency is a gain, not a metric to trade: it keeps no loss.
             froze = freeze(used, throughput, machine)
-            gain = (
+            concurrent = gains.get(cell["machine"]) or {}
+            gain = bool(
                 stats.clearly_better(pooled["ttft"], False)
                 or stats.clearly_better(pooled["latency"], False)
                 or (holds and froze["reference_froze"])
-                or gains.get(cell["machine"], False)
+                or concurrent.get("gain")
             )
+            # Each trade goes to the owner with the numbers of every gain
+            # it may take (owner 2026-11-01 20:30; freezes: "freeze").
+            gain_numbers = {
+                f"ttft vs {throughput}": stats.ratio_text(pooled["ttft"]),
+                f"latency vs {throughput}": stats.ratio_text(pooled["latency"]),
+                "concurrent_ttft": concurrent or None,
+            }
             for metric, rule in (
                 ("work", "G1"),
                 ("latency", "G2"),
@@ -1094,6 +1493,7 @@ def churn_cell(
                         },
                         "tolerance": tolerance,
                         "gain": gain,
+                        "gains": gain_numbers,
                         "freeze": froze,
                         "sigma": round(estimates[metric]["sigma"], 4),
                         "df": estimates[metric]["df"],
@@ -1110,7 +1510,8 @@ def churn_cell(
             if result != PASS and cell.get("memory_cap") and kept and throughput:
                 # OQ2 (owner 20:45): under a memory cap G3 also passes when G2
                 # passes, decodes never froze, and the TTFT is no worse than
-                # the cell's best tree that kept decodes running.
+                # the cell's best tree that kept decodes running, which
+                # without a usable run of that tree is not known.
                 g2 = next(
                     (
                         v["verdict"]
@@ -1120,8 +1521,10 @@ def churn_cell(
                     FAIL,
                 )
                 best = compare(used, machine, prices, candidate, kept, "ttft")["pooled"]
-                no_worse = stats.verdict(best, False, 0.0) != FAIL
-                result = PASS if g2 == PASS and holds and no_worse else FAIL
+                if g2 != PASS or not holds or stats.verdict(best, False, 0.0) == FAIL:
+                    result = FAIL
+                else:
+                    result = PASS if best else INCONCLUSIVE
                 why = f"OQ2: G2 {g2}, G4 {'holds' if holds else 'fails'}, TTFT vs {kept} {stats.ratio_text(best)}"
             record(
                 f"G3 {candidate} vs {ttft}",
@@ -1163,46 +1566,35 @@ def churn_cell(
             )
     if cell.get("point_gate"):
         verdicts.extend(
-            point_gate(cell, used, prices, gates, g4_holds.get("cand", True))
+            point_gate(cell, used, machine, prices, gates, g4_holds.get("cand", True))
         )
     return verdicts
 
 
 def point_gate(
-    cell: dict, runs: list[Run], prices, gates: dict, g4_holds: bool
+    cell: dict, runs: list[Run], machine: dict, prices, gates: dict, g4_holds: bool
 ) -> list[dict]:
-    """G10: work point estimate at least 1 - tolerance and TTFT at most
-    1 + tolerance of the reference's, and no G4 failure; a cell without
-    runs on both sides is INCONCLUSIVE, for the owner."""
+    """G10 (amend/V.md §5's interval rule; amend/base.md: an undecided G10
+    goes to the owner): work and TTFT of cand against the reference, PASS
+    when the bound on the good side clears the tolerance, FAIL when the
+    bound on the bad side is past equality, else INCONCLUSIVE; a G4 failure
+    fails it. A cell without runs on both sides is INCONCLUSIVE."""
     reference = cell["point_gate"]
-    group = [r for r in runs if r.tree in ("cand", reference)]
-    per_run = metric_values(group, prices)
     verdicts = []
     for metric in ("work", "ttft"):
-        mine = [per_run[r.label][metric] for r in group if r.tree == "cand"]
-        theirs = [per_run[r.label][metric] for r in group if r.tree == reference]
-        if not mine or not theirs or None in mine + theirs:
-            verdicts.append(
-                {
-                    "cell": cell["name"],
-                    "rule": f"G10 {metric} vs {reference}",
-                    "verdict": INCONCLUSIVE,
-                    "numbers": None,
-                }
-            )
-            continue
-        point = stats.geometric_mean(mine) / stats.geometric_mean(theirs)
-        ok = (
-            point >= 1 - gates["tolerance"]
-            if HIGHER_IS_BETTER[metric]
-            else point <= 1 + gates["tolerance"]
-        )
+        estimate = compare(runs, machine, prices, "cand", reference, metric)["pooled"]
+        result = stats.verdict(estimate, HIGHER_IS_BETTER[metric], gates["tolerance"])
         verdicts.append(
             {
                 "cell": cell["name"],
                 "rule": f"G10 {metric} vs {reference}",
-                "verdict": PASS if ok and g4_holds else FAIL,
-                "numbers": {"point": round(point, 4), "g4_holds": g4_holds},
+                "verdict": FAIL if estimate and not g4_holds else result,
+                "numbers": estimate
+                and {
+                    "ratio": stats.ratio_text(estimate),
+                    "point": round(math.exp(estimate["log_ratio"]), 4),
+                    "g4_holds": g4_holds,
+                },
             }
         )
     return verdicts
@@ -1473,63 +1865,72 @@ def g8_verdict(cell: dict, spec: dict, run: Run) -> list[dict]:
 
 
 def ttft_rounds(cell: dict, spec: dict, results: list[Path]) -> tuple[dict, list, list]:
-    """{tree: {n: [(directory, label, round)]}} of a TTFT cell's recorded and
-    planned runs that are valid, over the concurrencies whose every round
-    completed its N requests (A104's structural minimum), the runs and
-    concurrencies left out, with why, and the candidate runs' G8."""
-    labels = {tree: list(found) for tree, found in (cell.get("recorded") or {}).items()}
+    """{tree: {n: [(directory, label, round)]}} of a TTFT cell's recorded,
+    planned and rerun runs that are valid and of their tree's build under
+    test, over the concurrencies whose every round completed its N requests
+    (A104's structural minimum), the runs and concurrencies left out, with
+    why, and the candidate runs' G8."""
+    labels = [
+        (tree, label)
+        for tree, found in (cell.get("recorded") or {}).items()
+        for label in found
+    ]
     for tree, orders in (cell.get("runs") or {}).items():
         for order, count in orders.items():
-            labels.setdefault(tree, []).extend(
-                run_label(cell["name"], tree, order, r) for r in range(1, count + 1)
-            )
+            labels += [
+                (tree, run_label(cell["name"], tree, order, r))
+                for r in range(1, count + 1)
+            ]
+    labels += [
+        (meta.get("tree_name"), meta["label"]) for meta in cell_metas(results, cell)
+    ]
+    runs, unused = usable(spec, cell, runs_of(cell, labels, results))
     found: dict = {}
-    unused, health_verdicts = [], []
-    for tree, names in labels.items():
-        for label in names:
-            directory = locate(results, label)
-            if directory is None:
-                continue
-            run = Run(directory, label, cell["name"], tree)
-            validate(run, spec, cell)
-            health_verdicts += g8_verdict(cell, spec, run)
-            if run.invalid:
-                unused.append(unused_entry(cell, label, tree, run.invalid))
-                continue
-            levels = load_ttft_rounds(directory, label, cell.get("rounds", 3))
-            for n, level in sorted(levels.items()):
-                rounds = level["rounds"]
-                if len(rounds) < level["expected"] or any(
-                    len(r["ttft_ms"]) != n for r in rounds
-                ):
-                    unused.append(
-                        unused_entry(
-                            cell,
-                            label,
-                            tree,
-                            [
-                                f"N={n}: {len(rounds)} of {level['expected']} rounds "
-                                f"completed their {n} requests"
-                            ],
-                        )
+    health_verdicts = []
+    for run in runs:
+        directory, label, tree = run.directory, run.label, run.tree
+        validate(run, spec, cell)
+        health_verdicts += g8_verdict(cell, spec, run)
+        if run.invalid:
+            unused.append(unused_entry(cell, label, tree, run.invalid))
+            continue
+        levels = load_ttft_rounds(directory, label, cell.get("rounds", 3))
+        for n, level in sorted(levels.items()):
+            rounds = level["rounds"]
+            if len(rounds) < level["expected"] or any(
+                len(r["ttft_ms"]) != n for r in rounds
+            ):
+                unused.append(
+                    unused_entry(
+                        cell,
+                        label,
+                        tree,
+                        [
+                            f"N={n}: {len(rounds)} of {level['expected']} rounds "
+                            f"completed their {n} requests"
+                        ],
                     )
-                    continue
-                found.setdefault(tree, {}).setdefault(n, []).extend(
-                    (directory, label, r) for r in rounds
                 )
+                continue
+            found.setdefault(tree, {}).setdefault(n, []).extend(
+                (directory, label, r) for r in rounds
+            )
     return found, unused, health_verdicts
 
 
-def ttft_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, bool, list]:
+def ttft_cell(
+    cell: dict, spec: dict, results: list[Path]
+) -> tuple[list, dict | None, list]:
     """G5 (amend/V.md A74): per N the median over rounds of each round's
     worst TTFT, cand at most the reference's times 1 + r_N, r_N the
     reference's spread of round worsts over its rounds other than the
-    largest; N=1 and the first round reported. With point_gate, G10's point
+    largest; N=1 and the first round reported. With point_gate, G10's interval
     rule instead. Each candidate run's G8. Also whether cand's concurrent
-    TTFT clearly beats the gain reference's (a gain for the owner's trade
-    rule), and the runs and concurrencies not used."""
+    TTFT clearly beats the gain reference's, with both numbers (a gain for
+    the owner's trade rule, None without one), and the runs and
+    concurrencies not used."""
     found, unused, health_verdicts = ttft_rounds(cell, spec, results)
-    verdicts, gain = [], False
+    verdicts, gain = [], None
     gate = "G10" if cell.get("point_gate") else "G5"
     for n in cell.get("gate_n", [2, 4]):
         reference = cell.get("point_gate") or cell["reference"]
@@ -1547,9 +1948,21 @@ def ttft_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, bool, 
             )
             continue
         if cell.get("point_gate"):
-            point = statistics.median(mine) / statistics.median(theirs)
-            result = PASS if point <= 1 + cell.get("tolerance", 0.02) else FAIL
-            numbers = {"point": round(point, 4)}
+            # G10 by the interval rule (amend/V.md §5) on the rounds' worst
+            # TTFTs, their per-round sigma pooled within each tree's rounds,
+            # else the machine's recorded TTFT sigma.
+            sigma, df = stats.pooled_sigma([mine, theirs])
+            if sigma is None:
+                prior = spec["machines"][cell["machine"]]["sigma"]["ttft"]
+                sigma, df = prior["sigma"], prior["df"]
+            estimate = stats.interval({"-": (mine, theirs)}, sigma, df)["pooled"]
+            result = stats.verdict(estimate, False, spec["gates"]["tolerance"])
+            numbers = {
+                "ratio": stats.ratio_text(estimate),
+                "point": round(statistics.median(mine) / statistics.median(theirs), 4),
+                "sigma": round(sigma, 4),
+                "df": df,
+            }
         else:
             trimmed = sorted(theirs)[:-1]
             spread = max(trimmed) / min(trimmed) - 1 if len(trimmed) > 1 else 0.0
@@ -1581,7 +1994,14 @@ def ttft_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, bool, 
                 max(r["ttft_ms"])
                 for _, _, r in found.get(gain_reference, {}).get(n, [])
             )
-            gain = bool(others) and max(mine) < min(others)
+            if others:
+                gain = {
+                    "gain": max(mine) < min(others),
+                    "cell": cell["name"],
+                    "n": n,
+                    "cand_worst_max_ms": max(mine),
+                    f"{gain_reference}_worst_min_ms": min(others),
+                }
     if found.get("cand", {}).get(1):
         verdicts.append(
             {
@@ -1621,39 +2041,64 @@ def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
     """G7 on in-session ABBA runs (reference, cand, cand, reference, per set):
     every metric must PASS abba.compare; G8 of each cand run; and G8's warm
     start (amend/V.md A16): cand's warm spawn-to-ready at most the
-    reference's plus the 256-row warm-up's cost. A set with a run that is
-    not valid is not judged; its invalid runs are returned with why."""
-    runs = abba_runs(cell)
+    reference's plus the 256-row warm-up's cost. The planned sets and those
+    a rerun began (a rerun takes the next repeat numbers) are judged; one
+    whose cand runs are all of another build than the build under test is
+    passed over, its runs listed, and one with a run that is not valid or
+    not of its tree's build is not judged (a second copy of a run it uses
+    is only listed); the runs not used are returned with why."""
+    planned = cell["abba"].get("sets", 1)
+    begun = [((meta.get("repeat") or 0) + 1) // 2 for meta in cell_metas(results, cell)]
+    runs = abba_runs(cell, max([planned, *begun]))
     verdicts, unused = [], []
     for index in range(0, len(runs), 4):
+        members = runs[index : index + 4]
         labels = [
             run_label(cell["name"], tree, order, repeat)
-            for tree, order, repeat in runs[index : index + 4]
+            for tree, order, repeat in members
         ]
-        directories = [locate(results, label) for label in labels]
-        invalid = []
-        for (tree, _, _), d, label in zip(runs[index : index + 4], directories, labels):
-            if d is None:
-                continue
-            run = Run(d, label, cell["name"], tree)
+        trees = [tree for tree, _, _ in members]
+        found, copies = usable(
+            spec, cell, runs_of(cell, list(zip(trees, labels)), results)
+        )
+        kept = {run.label for run in found}
+        cand = [label for tree, label in zip(trees, labels) if tree == "cand"]
+        if not kept & set(cand) and {entry["label"] for entry in copies} & set(cand):
+            unused += copies + [
+                unused_entry(
+                    cell,
+                    run.label,
+                    run.tree,
+                    ["its set's cand runs are of another build"],
+                )
+                for run in found
+            ]
+            continue
+        if not found and not copies and index // 4 >= planned:
+            continue
+        # A copy of a run that is used leaves its set whole; one of a label
+        # none of whose copies is used leaves it without that run.
+        unused += copies
+        left_out = [entry["label"] for entry in copies if entry["label"] not in kept]
+        for run in found:
             validate(run, spec, cell)
             verdicts += g8_verdict(cell, spec, run)
             if run.invalid:
-                invalid.append(unused_entry(cell, label, tree, run.invalid))
-        unused += invalid
-        if None in directories or invalid:
+                unused.append(unused_entry(cell, run.label, run.tree, run.invalid))
+                left_out.append(run.label)
+        if len(found) < 4 or left_out:
             verdicts.append(
                 {
                     "cell": cell["name"],
                     "rule": f"G7 set {index // 4 + 1}",
                     "verdict": INCONCLUSIVE,
-                    "numbers": "not run"
-                    if None in directories
-                    else "runs not used: "
-                    + ", ".join(entry["label"] for entry in invalid),
+                    "numbers": "runs not used: " + ", ".join(dict.fromkeys(left_out))
+                    if left_out
+                    else "not run",
                 }
             )
             continue
+        directories = [run.directory for run in found]
         rounds = [abba_metrics(d, label) for d, label in zip(directories, labels)]
         for metric in sorted(rounds[0]):
             samples = [r.get(metric, []) for r in rounds]
@@ -1668,14 +2113,11 @@ def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
                     }
                 )
         starts = {}
-        for (tree, _, _), d, label in zip(runs[index : index + 4], directories, labels):
-            meta = d / f"{label}.meta.json"
-            if meta.exists():
-                found = json.loads(meta.read_text())
-                if not found.get("first_start") and found.get("parts"):
-                    starts.setdefault(tree, []).append(
-                        found["parts"][0]["spawn_to_ready_s"]
-                    )
+        for run in found:
+            if not run.meta.get("first_start") and run.meta.get("parts"):
+                starts.setdefault(run.tree, []).append(
+                    run.meta["parts"][0]["spawn_to_ready_s"]
+                )
         warmup = spec["machines"][cell["machine"]].get("warmup_256_s")
         reference = cell["abba"]["reference"]
         if starts.get("cand") and starts.get(reference) and warmup is not None:
@@ -1692,55 +2134,141 @@ def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
                     },
                 }
             )
+    if not any(v["rule"].startswith("G7") for v in verdicts):
+        verdicts.append(
+            {
+                "cell": cell["name"],
+                "rule": "G7",
+                "verdict": INCONCLUSIVE,
+                "numbers": "no set of the build under test judged",
+            }
+        )
     return verdicts, unused
 
 
-def single_cell(cell: dict, results: list[Path]) -> list[dict]:
+def round_build(document: dict, version: str) -> str | None:
+    """The build a backend regression comparison's rounds of one version
+    (candidate, baseline) ran, None unless they name one."""
+    builds = {
+        (record.get("identity") or {}).get("build_id")
+        for record in document.get("rounds") or []
+        if record.get("version") == version
+    }
+    return builds.pop() if len(builds) == 1 else None
+
+
+def single_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
     """G7 of the backend benchmark comparisons (make test-performance-real
-    BASELINE=pass), one per model, each copied beside the run's records as
-    LABEL.backend-regression.json."""
-    verdicts = []
+    BASELINE=pass), each copied beside the run's records as
+    LABEL.backend-regression.json: every repeat of each model's (a rerun
+    takes the next repeat number) whose candidate rounds ran the cand build
+    under test, and whose baseline rounds the baseline's where analyze is
+    given it, and every one that ended in an error before it wrote its
+    rounds (backend_regression.py writes them once all four ran), judged on
+    that error. The others are returned with why."""
+    verdicts, unused = [], []
     for model in cell["models"]:
-        label = run_label(cell["name"], f"cand-{model}", "-", 1)
-        directory = next(
-            (d for d in results if (d / f"{label}.backend-regression.json").exists()),
-            None,
+        tree = f"cand-{model}"
+        stem = f"{cell['name']}-{tree}-"
+        repeats = sorted(
+            int(repeat)
+            for repeat in {
+                path.name[len(stem) : -len(SINGLE_RESULTS)]
+                for directory in results
+                for path in directory.glob(f"{stem}*{SINGLE_RESULTS}")
+            }
+            if repeat.isdigit()
         )
-        if directory is None:
+        judged: dict[str, Path] = {}
+        for repeat in repeats:
+            label = run_label(cell["name"], tree, "-", repeat)
+            for directory in results:
+                path = directory / f"{label}{SINGLE_RESULTS}"
+                if not path.exists():
+                    continue
+                document = json.loads(path.read_text())
+                reason = (
+                    other_build(spec, tree, round_build(document, "candidate"))
+                    or other_build(
+                        spec, cell["baseline"], round_build(document, "baseline")
+                    )
+                    if document.get("rounds")
+                    else None
+                )
+                # The job's own validity verdict on its surroundings (no
+                # run.py here: final160 lib.sh single() writes LABEL.void
+                # when the M5 Pro was touched during the make, amend/base.md
+                # §2.7).
+                void = directory / f"{label}.void"
+                if reason is None and void.exists():
+                    reason = f"void: {void.read_text().strip()}"
+                if reason is None and label in judged:
+                    reason = f"also in {judged[label]}, whose run is used"
+                if reason:
+                    error = document.get("error")
+                    unused.append(
+                        unused_entry(
+                            cell,
+                            label,
+                            tree,
+                            [reason + (f": {error}" if error else "")],
+                        )
+                    )
+                    continue
+                judged[label] = directory
+                failures = (document.get("comparison") or {}).get(
+                    "failures", [document.get("error")]
+                )
+                verdicts.append(
+                    {
+                        "cell": cell["name"],
+                        "rule": f"G7 {label}",
+                        "verdict": PASS if document.get("pass") else FAIL,
+                        "numbers": failures,
+                    }
+                )
+        if not judged:
             verdicts.append(
                 {
                     "cell": cell["name"],
                     "rule": f"G7 {model}",
                     "verdict": INCONCLUSIVE,
-                    "numbers": "not run",
+                    "numbers": "no run of the build under test"
+                    if repeats
+                    else "not run",
                 }
             )
-            continue
-        document = json.loads(
-            (directory / f"{label}.backend-regression.json").read_text()
-        )
-        failures = (document.get("comparison") or {}).get(
-            "failures", [document.get("error")]
-        )
-        verdicts.append(
-            {
-                "cell": cell["name"],
-                "rule": f"G7 {model}",
-                "verdict": PASS if document.get("pass") else FAIL,
-                "numbers": failures,
-            }
-        )
-    return verdicts
+    return verdicts, unused
 
 
 def serve1_prices(label: str, results: list[Path]) -> dict | None:
     """A model's prices from a reference serve1 run on its machine (DESIGN
     §8.3: other models' prices from pass's single-request cell): R the
     prefill tokens per second of the largest prompt, D decode tokens per
-    second, each a median."""
-    directory = locate(results, label)
-    if directory is None:
+    second, each a median. Taken from the newest complete run of the
+    label's cell and tree (a rerun takes the next repeat number): a run that
+    stopped early holds only the sizes it reached."""
+    stem = label.rsplit("-", 1)[0] + "-"
+    found = sorted(
+        (
+            (int(path.name[len(stem) : -len(".out")]), directory)
+            for directory in results
+            for path in directory.glob(f"{stem}*.out")
+            if path.name[len(stem) : -len(".out")].isdigit()
+        ),
+        key=lambda item: -item[0],
+    )
+    complete = next(
+        (
+            (directory, f"{stem}{repeat}")
+            for repeat, directory in found
+            if Run(directory, f"{stem}{repeat}").complete
+        ),
+        None,
+    )
+    if complete is None:
         return None
+    directory, label = complete
     records = [
         r
         for r in read_jsonl(directory / f"{label}.events.jsonl")
@@ -1766,11 +2294,23 @@ def serve1_prices(label: str, results: list[Path]) -> dict | None:
 
 
 def analyze(spec: dict, results: list[Path]) -> dict:
-    runs = load_runs(spec, results)
+    """The verdicts on the runs in the results of each tree's build under
+    test (spec trees' build_id, analyze --build), the runs not used and the
+    legacy numbers."""
+    loaded = load_runs(spec, results)
     cells = {cell["name"]: cell for cell in spec["cells"]}
-    verdicts, invalid, gains, legacy = [], [], {}, []
+    verdicts, invalid, gains, legacy, runs = [], [], {}, [], []
+    for cell in spec["cells"]:
+        kept, copies = usable(spec, cell, [r for r in loaded if r.cell == cell["name"]])
+        runs += kept
+        invalid += copies
     for run in runs:
         validate(run, spec, cells[run.cell])
+    for name, cell in cells.items():
+        compare_ssd_caches(
+            cell, [r for r in runs if r.cell == name], spec["gates"]["tolerance"]
+        )
+    for run in runs:
         if run.invalid:
             invalid.append(
                 unused_entry(cells[run.cell], run.label, run.tree, run.invalid)
@@ -1780,14 +2320,17 @@ def analyze(spec: dict, results: list[Path]) -> dict:
             found, gain, unused = ttft_cell(cell, spec, results)
             verdicts.extend(found)
             invalid.extend(unused)
-            gains[cell["machine"]] = gains.get(cell["machine"], False) or gain
+            if gain and not (gains.get(cell["machine"]) or {}).get("gain"):
+                gains[cell["machine"]] = gain
     for cell in spec["cells"]:
         scenario = cell.get("scenario")
         if scenario == "churn":
             cell_runs = [r for r in runs if r.cell == cell["name"]]
             invalid += [
                 unused_entry(cell, label, tree, ["not run"])
-                for tree, label in not_run(cell, cell_runs)
+                for tree, label in not_run(
+                    cell, [r for r in loaded if r.cell == cell["name"]]
+                )
             ]
             prices = cell.get("prices") or (
                 serve1_prices(cell["prices_from"], results)
@@ -1805,26 +2348,39 @@ def analyze(spec: dict, results: list[Path]) -> dict:
                         "numbers": None,
                     }
                 )
-            elif prices is None:
+                continue
+            if prices is None:
+                # Its work gates are INCONCLUSIVE; the rest are judged.
                 verdicts.append(
                     {
                         "cell": cell["name"],
                         "rule": "prices",
                         "verdict": INCONCLUSIVE,
-                        "numbers": f"no {cell.get('prices_from')}",
+                        "numbers": f"no complete {cell.get('prices_from')} or rerun of it",
                     }
                 )
-            else:
-                verdicts.extend(churn_cell(cell, spec, cell_runs, gains, prices))
+            verdicts.extend(churn_cell(cell, spec, cell_runs, gains, prices))
         elif cell.get("abba"):
             found, unused = abba_cell(cell, spec, results)
             verdicts.extend(found)
             invalid.extend(unused)
         elif scenario == "single":
-            verdicts.extend(single_cell(cell, results))
+            found, unused = single_cell(cell, spec, results)
+            verdicts.extend(found)
+            invalid.extend(unused)
     return {
         "spec": spec["path"],
+        "builds": {
+            name: tree["build_id"]
+            for name, tree in spec["trees"].items()
+            if tree.get("build_id")
+        },
         "verdicts": verdicts,
+        "used": [
+            {"cell": r.cell, "label": r.label, "tree": r.tree, "build": r.build}
+            for r in runs
+            if not r.invalid
+        ],
         "invalid": invalid,
         "legacy": legacy,
         "generated": time.time(),
@@ -1834,6 +2390,12 @@ def analyze(spec: dict, results: list[Path]) -> dict:
 def verdict_markdown(document: dict) -> str:
     lines = [
         "# 1.6.0 matrix verdict",
+        "",
+        "Builds under test: "
+        + ", ".join(
+            f"{name} {build if isinstance(build, str) else ' + '.join(build)}"
+            for name, build in document["builds"].items()
+        ),
         "",
         "| cell | rule | verdict | numbers |",
         "| --- | --- | --- | --- |",
@@ -1922,6 +2484,44 @@ def check_run(
     return problems + health(run, machine, gates)["failures"]
 
 
+def free_bytes(directory: Path) -> int:
+    """The free space of the volume holding `directory` as the engine
+    measures it (DiskSpace: statfs f_bavail)."""
+    found = os.statvfs(directory)
+    return found.f_bavail * found.f_frsize
+
+
+def disk(spec: dict, results: list[Path], name: str, tree: str) -> int:
+    """matrix.py disk: whether the volume's free space now lies in the
+    window ssd_window gives a run of `tree` in cell `name` against the valid
+    runs in the results, printed with it; 1 outside it (analyze would leave
+    the run out of the comparisons, compare_ssd_caches), else 0: also for a
+    cell outside the spec (the 122B check's), which analyze never reads."""
+    cell = next((c for c in spec["cells"] if c["name"] == name), None)
+    if cell is None:
+        print(f"disk {name}: not a cell of {spec['path']}: no run of it is compared")
+        return 0
+    runs = [r for r in load_runs(spec, results) if r.cell == name]
+    for run in runs:
+        validate(run, spec, cell)
+    window = ssd_window(cell, runs, tree, spec["gates"]["tolerance"])
+    free = free_bytes(results[0])
+    inside = (window["low"] is None or free >= window["low"]) and (
+        window["high"] is None or free <= window["high"]
+    )
+
+    def gib(size):
+        return "-" if size is None else f"{size / 2**30:.2f} GiB"
+
+    print(
+        f"disk {name} {tree}: {gib(free)} free; the SSD cache stays comparable with "
+        f"{', '.join(window['references']) or 'no reference run'} from "
+        f"{gib(window['low'])} to {gib(window['high'])} free: "
+        + ("ok" if inside else "REFUSED")
+    )
+    return 0 if inside else 1
+
+
 def job_type(name: str) -> str:
     """A queued job's type: its name without the queue number and the
     run's repeat, e.g. 20-m6-fn-churn-cand-A1.sh -> m6-fn-churn-cand."""
@@ -1933,8 +2533,9 @@ def overruns(
 ) -> list[str]:
     """Jobs in QUEUE/running past twice their expected time (owner 13:29):
     the time the first finished job of the same type took on this machine,
-    from its log's creation to its last write, else `churn_minutes` per run
-    (amend/V.md A104)."""
+    from its log's creation to its last write, else the minutes the job
+    states (its "EXPECT=N" or "Expected ~N min" line, amend/base.md §2.10),
+    else `churn_minutes` per run (amend/V.md A104)."""
     now = time.time() if now is None else now
     expected = {}
     for log in sorted((queue / "done").glob("*.sh.log")):
@@ -1946,8 +2547,15 @@ def overruns(
     late = []
     for log in sorted((queue / "running").glob("*.sh.log")):
         took = now - log.stat().st_birthtime
+        job = log.with_suffix("")
+        stated = re.search(
+            r"\bEXPECT=(\d+)|[Ee]xpected:? ~?(\d+) min",
+            job.read_text(errors="replace") if job.exists() else "",
+        )
         allowed = 2 * (
-            expected.get(job_type(log.name.removesuffix(".log"))) or churn_minutes * 60
+            expected.get(job_type(log.name.removesuffix(".log")))
+            or (stated and 60 * int(stated.group(1) or stated.group(2)))
+            or churn_minutes * 60
         )
         if took > allowed:
             late.append(
@@ -1982,7 +2590,7 @@ def planned_runs(cell: dict, references: bool) -> list[tuple[str, str, int]]:
     if references:
         return interleave(cell.get("reference_runs") or {})
     if cell.get("abba"):
-        return abba_runs(cell)
+        return abba_runs(cell, cell["abba"].get("sets", 1))
     return interleave(cell.get("runs") or {})
 
 
@@ -2024,15 +2632,18 @@ def job_script(spec: dict, cell: dict, tree: str, order: str, repeat: int, args)
         if draft:
             variables.append(f'DRAFT_MODEL="{draft}"')
         results = f"build/release/{model['model'].replace('/', '--').replace(':', '--')}/backend-regression.json"
+        # The comparison is copied only as this make wrote it: an earlier
+        # run's, left when make fails before backend_regression.py writes
+        # one, is removed first. (status is read-only in zsh.)
         return (
             "#!/bin/zsh\n"
             f"# {label}: cell {cell['name']}, {model['model']} against {cell['baseline']} ({spec['path']})\n"
-            f"cd {shlex.quote(args.trees[base])} || exit 1\n"
+            f"cd {shlex.quote(args.trees[base])} && rm -f {results} || exit 1\n"
             f"/usr/bin/lockf -k {machine['lock']} env {machine_prefix(machine)}make install "
             f"test-performance-real {' '.join(variables)}\n"
-            "status=$?\n"
-            f"cp {results} {shlex.quote(args.out)}/{label}.backend-regression.json\n"
-            "echo EXIT=$status\n"
+            "code=$?\n"
+            f"test -f {results} && cp {results} {shlex.quote(args.out)}/{label}{SINGLE_RESULTS}\n"
+            "echo EXIT=$code\n"
         )
     model = spec["models"][cell["model"]]
     server_args = " ".join(
@@ -2197,11 +2808,35 @@ def parse_args(argv=None):
         type=Path,
         help="a gpuq root: list its jobs past twice their expected time",
     )
+    d = commands.add_parser(
+        "disk",
+        help="refuse a churn run whose free disk would make its SSD cache "
+        "incomparable with its references' (exit 1)",
+    )
+    d.add_argument("--spec", required=True, type=Path)
+    d.add_argument("--results", required=True, type=Path, nargs="+")
+    d.add_argument("--cell", required=True)
+    d.add_argument("--tree", default="cand")
     a = commands.add_parser("analyze")
     a.add_argument("--spec", required=True, type=Path)
     a.add_argument("--results", required=True, type=Path, nargs="+")
     a.add_argument("--out", required=True, type=Path)
+    a.add_argument(
+        "--build",
+        action="append",
+        default=[],
+        help="NAME=BUILD_ID[,BUILD_ID...]: the builds under test of a tree (cand's "
+        "at least: its build/engine/build-identity.json), several pooled when the "
+        "change between them is behaviour-neutral; runs of another build are not used",
+    )
     args = parser.parse_args(argv)
+    if args.command == "analyze":
+        args.builds = {}
+        for item in args.build:
+            name, builds = item.split("=", 1)
+            args.builds.setdefault(name, []).extend(b for b in builds.split(",") if b)
+        if not args.builds.get("cand"):
+            parser.error("analyze judges cand's builds: give --build cand=BUILD_ID")
     if args.command == "plan":
         # Job scripts name absolute paths of the machine that runs plan.
         args.trees = {
@@ -2251,9 +2886,16 @@ def main(argv=None) -> int:
             print(f"FAIL {problem}")
         print("check: " + ("FAIL" if problems else "PASS"))
         return 1 if problems else 0
+    if args.command == "disk":
+        return disk(load_spec(args.spec), args.results, args.cell, args.tree)
     out = refuse_protected(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    document = analyze(load_spec(args.spec), args.results)
+    spec = load_spec(args.spec)
+    for name, builds in args.builds.items():
+        if name not in spec["trees"]:
+            raise SystemExit(f"--build {name}: {args.spec} has no tree {name}")
+        spec["trees"][name]["build_id"] = builds[0] if len(builds) == 1 else builds
+    document = analyze(spec, args.results)
     (out / "verdict.json").write_text(
         json.dumps(document, indent=1, default=str) + "\n"
     )
