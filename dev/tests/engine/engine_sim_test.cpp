@@ -26,6 +26,7 @@
 #include "FakeMemory.hpp"
 #include "LoopFixture.hpp"
 #include "ProtocolPeer.hpp"
+#include "RegrowthWatch.hpp"
 #include "TestChecks.hpp"
 #include "TestMetalMemory.hpp"
 #include "TestRegistry.hpp"
@@ -535,6 +536,14 @@ struct Churn final {
   std::vector<uint64_t> finished;
 };
 
+// Ticks the idle loop until `done` or `milliseconds` pass; whether done.
+bool idleUntil(Serving &serving, double milliseconds, const std::function<bool()> &done,
+               const std::function<void()> &observe = {}) {
+  const double end = serving.now() + milliseconds;
+  serving.run([&] { return done() || serving.now() >= end; }, observe, "the idle loop did not move", end);
+  return done();
+}
+
 // The bound of a contended prefill unit as the run's own status reports it
 // (amend/V.md A09, G4a): max(G, u / kPassOverheadShare), u the units term's
 // price, by the price's p95 error.
@@ -579,15 +588,22 @@ double estimatedPrice(const engine::CostEstimateSnapshot &estimate, const model:
 // three lanes, each reading spilled K/V at the store's floor; no request
 // waits for memory past the resource wait limit and none fails for
 // capacity. Inside the episode (to 60 s past its end) the experts account
-// changes direction at most once per level of the host, and it is back at
-// its size before the episode within 60 s of its end (#645: a store that
-// shrinks and never regrows, 32.9 against 48.9 tokens a second). Outside
-// it, value may take a store unit for a long prompt's prefill (brief §2.12,
-// DESIGN §0 19:45; which one is SIM-value's question, on calibrated
-// counterfactuals), and what it takes comes back right after: once no
-// request that prefilled when it went still prefills, the store is back at
-// its size before within two control passes after the host's settling (the
-// free-room bound, AMENDMENTS X19).
+// changes direction at most once per level of the host, and the episode
+// takes a unit. Value may take a store unit for a long prompt's prefill
+// outside it (brief §2.12, DESIGN §0 19:45; which one is SIM-value's
+// question, on calibrated counterfactuals). The store's regrowth is A30's
+// (owner 11-03 03:55, RegrowthWatch): through the whole run no unit it grew
+// back is taken back within kValueHorizonSeconds, and it is never short of
+// its cap for more than two settled passes while its next unit would grow by
+// the rule's terms (#645: a store that shrinks and never regrows, 32.9
+// against 48.9 tokens a second). It regrows into free room after the take
+// that precedes the episode; after the episode the lanes' KV and its
+// projected growth hold the room it would grow into (1.08 GB beyond them at
+// the release, falling as the rounds grow, against a 1.32 GB unit; no cache
+// idle to displace), so the store stays a unit short to the end, as the
+// ledger's growth rule says (amend/M.md R3: pools grow into the room the
+// lanes leave), which B4's "back at its size before the episode within 60 s
+// of its end" contradicted under either rule.
 void testChurnRegrowsAfterTheHostEpisode() {
   const Machine &machine = kStudio18G;
   constexpr double episode = 300'000.0, warningEnd = 420'000.0, release = 600'000.0, end = 900'000.0;
@@ -601,75 +617,44 @@ void testChurnRegrowsAfterTheHostEpisode() {
                             {warningEnd, episodeOther, engine::MemoryPressure::Normal},
                             {release, machine.otherBytes, engine::MemoryPressure::Normal}});
   Churn churn(serving, {2, 0, 1});
-  // A unit given outside the episode: when, the store's bytes before, the
-  // requests that prefilled then, when the last of them stopped, and the
-  // control passes since the host settled after that.
-  struct Given final {
-    double at = 0.0;
-    uint64_t bytesBefore = 0;
-    std::set<uint64_t> prefilling;
-    std::optional<double> claimEnd;
-    uint32_t passes = 0;
-  };
-  std::vector<Given> given;
+  test::RegrowthWatch regrowth("experts");
   uint64_t last = serving.experts->state().currentBytes, before = last;
   int direction = 0;
   std::map<int, uint32_t> turnsByLevel;  // per level of the host: 1 warning, 2 short, 3 the minute after
   std::optional<double> backAt;
-  std::string notBack;
   uint32_t givenOutside = 0;
   bool episodeShrank = false;
   double oldestClaim = 0.0;
-  const auto prefilling = [&] {
-    std::set<uint64_t> ids;
-    for (const engine::ActiveRequestSnapshot &request : serving.fixture.loop.statusSnapshot().activeRequests)
-      if (request.phase == engine::Phase::Prefill)
-        ids.insert(request.id);
-    return ids;
-  };
+  // The most room beyond what the lanes project and the waiting claims hold
+  // after the episode, which the store would grow into.
+  uint64_t roomAfter = 0;
   churn.run(end, [&] {
     const double now = serving.now();
     const uint64_t current = serving.experts->state().currentBytes;
     const bool inside = now >= episode && now < episodeEnd;
     const int level = now < warningEnd ? 1 : now < release ? 2 : 3;
-    if (now < episode) {
-      before = current;
-      for (const Given &unit : given)
-        before = std::max(before, unit.bytesBefore);
-    }
+    if (now < episode)
+      before = std::max(before, current);
     if (current != last) {
       const int moved = current > last ? 1 : -1;
-      if (moved < 0 && !inside) {
-        given.push_back({.at = now, .bytesBefore = last, .prefilling = prefilling()});
-        ++givenOutside;
-      }
+      givenOutside += moved < 0 && !inside;
       episodeShrank |= moved < 0 && now >= episode && now < release;
       if (inside && direction && moved != direction)
         ++turnsByLevel[level];
       direction = moved;
       last = current;
     }
-    // What went outside the episode comes back, unless the episode begins
-    // before its bound: the host's level decides then.
-    const auto settled = [&](const Given &unit) {
-      return current >= unit.bytesBefore || (unit.at < episode && now >= episode);
-    };
-    std::erase_if(given, settled);
-    for (Given &unit : given) {
-      if (!unit.claimEnd) {
-        const std::set<uint64_t> still = prefilling();
-        if (std::ranges::none_of(unit.prefilling, [&](uint64_t id) { return still.contains(id); }))
-          unit.claimEnd = now;
-      }
-      if (unit.claimEnd && now >= *unit.claimEnd + engine::kHostSettleMilliseconds &&
-          !serving.fixture.loop.commandInFlight() && ++unit.passes > 2 && notBack.empty())
-        notBack = "a store unit given at " + std::to_string(unit.at / 1000.0) +
-                  " s, outside the host's episode, was not back two control passes after its claim ended at " +
-                  std::to_string(*unit.claimEnd / 1000.0) + " s and the host settled";
+    regrowth.observe(*serving.fixture.governor, serving.experts->units(), now, serving.fixture.controlPasses,
+                     serving.fixture.loop.commandInFlight());
+    const engine::MemoryGovernorSnapshot memory = serving.memory();
+    if (now >= release) {
+      const uint64_t held = memory.reservedBytes + memory.claims.bytes +
+                            serving.fixture.governor->ledger().laneDemandBytes();
+      roomAfter = std::max(roomAfter, memory.headroomBytes > held ? memory.headroomBytes - held : 0);
+      if (!backAt && current >= before)
+        backAt = now;
     }
-    if (now >= release && !backAt && current >= before)
-      backAt = now;
-    oldestClaim = std::max(oldestClaim, serving.memory().claims.oldestMilliseconds);
+    oldestClaim = std::max(oldestClaim, memory.claims.oldestMilliseconds);
   });
   const engine::EngineSnapshot counts = serving.fixture.loop.statusSnapshot();
   const double gapLimit = unitBound(counts.scheduler) +
@@ -682,18 +667,22 @@ void testChurnRegrowsAfterTheHostEpisode() {
                                       " ms");
   require(oldestClaim < engine::kResourceWaitTimeoutMilliseconds && counts.failed == 0,
           at(machine) + "a request waited " + std::to_string(oldestClaim) + " ms for memory, or failed");
-  require(notBack.empty(), at(machine) + notBack + serving.holders());
   for (const auto &[level, turns] : turnsByLevel)
     require(turns <= 1, at(machine) + "the store changed direction " + std::to_string(turns) +
                             " times at one host level (" + std::to_string(level) + ")");
   require(episodeShrank, at(machine) + "the host's episode took no store unit");
-  require(backAt && *backAt <= release + 60'000.0,
-          at(machine) + "the store was not back at its size before the episode within 60 s of its end (" +
-              (backAt ? std::to_string((*backAt - release) / 1000.0) + " s" : std::string("never")) + ")");
+  require(regrowth.retaken == 0, at(machine) + std::to_string(regrowth.retaken) +
+                                     " store units were taken back within the value horizon of their regrowth:" +
+                                     regrowth.history);
+  require(regrowth.stuck.empty(), at(machine) + regrowth.stuck + serving.holders());
   note(at(machine) + std::to_string(churn.finished.size()) + " requests, work " + std::to_string(churn.work()) +
-       ", longest decode gap " + std::to_string(longestGap) + " ms of " + std::to_string(gapLimit) +
-       ", store back " + std::to_string((*backAt - release) / 1000.0) + " s after the episode, " +
-       std::to_string(givenOutside) + " units given outside it");
+       ", longest decode gap " + std::to_string(longestGap) + " ms of " + std::to_string(gapLimit) + ", " +
+       std::to_string(givenOutside) + " units given outside the episode, " + std::to_string(regrowth.grows) +
+       " regrown, store " +
+       (backAt ? "back " + std::to_string((*backAt - release) / 1000.0) + " s after the episode"
+               : "short to the churn's end (the most room the lanes left after the episode " +
+                     std::to_string(roomAfter >> 20) + " MiB, its unit " + std::to_string(machine.store.unitBytes >> 20) +
+                     " MiB)"));
 }
 
 // --- SIM-churn-order ------------------------------------------------------------------------------------------
@@ -873,14 +862,6 @@ void testChurnOrderKeepsLeadersAndSpillLanes() {
 }
 
 // --- SIM-warning-M6 -------------------------------------------------------------------------------------------
-
-// Ticks the idle loop until `done` or `milliseconds` pass; whether done.
-bool idleUntil(Serving &serving, double milliseconds, const std::function<bool()> &done,
-               const std::function<void()> &observe = {}) {
-  const double end = serving.now() + milliseconds;
-  serving.run([&] { return done() || serving.now() >= end; }, observe, "the idle loop did not move", end);
-  return done();
-}
 
 // SIM-warning-M6 (amend/V.md A15/A31, X19): the M6 under macOS's warning
 // from the start, the host's headroom below one store chunk (443 MB, fxL),
@@ -1204,7 +1185,15 @@ void testValueChoiceFollowsTheCalibratedCost() {
 // into free room, the free run does at least as much work, reads the KV tier
 // for no more than a store chunk's refill more, and takes back no chunk it
 // regrew within kValueHorizonSeconds (the cool-down's 8 shrinks for 7
-// regrows, A30).
+// regrows, A30). Through the churn and idle after it the store is never
+// short of its cap for more than two settled passes while its next unit
+// would grow by A30's terms (RegrowthWatch). Two claims take a unit each in
+// the first 70 s and the lanes then hold the room. Idle after the churn,
+// with the take rate long decayed and its regrowth gaining about 0.5 s, the
+// churn's cached prompts (about 3 GB) hold it: the cache prices each block
+// at its reuse times the prefill of its whole chain (Cache::ReclaimPlan::
+// price), which for these 16K-110K-token chains is more than that gain, so
+// the store stays at its floor by value, not by A30.
 void testNoSpillTargetChurnFollowsValue() {
   const Machine &machine = k35BStudio18G;
   const ChurnPrompts prompts{.first = 16'186, .step = 7'281, .offsets = {-17, 0, 105}};
@@ -1212,7 +1201,8 @@ void testNoSpillTargetChurnFollowsValue() {
     double work = 0.0;
     uint64_t tierReads = 0, shrinks = 0, grows = 0;
     uint32_t retaken = 0;
-    bool regrown = false;
+    std::string stuck;
+    uint32_t idleUnits = 0;
   };
   const auto churnOf = [&](bool regrowth) {
     Serving serving(machine);
@@ -1222,6 +1212,11 @@ void testNoSpillTargetChurnFollowsValue() {
     Churn churn(serving, {2, 0, 1}, prompts);
     std::vector<double> grownAt;
     uint64_t grows = serving.experts->grows, shrinks = serving.experts->shrinks;
+    test::RegrowthWatch watcher("experts");
+    const auto watch = [&] {
+      watcher.observe(*serving.fixture.governor, serving.experts->units(), serving.now(),
+                       serving.fixture.controlPasses, serving.fixture.loop.commandInFlight());
+    };
     Result result;
     churn.run(600'000.0, [&] {
       if (serving.experts->grows > grows)
@@ -1231,16 +1226,19 @@ void testNoSpillTargetChurnFollowsValue() {
         ++result.retaken;
       grows = serving.experts->grows;
       shrinks = serving.experts->shrinks;
+      watch();
     });
     result.work = churn.work();
     result.tierReads = uint64_t{serving.fixture.tier->restores} * machine.pageBytes;
     result.shrinks = serving.experts->shrinks;
     result.grows = serving.experts->grows;
-    // The churn's last requests end; idle, the store takes back what it gave
-    // (free room or idle cache) within two settled passes and the settling.
-    churn.finish();
-    result.regrown = idleUntil(serving, 3 * engine::kHostSettleMilliseconds,
-                               [&] { return serving.experts->units() == machine.store.cap; });
+    // The churn's last requests end, and the engine idles beyond two
+    // settled passes and the settling.
+    serving.run([&] { return std::ranges::none_of(churn.inFlight, [&](const auto &id) { return id && serving.active(*id); }); },
+                [&] { watch(); }, "the churn's last requests did not end");
+    static_cast<void>(idleUntil(serving, 4 * engine::kHostSettleMilliseconds, [] { return false; }, watch));
+    result.stuck = watcher.stuck;
+    result.idleUnits = serving.experts->units();
     return result;
   };
   const Result free = churnOf(true), counterfactual = churnOf(false);
@@ -1252,12 +1250,13 @@ void testNoSpillTargetChurnFollowsValue() {
               std::to_string(counterfactual.tierReads));
   require(free.retaken == 0, at(machine) + std::to_string(free.retaken) +
                                  " store chunks were taken back within the value horizon of their regrowth");
-  require(free.regrown, at(machine) + "idle after the churn, the store stayed below its cap");
+  require(free.stuck.empty(), at(machine) + free.stuck);
   note(at(machine) + "work " + std::to_string(free.work) + " against " + std::to_string(counterfactual.work) +
        ", tier reads " + std::to_string(free.tierReads >> 20) + " against " +
        std::to_string(counterfactual.tierReads >> 20) + " MiB, store units given/taken back " +
        std::to_string(free.shrinks) + "/" + std::to_string(free.grows) + " against " +
-       std::to_string(counterfactual.shrinks) + "/" + std::to_string(counterfactual.grows));
+       std::to_string(counterfactual.shrinks) + "/" + std::to_string(counterfactual.grows) + ", idle after it " +
+       std::to_string(free.idleUnits) + " of " + std::to_string(machine.store.cap) + " units");
 }
 
 // --- SIM-turns ------------------------------------------------------------------------------------------------

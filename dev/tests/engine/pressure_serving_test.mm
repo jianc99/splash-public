@@ -15,6 +15,7 @@
 // start's warm-up runs.
 
 #include "ProtocolPeer.hpp"
+#include "RegrowthWatch.hpp"
 #include "SyntheticModels.hpp"
 #include "TestChecks.hpp"
 #include "TestFiles.hpp"
@@ -128,8 +129,10 @@ struct Served final {
   // runs them; then the books at that sample.
   void step(const std::function<void()> &sample) {
     static_cast<void>(loop().tick());
-    if (!loop().commandInFlight())
+    if (!loop().commandInFlight()) {
       static_cast<void>(bootstrap->controlPass(host->pressure));
+      ++controlPasses;
+    }
     drain();
     if (sample)
       sample();
@@ -143,7 +146,17 @@ struct Served final {
     }
   }
 
+  // The store's regrowth at each control pass (A30, RegrowthWatch), on the
+  // steps' wall clock.
+  void watch(test::RegrowthWatch &regrowth) {
+    const double now = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    regrowth.observe(resources().memoryGovernor(), static_cast<uint32_t>(store().chunks), now, controlPasses,
+                     loop().commandInFlight());
+  }
+
   std::shared_ptr<Host> host;
+  std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+  uint64_t controlPasses = 0;
   RuntimeMetrics metrics;
   std::vector<uint8_t> output;
   protocol::peer::EventReader reader;
@@ -170,15 +183,23 @@ void requireBooks(Served &served, const std::string &when) {
 
 // Two host episodes, normal -> warning -> critical -> normal, beside three
 // growing prompts and a decoder. At every sample the books hold; within each
-// level of the host the experts account moves one way only; after each
-// episode it is back at its size before it; every request completes or ends
-// for capacity; Metal stays healthy.
+// level of the host the experts account moves one way only; through the
+// episodes and the drain after them the store's regrowth is A30's (owner
+// 11-03 03:55, RegrowthWatch): no unit it grew back is taken back within the
+// horizon, and it is never short of its cap for more than two settled passes
+// while its next unit would grow by the rule's terms. B4's "back at its size
+// before each episode within its normal level" is not A30's: a unit the
+// decoder's claim took stays out while that lane is in service beside the
+// fed prompts (coordinator 06:10), and after the critical level's drop the
+// take rate decays over its time constant first. Every request completes or
+// ends for capacity; Metal stays healthy.
 void testEpisodesKeepTheBooksAndRegrow() {
   const test::TemporaryDirectory root("splash-pressure-serving");
   auto host = std::make_shared<Host>();
   Served served(root.path(), host);
   const uint64_t physical = metal::probeDeviceCapabilities().physicalMemoryBytes;
   const uint64_t spareReserve = EngineMemoryPolicy::hostSpareReserveBytes(physical);
+  test::RegrowthWatch regrowth("experts");
   served.submit(1, 64, 4096);
   uint64_t next = 10;
   const auto feed = [&] {
@@ -190,7 +211,6 @@ void testEpisodesKeepTheBooksAndRegrow() {
   };
   for (uint32_t episode = 1; episode <= 2; ++episode) {
     const std::string at = "episode " + std::to_string(episode);
-    const uint64_t before = served.expertsAccount().value_or(0);
     struct Level final {
       MemoryPressure pressure;
       uint64_t available;
@@ -206,6 +226,7 @@ void testEpisodesKeepTheBooksAndRegrow() {
       int direction = 0;
       served.stepFor(4000.0, [&] {
         feed();
+        served.watch(regrowth);
         requireBooks(served, at + ", " + level.name);
         const uint64_t current = served.expertsAccount().value_or(0);
         if (last && current != *last) {
@@ -217,10 +238,13 @@ void testEpisodesKeepTheBooksAndRegrow() {
         last = current;
       });
     }
-    require(served.expertsAccount().value_or(0) >= before,
-            at + ": the experts account was not back at its size before the episode");
   }
-  served.stepFor(60'000.0, {}, [&] { return served.ended.size() == served.submitted.size(); });
+  served.stepFor(60'000.0, [&] { served.watch(regrowth); },
+                 [&] { return served.ended.size() == served.submitted.size(); });
+  require(regrowth.retaken == 0, std::to_string(regrowth.retaken) +
+                                     " store units were taken back within the value horizon of their regrowth:" +
+                                     regrowth.history);
+  require(regrowth.stuck.empty(), regrowth.stuck);
   std::string unended;
   for (const uint64_t id : served.submitted)
     if (!served.ended.contains(id))
