@@ -7,9 +7,12 @@
 // Pro, under the machine's GPU lock.
 //
 // The target is the synthetic Qwen3.6-35B-A3B geometry (SyntheticModels.hpp
-// moeConfig, 128 routed experts a layer): its store streams in several
-// chunks under a budget a byte short of every expert (runtime_resources_test's
-// floor case); the Flash-Next fixture's four experts a layer stream in one.
+// moeConfig, 128 routed experts a layer; HiSparse off): its store streams in
+// several chunks under a budget a byte short of every expert
+// (runtime_resources_test's floor case). The synthetic Flash-Next
+// (flashNextConfig) does not start here: its hidden state of 256 values has
+// no hyper-connection norm kernel (HyperConnection.cpp, 2560 only), which a
+// start's warm-up runs.
 
 #include "ProtocolPeer.hpp"
 #include "SyntheticModels.hpp"
