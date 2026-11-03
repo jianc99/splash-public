@@ -24,8 +24,6 @@ using splash::test::Executor;
 using splash::test::guardReleases;
 using splash::test::idle;
 using splash::test::request;
-using splash::test::runUntilIdle;
-using splash::test::tickUntil;
 
 namespace {
 
@@ -40,7 +38,6 @@ bool tickAt(test::EngineHarness &h, double now) {
   return h.tick();
 }
 
-using test::tickUntil;
 // Ticks on from `now` until done() holds, as the harness runs
 // (EngineHarness::runUntil); `now` follows its clock.
 void tickUntil(test::EngineHarness &h, double &now, const std::function<bool()> &done, const char *message) {
@@ -1095,10 +1092,13 @@ void testSharedJunctionPublishesFromCachedKv() {
           "the shared junction did not make room from cached KV");
 }
 
-void advanceToOverlappedVerify(engine::Engine &engine, Executor &executor,
-                               Events &events, uint64_t requestId) {
-  require(engine.tick(1) && engine.tick(2),
-          "constrained request did not reach its initial mask");
+// Ticks the harness at 1 to 6 ms: the constrained request's initial mask,
+// its first token, then its first cycle's overlapped verify.
+void advanceToOverlappedVerify(test::EngineHarness &h, uint64_t requestId) {
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  require(tickAt(h, 1) && tickAt(h, 2), "constrained request did not reach its initial mask");
   require(events.maskRequests.size() == 1 &&
               events.maskRequests[0].first == requestId &&
               events.maskRequests[0].second.empty(),
@@ -1106,7 +1106,7 @@ void advanceToOverlappedVerify(engine::Engine &engine, Executor &executor,
   const std::array<uint32_t, 1> initialMask{1};
   engine.provideMask(requestId, initialMask);
   // Its first token is selected, then its first cycle drafts.
-  require(engine.tick(3) && engine.tick(4) && engine.tick(5) && engine.tick(6),
+  require(tickAt(h, 3) && tickAt(h, 4) && tickAt(h, 5) && tickAt(h, 6),
           "constrained request did not launch overlapped verification");
   require(engine.commandInFlight() && executor.overlap &&
               events.maskRequests.size() == 2 &&
@@ -1117,12 +1117,11 @@ void advanceToOverlappedVerify(engine::Engine &engine, Executor &executor,
 
 void testConstraintMaskOverlapsInsideOneSchedulerBatch() {
   test::EngineHarness h({.pages = 8, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
-  Executor &executor = h.model;
   Events &events = h.events;
   engine::Engine &engine = h.engine;
 
   engine.submit(constrainedRequest(200));
-  advanceToOverlappedVerify(engine, executor, events, 200);
+  advanceToOverlappedVerify(h, 200);
   const std::array<uint32_t, 1> verifyMask{1};
   engine.provideMask(200, verifyMask);
   require(tickAt(h, 7) && idle(engine) && events.completedCount == 1 &&
@@ -1246,7 +1245,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
     Events &events = h.events;
     engine::Engine &engine = h.engine;
     engine.submit(constrainedRequest(201));
-    advanceToOverlappedVerify(engine, executor, events, 201);
+    advanceToOverlappedVerify(h, 201);
     engine.cancel(201);
     const std::array<uint32_t, 1> lateMask{1};
     engine.provideMask(201, lateMask);
@@ -1263,7 +1262,7 @@ void testConstraintMaskWaitHonorsCancelAndDeadline() {
     Events &events = h.events;
     engine::Engine &engine = h.engine;
     engine.submit(constrainedRequest(202, 100.0));
-    advanceToOverlappedVerify(engine, executor, events, 202);
+    advanceToOverlappedVerify(h, 202);
     require(tickAt(h, 100.0) && executor.overlap->abandoned &&
                 idle(engine) && events.failedCount == 1,
             "deadline did not terminate an in-flight host mask wait");
@@ -1281,7 +1280,7 @@ void testUnansweredVerifyMaskFailsOnlyItsRequest() {
   engine::Engine &engine = h.engine;
   engine.submit(constrainedRequest(203, 100'000.0));
   // The verify mask is requested at tick 6.
-  advanceToOverlappedVerify(engine, executor, events, 203);
+  advanceToOverlappedVerify(h, 203);
   engine.submit(request(204, {2}));
   static_cast<void>(tickAt(h, 5005.0));
   require(engine.commandInFlight() && !executor.overlap->abandoned &&

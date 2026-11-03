@@ -29,9 +29,7 @@ using splash::test::guardReleases;
 using splash::test::idle;
 using splash::test::OffloadControl;
 using splash::test::request;
-using splash::test::runUntilIdle;
 using splash::test::State;
-using splash::test::tickUntil;
 
 namespace {
 
@@ -45,7 +43,6 @@ bool tickAt(test::EngineHarness &h, double now) {
   return h.tick();
 }
 
-using test::tickUntil;
 // Ticks on from `now` until done() holds, as the harness runs
 // (EngineHarness::runUntil); `now` follows its clock.
 void tickUntil(test::EngineHarness &h, double &now, const std::function<bool()> &done, const char *message) {
@@ -55,13 +52,11 @@ void tickUntil(test::EngineHarness &h, double &now, const std::function<bool()> 
   now = h.now() + 1;
 }
 
-void runUntilCheckpoint(engine::Engine &engine, uint64_t publications) {
-  for (uint32_t step = 0; step < 128; ++step) {
-    static_cast<void>(engine.tick(step + 1));
-    if (engine.snapshot().checkpointPublications >= publications)
-      return;
-  }
-  throw std::runtime_error("engine did not publish the expected checkpoint");
+// Ticks as the harness runs until the engine has published `publications`
+// checkpoints.
+void runUntilCheckpoint(test::EngineHarness &h, uint64_t publications) {
+  h.runUntil([&] { return h.engine.snapshot().checkpointPublications >= publications; },
+             "engine did not publish the expected checkpoint");
 }
 
 // An engine with no test configuration plans checkpoints every
@@ -74,7 +69,7 @@ void testCancelledColdPrefillResumesItsLatestCheckpoint() {
   engine::Engine &engine = h.engine;
   const std::vector<uint32_t> prompt(30001, 19);
   engine.submit(request(400, prompt));
-  runUntilCheckpoint(engine, 2);
+  runUntilCheckpoint(h, 2);
   require(resources.snapshot().stateCache.entries == 1 &&
               resources.snapshot().stateCache.bytes == 64,
           "cold prefill accumulated superseded progress states");
@@ -134,13 +129,13 @@ void testSharedCheckpointSurvivesPeerRollingReplacement() {
   auto background = request(412, original);
   background.priority = RequestPriority::Background;
   engine.submit(std::move(background));
-  runUntilCheckpoint(engine, 1);
+  runUntilCheckpoint(h, 1);
   std::vector<uint32_t> branch = original;
   std::fill(branch.begin() + kPrefillCheckpointTokens, branch.end(), 21);
   auto foreground = request(413, branch);
   foreground.priority = RequestPriority::Foreground;
   engine.submit(std::move(foreground));
-  runUntilCheckpoint(engine, 2);
+  runUntilCheckpoint(h, 2);
   require(resources.lookup(original, {}).resumeBoundary() == kPrefillCheckpointTokens,
           "rolling a shared checkpoint retired the paused peer's recovery point");
   engine.cancel(412);
@@ -158,7 +153,7 @@ void testRepeatedRetriesRollTheRestoredCheckpoint() {
   const std::vector<uint32_t> prompt(40001, 31);
   for (uint32_t attempt = 0; attempt < 3; ++attempt) {
     engine.submit(request(500 + attempt, prompt));
-    runUntilCheckpoint(engine, attempt + 1);
+    runUntilCheckpoint(h, attempt + 1);
     require(events.starts.back() == attempt * kPrefillCheckpointTokens &&
                 resources.snapshot().stateCache.entries == 1 &&
                 resources.snapshot().stateCache.checkpointEntries == 1,
@@ -184,7 +179,7 @@ void testRetryCancelledBeforeNextCheckpointKeepsItsSource() {
   engine::Engine &engine = h.engine;
   const std::vector<uint32_t> prompt(25001, 32);
   engine.submit(request(510, prompt));
-  runUntilCheckpoint(engine, 1);
+  runUntilCheckpoint(h, 1);
   engine.cancel(510);
   h.runUntilIdle();
   for (uint32_t id : {511U, 512U}) {
@@ -220,7 +215,7 @@ void testRestoredCheckpointAtReplayEndBecomesOrdinary() {
       }
       const std::vector<uint32_t> prompt(25001, 33);
       engine.submit(request(520, prompt));
-      runUntilCheckpoint(engine, 1);
+      runUntilCheckpoint(h, 1);
       engine.cancel(520);
       h.runUntilIdle();
       const uint32_t taken = executor.reservations + executor.diskSnapshots;
@@ -258,7 +253,7 @@ void testRetryRetiresCheckpointAtDeeperJunction() {
   engine::Engine &engine = h.engine;
   const std::vector<uint32_t> prompt(30001, 34);
   engine.submit(request(530, prompt));
-  runUntilCheckpoint(engine, 2);
+  runUntilCheckpoint(h, 2);
   require(tickAt(h, 50) && tickAt(h, 51) && !engine.commandInFlight() &&
               executor.requests.at(530).position == 18432,
           "fixture did not commit past the last recovery point");
@@ -296,7 +291,7 @@ void testPinnedCheckpointSkipsReplacementButNotOrdinaryState() {
   engine::Engine &engine = h.engine;
   const std::vector<uint32_t> prompt(18001, 35);
   engine.submit(request(540, prompt));
-  runUntilCheckpoint(engine, 1);
+  runUntilCheckpoint(h, 1);
   auto pinned = resources.lookup(prompt, {});
   require(pinned.resumeBoundary() == kPrefillCheckpointTokens,
           "fixture did not pin its checkpoint");
@@ -329,12 +324,12 @@ void testPinnedPredecessorTakesNoRoomFromOtherStates() {
   // A cancelled prefill leaves its checkpoint at 4096 cached.
   const std::vector<uint32_t> other(25001, 41);
   engine.submit(request(1, other));
-  runUntilCheckpoint(engine, 1);
+  runUntilCheckpoint(h, 1);
   engine.cancel(1);
   h.runUntilIdle();
   const std::vector<uint32_t> prompt(18001, 42);
   engine.submit(request(2, prompt));
-  runUntilCheckpoint(engine, 2);
+  runUntilCheckpoint(h, 2);
   auto pinned = resources.lookup(prompt, {});
   require(pinned.resumeBoundary() == kPrefillCheckpointTokens &&
               resources.lookup(other, {}).resumeBoundary() == kPrefillCheckpointTokens,
@@ -425,7 +420,7 @@ void testFailedReplacementContinuesWithoutRecoveryPoint() {
   engine::Engine &engine = h.engine;
   const std::vector<uint32_t> prompt(25001, 36);
   engine.submit(request(550, prompt));
-  runUntilCheckpoint(engine, 1);
+  runUntilCheckpoint(h, 1);
   executor.denyReservationAt = 2 * kPrefillCheckpointTokens;
   for (uint32_t step = 0; step < 32 &&
        !engine.snapshot().checkpointPublicationFailures; ++step)
@@ -448,7 +443,7 @@ void testRollingHandleCannotRetirePromotedState() {
   engine::Engine &engine = h.engine;
   const std::vector<uint32_t> prompt(25001, 37);
   engine.submit(request(560, prompt));
-  runUntilCheckpoint(engine, 1);
+  runUntilCheckpoint(h, 1);
   {
     auto existing = resources.lookup(prompt, {});
     require(resources.reuseCompositeState(existing.state->kvBlock(), false),
@@ -513,13 +508,13 @@ void testCheckpointRetiresOnceItsSuccessorIsPublished() {
   Executor &executor = h.model;
   engine::Engine &engine = h.engine;
   engine.submit(request(430, std::vector<uint32_t>(25001, 23)));
-  runUntilCheckpoint(engine, 1);
+  runUntilCheckpoint(h, 1);
   executor.reservationObserver = [&] {
     require(resources.snapshot().stateCache.checkpointEntries == 1 &&
                 resources.snapshot().stateCache.checkpointRetirements == 0,
             "the next checkpoint's buffers retired the lane's checkpoint before its command");
   };
-  runUntilCheckpoint(engine, 2);
+  runUntilCheckpoint(h, 2);
   require(capturedStates(executor, 430) ==
                   std::vector<std::pair<uint32_t, uint64_t>>{{4096, 4096}, {8192, 8192}} &&
               executor.snapshots == 0 && engine.snapshot().captureCuts == 0,
@@ -663,7 +658,7 @@ void testRefusedStateTakesTheCheckpointAfterItsCommand() {
       // of the conversation that leaves the prompt at 6016.
       const std::vector<uint32_t> other(25001, 41);
       engine.submit(request(1, other));
-      runUntilCheckpoint(engine, 1);
+      runUntilCheckpoint(h, 1);
       engine.cancel(1);
       h.runUntilIdle();
       // Resuming at 64, the prompt's commands end at 2112, 4160, 6208 and
@@ -942,7 +937,7 @@ void testSharedCheckpointSurvivesPeerReplayPoint() {
     std::vector<uint32_t> first(12201);
     std::iota(first.begin(), first.end(), 1);
     engine.submit(request(1, first));
-    runUntilCheckpoint(engine, 1);
+    runUntilCheckpoint(h, 1);
     // The second follows the first to 6000, and its replay point lands at
     // 6176: no state the first plans lies in what they share past 4096, so
     // it does not wait for the first.
@@ -1078,9 +1073,11 @@ void dropDeepestState(engine::Cache &cache, const std::vector<uint32_t> &prompt)
 // request the host refuses memory beside it then takes its lane; the lane's
 // prompt replay point is lost while it waits, so it resumes from the
 // checkpoint before it.
-void suspendWithoutTheReplayPoint(engine::Engine &engine, engine::Cache &cache,
-                                  Executor &executor, Events &events, double &now,
-                                  const std::vector<uint32_t> &prompt, uint32_t history) {
+void suspendWithoutTheReplayPoint(test::EngineHarness &h, double &now, const std::vector<uint32_t> &prompt,
+                                  uint32_t history) {
+  Executor &executor = h.model;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
   executor.beginAllocationFailure = metal::AllocationFailure::HostPressure;
   executor.beginGrowthBlocked = [&executor] {
     return executor.lastBeginId == 2 && executor.requests.at(1).resident;
@@ -1089,12 +1086,10 @@ void suspendWithoutTheReplayPoint(engine::Engine &engine, engine::Cache &cache,
   background.priority = RequestPriority::Background;
   background.maxNewTokens = 10'000;
   engine.submit(std::move(background));
-  tickUntil(engine, now, [&] { return events.outputs[1].size() == history; },
-            "the lane did not decode its history");
+  tickUntil(h, now, [&] { return events.outputs[1].size() == history; }, "the lane did not decode its history");
   engine.submit(request(2, std::vector<uint32_t>(65, 2)));
-  tickUntil(engine, now, [&] { return executor.suspensions == 1; },
-            "the Normal request did not take the lane");
-  dropDeepestState(cache, prompt);
+  tickUntil(h, now, [&] { return executor.suspensions == 1; }, "the Normal request did not take the lane");
+  dropDeepestState(h.cache, prompt);
 }
 
 // A resumed lane's command captures its prompt's replay point and, past it,
@@ -1106,7 +1101,6 @@ void testStatePastTheReplayPointKeepsTheCheckpoint() {
   test::EngineHarness h({.pages = 1024, .shape = [](Executor &shape) { shape.maximumLanes = 1; }});
   engine::Cache &resources = h.cache;
   Executor &executor = h.model;
-  Events &events = h.events;
   engine::Engine &engine = h.engine;
   executor.decodeFinishes = false;
   // Checkpoints at 4096 and 8192, the replay point at 12192. A history of 64
@@ -1115,7 +1109,7 @@ void testStatePastTheReplayPointKeepsTheCheckpoint() {
   std::vector<uint32_t> prompt(12201);
   std::iota(prompt.begin(), prompt.end(), 1);
   double now = 1;
-  suspendWithoutTheReplayPoint(engine, resources, executor, events, now, prompt, 64);
+  suspendWithoutTheReplayPoint(h, now, prompt, 64);
   tickUntil(h, now,
             [&] { return executor.prefillChunks.at(1) == 8 && !engine.commandInFlight(); },
             "the resumed lane did not reach its history's end");
@@ -1165,7 +1159,7 @@ void testReplayPointWithoutRoomTakesTheCheckpointItsCommandCaptures() {
   std::vector<uint32_t> prompt(6657);
   std::iota(prompt.begin(), prompt.end(), 1);
   double now = 1;
-  suspendWithoutTheReplayPoint(engine, resources, executor, events, now, prompt, 1600);
+  suspendWithoutTheReplayPoint(h, now, prompt, 1600);
   tickUntil(h, now, [&] { return events.usage.contains(2); },
             "the Normal request did not finish");
   // Memory fills: a state's buffers come only from a state the cache lets
@@ -1200,7 +1194,7 @@ void testShortSuffixContinuesCheckpointDraftState() {
   engine::Engine &engine = h.engine;
   const std::vector<uint32_t> prompt(18001, 30);
   engine.submit(request(480, prompt));
-  runUntilCheckpoint(engine, 1);
+  runUntilCheckpoint(h, 1);
   engine.cancel(480);
   h.runUntilIdle();
   std::vector<uint32_t> shorter(
