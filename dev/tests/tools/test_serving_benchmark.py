@@ -1979,17 +1979,20 @@ class GateTests(unittest.TestCase):
             ],
         )
 
-    def test_an_ssd_cache_held_back_unlike_the_references_voids_the_run(self):
+    def test_an_ssd_cache_held_back_unlike_the_references_is_not_compared(self):
         # --max-cache-disk auto limits the SSD cache to a quarter of the
         # volume's free space beyond 10 GiB, so the free disk sets it. main's
         # sMNb held at most 10.71 GiB under 12.04 GiB (11.50 of 12.93 GB on
         # 62.6 GB free). On 50 GiB free a cand run's limit is 10 GiB: one that
-        # fills it was held back where sMNb was not, and is voided; one that
-        # held 8 GiB met neither limit, and counts. In the ample cell ntie's
-        # sNFb filled its 10.49 GiB (11.26 GB): a cand run on a cleaned disk
-        # holding 12.11 GiB under 14.90 GiB had room sNFb lacked, and is
-        # voided; one that filled 10.49 GiB counts, though r150's s150Fb,
-        # in none of that cell's gates, filled its 11.38 GiB.
+        # fills it was held back where sMNb was not, and is left out of the
+        # comparisons; one that held 8 GiB met neither limit, and counts. In
+        # the ample cell ntie's sNFb filled its 10.49 GiB (11.26 GB): a cand
+        # run on a cleaned disk holding 12.11 GiB under 14.90 GiB had room
+        # sNFb lacked, and is left out; one that filled 10.49 GiB counts,
+        # though r150's s150Fb, in none of that cell's gates, filled its
+        # 11.38 GiB. A run left out is still judged on its own G4, G8 and
+        # G9: B1's 7 s stall past the Studio's 6.2 s floor and its accounts
+        # that missed the charged bytes fail them.
         spec = matrix.load_spec(SPEC)
         names = ("s-fn-churn-18g", "s-fn-churn-ample")
         spec = {**spec, "cells": [c for c in spec["cells"] if c["name"] in names]}
@@ -2017,7 +2020,14 @@ class GateTests(unittest.TestCase):
                 )
                 for t, used in ((0, 0), (900, held))
             ]
-            churn_run(self.directory, label, done, samples)
+            records = done
+            if label == "s-fn-churn-18g-cand-B1":
+                records = [{**done[0], "chunks_ms": [0, 100, 7100]}, *done[1:]]
+                samples[1]["status"]["memory_governor"] = {
+                    "accounts": [{"name": "kv", "current_bytes": 100}],
+                    "charged_bytes": 300,
+                }
+            churn_run(self.directory, label, records, samples)
             if order:
                 (self.directory / f"{label}.meta.json").write_text(
                     json.dumps(
@@ -2056,6 +2066,75 @@ class GateTests(unittest.TestCase):
                         "free at Ready); sNFb held at most 10.42 GiB, filling its "
                         "10.49 GiB limit"
                     ],
+                ),
+            ],
+        )
+        verdicts = {v["rule"]: v for v in document["verdicts"]}
+        self.assertEqual(
+            verdicts["G4 G8 G9 s-fn-churn-18g-cand-B1"]["numbers"]["failures"],
+            [
+                "G4c: a client gap of 7.00 s, the floor is 6.2 s",
+                "G9: the accounts do not sum to charged_bytes at t=900",
+            ],
+        )
+        self.assertEqual(
+            verdicts["G4 G8 G9 s-fn-churn-ample-cand-A1"]["verdict"], stats.PASS
+        )
+
+    def test_the_floor_control_is_compared_with_usable_cand_runs_only(self):
+        # m6-fn-churn on a day of low free disk: cand-A1 filled its 10 GiB
+        # limit where r150's m150a held 10.71 GiB under 12.04 GiB, so it is
+        # not compared. cand-floorcap-A1, run on a normal disk, held what
+        # m150a held: it is compared with cand-B1, which held as much, never
+        # with cand-A1, whatever the order the runs come in. cand-floorcap-B1
+        # filled a 10 GiB limit unlike cand-B1. Neither run is voided.
+        cell = next(c for c in self.spec["cells"] if c["name"] == "m6-fn-churn")
+
+        def made(label, tree, free, limit, held):
+            samples = [
+                status(
+                    t,
+                    disk__limit_bytes=limit * 2**30,
+                    disk__used_bytes=used * 2**30,
+                    disk__volume_available_bytes=free * 2**30,
+                )
+                for t, used in ((0, 0), (900, held))
+            ]
+            run = churn_run(self.directory, label, [], samples)
+            run.tree = tree
+            return run
+
+        runs = [
+            made("m6-fn-churn-cand-floorcap-A1", "cand-floorcap", 58.3, 12.04, 10.71),
+            made("m6-fn-churn-cand-floorcap-B1", "cand-floorcap", 50.0, 10.0, 9.95),
+            made("m6-fn-churn-cand-A1", "cand", 50.0, 10.0, 9.95),
+            made("m6-fn-churn-cand-B1", "cand", 58.3, 12.04, 10.71),
+            made("m150a", "r150", 58.3, 12.04, 10.71),
+        ]
+        matrix.compare_ssd_caches(cell, runs, self.gates["tolerance"])
+        filled = (
+            "this run held at most 9.95 GiB, filling its 10.00 GiB limit (50.00 GiB "
+            "free at Ready)"
+        )
+        self.assertEqual(
+            [(r.label, r.invalid, r.voided) for r in runs if r.invalid or r.voided],
+            [
+                (
+                    "m6-fn-churn-cand-floorcap-B1",
+                    [
+                        "SSD cache not comparable with cand's m6-fn-churn-cand-B1: "
+                        f"{filled}; m6-fn-churn-cand-B1 held at most 10.71 GiB "
+                        "under a 12.04 GiB limit"
+                    ],
+                    [],
+                ),
+                (
+                    "m6-fn-churn-cand-A1",
+                    [
+                        f"SSD cache not comparable with r150's m150a: {filled}; "
+                        "m150a held at most 10.71 GiB under a 12.04 GiB limit"
+                    ],
+                    [],
                 ),
             ],
         )
@@ -2556,6 +2635,63 @@ class GateTests(unittest.TestCase):
             [("s1-cand-2", ["the laptop was in use (HIDIdleTime 2.5 s)"])],
         )
 
+    def test_an_abba_set_with_a_second_copy_of_a_run_is_judged(self):
+        # m6-serve1 analyzed over two results directories that both hold
+        # m6-serve1-cand-1, the second a copy of the first: the copy is
+        # listed and the set, its four runs all used, is judged. A set whose
+        # pass-2 is only of another build is not.
+        cell = next(c for c in self.spec["cells"] if c["name"] == "m6-serve1")
+        spec = {**self.with_cand_build(self.spec, "src-new"), "cells": [cell]}
+        copy = Path(tempfile.mkdtemp(dir=self.directory))
+        for tree, _, repeat in matrix.abba_runs(cell, 1):
+            label = f"m6-serve1-{tree}-{repeat}"
+            write_jsonl(
+                self.directory / f"{label}.events.jsonl",
+                [
+                    {"kind": "request", "size": 300, "sample": s, "ttft_ms": 1000 + s}
+                    for s in range(3)
+                ],
+            )
+            (self.directory / f"{label}.out").write_text("DONE\n")
+            self.run_meta(
+                label,
+                cell=cell["name"],
+                tree_name=tree,
+                repeat=repeat,
+                build_id="src-new" if tree == "cand" else "src-pass",
+            )
+        for suffix in (".events.jsonl", ".out", ".meta.json"):
+            name = f"m6-serve1-cand-1{suffix}"
+            (copy / name).write_text((self.directory / name).read_text())
+        verdicts, unused = matrix.abba_cell(cell, spec, [self.directory, copy])
+        self.assertEqual(
+            [(v["rule"], v["verdict"]) for v in verdicts if v["rule"][:2] == "G7"],
+            [("G7 serve1_300_ttft_ms set 1", stats.PASS)],
+        )
+        self.assertEqual(
+            [(u["label"], u["reasons"]) for u in unused],
+            [
+                (
+                    "m6-serve1-cand-1",
+                    [f"also in {self.directory}, whose run is used"],
+                )
+            ],
+        )
+        trees = spec["trees"]
+        spec["trees"] = {**trees, "pass": {**trees["pass"], "build_id": "src-pass"}}
+        (copy / "m6-serve1-pass-2.meta.json").write_text(
+            json.dumps({"label": "m6-serve1-pass-2", "build_id": "src-old"})
+        )
+        (self.directory / "m6-serve1-pass-2.meta.json").unlink()
+        (self.directory / "m6-serve1-pass-2.events.jsonl").rename(
+            copy / "m6-serve1-pass-2.events.jsonl"
+        )
+        verdicts, unused = matrix.abba_cell(cell, spec, [self.directory, copy])
+        self.assertEqual(
+            [(v["rule"], v["verdict"], v["numbers"]) for v in verdicts][-1],
+            ("G7 set 1", stats.INCONCLUSIVE, "runs not used: m6-serve1-pass-2"),
+        )
+
     def test_analyze_pools_the_cand_builds_it_is_given(self):
         # The M6 cells ran on the M3b+C build src-a; the release binary src-b
         # differs by a behaviour-neutral change, so its confirmation run
@@ -2746,6 +2882,103 @@ class GateTests(unittest.TestCase):
         (self.directory / "p-35b-price-pass-2.out").write_text("")
         self.assertIsNone(matrix.serve1_prices("p-35b-price-pass-1", [self.directory]))
 
+    def test_a_cell_without_prices_still_judges_each_candidate_run(self):
+        # p-35b-churn-18g: p-35b-price-pass-1 measured every size, then its
+        # run.py failed (no DONE), and it has no rerun, so the cell has no
+        # prices. Its work gates are INCONCLUSIVE beside the prices', and the
+        # rest are judged: cand-A1's engine restarted, which fails G8, and
+        # cand-B1's requests took 1.5 times r150's.
+        spec = matrix.load_spec(SPEC)
+        cell = next(c for c in spec["cells"] if c["name"] == "p-35b-churn-18g")
+        spec = {**spec, "cells": [cell]}
+        write_jsonl(
+            self.directory / "p-35b-price-pass-1.events.jsonl",
+            [
+                {
+                    "kind": "request",
+                    "size": size,
+                    "prompt": size,
+                    "ttft_ms": size / 2 + 500,
+                    "decode_ms_per_token": 20,
+                }
+                for size in (300, 2048, 14336)
+            ],
+        )
+        (self.directory / "p-35b-price-pass-1.out").write_text("")
+
+        def done(latency):
+            return [
+                {
+                    "tag": f"w{w}-r1",
+                    "start": 0,
+                    "t": latency,
+                    "ttft": 5,
+                    "decode_tps": 30,
+                }
+                for w in range(3)
+            ]
+
+        def samples(restarts=0):
+            return [
+                status(
+                    t,
+                    transport__restarts=restarts if t else 0,
+                    disk__limit_bytes=12 << 30,
+                    disk__used_bytes=0,
+                    disk__volume_available_bytes=60 << 30,
+                )
+                for t in (0, 900)
+            ]
+
+        for label, latency, restarts in (
+            ("p35R150b", 100, 0),
+            ("p35MNb", 100, 0),
+            ("p-35b-churn-18g-cand-B1", 150, 0),
+            ("p-35b-churn-18g-cand-A1", 100, 1),
+        ):
+            churn_run(self.directory, label, done(latency), samples(restarts))
+        for label, order in (
+            ("p-35b-churn-18g-cand-A1", [2, 0, 1]),
+            ("p-35b-churn-18g-cand-B1", [0, 1, 2]),
+        ):
+            (self.directory / f"{label}.meta.json").write_text(
+                json.dumps(
+                    {
+                        "label": label,
+                        "cell": cell["name"],
+                        "tree_name": "cand",
+                        "order": order,
+                        "model": spec["models"]["35b-q4"]["model"],
+                        "complete": True,
+                    }
+                )
+            )
+        verdicts = {
+            v["rule"]: v for v in matrix.analyze(spec, [self.directory])["verdicts"]
+        }
+        self.assertEqual(verdicts["prices"]["verdict"], stats.INCONCLUSIVE)
+        restarted = verdicts["G4 G8 G9 p-35b-churn-18g-cand-A1"]
+        self.assertEqual(restarted["verdict"], stats.FAIL)
+        self.assertIn(
+            "G8: the engine restarted (transport.restarts 0 -> 1)",
+            restarted["numbers"]["failures"],
+        )
+        self.assertEqual(
+            verdicts["G4 G8 G9 p-35b-churn-18g-cand-B1"]["verdict"], stats.PASS
+        )
+        self.assertEqual(
+            (
+                verdicts["G1 cand vs r150"]["verdict"],
+                verdicts["G1 cand vs r150"]["numbers"]["ratio"],
+            ),
+            (stats.INCONCLUSIVE, "n/a"),
+        )
+        self.assertEqual(verdicts["G2 cand vs r150"]["verdict"], stats.FAIL)
+        self.assertEqual(
+            {verdicts[f"SSD {c}"]["numbers"] for c in matrix.ssd_counters_of(cell)},
+            {"no sigma"},
+        )
+
     def test_a_job_without_history_is_late_at_twice_the_minutes_it_states(self):
         # M5 19-122b-yarn states 75 minutes and no yarn job finished before:
         # at 50 minutes it is not late (20 minutes per churn run would say
@@ -2786,6 +3019,26 @@ class GateTests(unittest.TestCase):
             [(u["label"], u["reasons"]) for u in document["invalid"]],
             [(label, ["void: HIDIdleTime 30 s < the make's 1200 s"])],
         )
+
+    def test_a_single_comparison_ended_by_an_error_fails_g7(self):
+        # s-single 27b-q4: the cand engine crashed in a candidate round, and
+        # backend_regression.py wrote its error and no rounds. The comparison
+        # is judged on that error, not passed over as another build's.
+        cell = next(c for c in self.spec["cells"] if c["name"] == "s-single")
+        spec = {**self.with_cand_build(self.spec, "src-new"), "cells": [cell]}
+        label = "s-single-cand-27b-q4-1"
+        error = "round-2-candidate: benchmark exited -11 without JSON"
+        (self.directory / f"{label}.backend-regression.json").write_text(
+            json.dumps({"pass": False, "error": error})
+        )
+        document = matrix.analyze(spec, [self.directory])
+        self.assertEqual(
+            {v["rule"]: (v["verdict"], v["numbers"]) for v in document["verdicts"]}[
+                f"G7 {label}"
+            ],
+            (stats.FAIL, [error]),
+        )
+        self.assertEqual(document["invalid"], [])
 
     def test_a_trade_carries_the_numbers_of_its_gains(self):
         # cand trails r150 by 3 % in work with a clearly better TTFT; the

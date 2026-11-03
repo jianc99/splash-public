@@ -403,12 +403,15 @@ runs per tree and order, recorded reference runs, gates).
   test (`--build NAME=BUILD_ID`, cand's at least, as its
   `build/engine/build-identity.json` names it): a run whose `run.py` build id
   is another, a single cell's comparison whose candidate rounds ran another,
-  or a second copy of a label in another results directory is not used. It
-  reads every run of a cell, planned or a rerun (a rerun takes the next
-  repeat number); an ABBA set whose cand runs are all of another build is
-  passed over. It writes `verdict.json` and `verdict.md`: PASS, FAIL or
-  INCONCLUSIVE with the numbers (a candidate none of whose runs is usable
-  gets its gates INCONCLUSIVE, naming its runs), the trades for the owner,
+  or a second copy of a label in another results directory is not used (a
+  comparison that ended in an error before it wrote its rounds names no
+  build and is judged on that error). It reads every run of a cell, planned
+  or a rerun (a rerun takes the next repeat number); an ABBA set whose cand
+  runs are all of another build is passed over. It writes `verdict.json`
+  and `verdict.md`: PASS, FAIL or INCONCLUSIVE with the numbers (a candidate
+  none of whose runs is usable gets its gates INCONCLUSIVE, naming its runs,
+  and a churn cell without a complete run of its prices its work gates),
+  the trades for the owner,
   every run it did not use and why, a run a cell plans that left no record
   as not run, and per fixed-order set of each churn cell the per-run numbers
   of `bin/cmp.py` and `pertag.py`.
@@ -428,12 +431,14 @@ only if the experts were at their cap at Ready and macOS's memory pressure
 level was normal before `run.py` started the server, where it recorded one
 (the engine's `memory_pressure` is its band state, and right after the load
 macOS's own level can read warning for tens of seconds). A churn run of a
-tree under test counts only if its SSD cache is comparable with that of every
-run of the trees its cell's gates compare it with: `--max-cache-disk auto` sets
+tree under test is compared only if its SSD cache is comparable with that of
+every usable run of the trees its cell's gates compare it with (the floor =
+cap control's with cand's): `--max-cache-disk auto` sets
 the limit from the volume's free space that day, so some limit must hold
 each run within the gates' 2 % of what it held, from 98 % of the most it held
 within its limit up to, where it came within 2 % of its limit, that limit
-over 0.98 (the reason gives both runs' caches and this run's free space). G8 is
+over 0.98 (the reason gives both runs' caches and this run's free space); one
+that is not is still judged on its G4, G8 and G9. G8 is
 judged on every candidate run of every scenario: a run whose server
 restarted, failed a request, had a Metal failure, or exited, was not ready in
 time or, once ready, did not let its scenario end (a request or `/status` it

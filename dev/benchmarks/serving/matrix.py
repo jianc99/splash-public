@@ -173,7 +173,8 @@ class Run:
     and those the client ended at their deadline, its end, /status samples
     and events (a ttft run's over its levels) and meta, and the reasons it
     may not be used: `invalid` all of them, `voided` those not the server's
-    own failure. A churn run's work is read at `window` seconds."""
+    own failure, nor an SSD cache not comparable with its references'. A
+    churn run's work is read at `window` seconds."""
 
     def __init__(
         self,
@@ -602,15 +603,19 @@ def compared_trees(cell: dict, tree: str) -> set[str]:
 
 
 def compare_ssd_caches(cell: dict, runs: list[Run], tolerance: float) -> None:
-    """Voids each usable run of a tree under test whose SSD cache is not
-    comparable with that of a usable run of a tree its cell's gates compare
-    it with: no limit lies in both runs' ranges (ssd_cache). Under
-    --max-cache-disk auto the limit is a quarter of the volume's free space
-    beyond a floor (docs/server.md), so it moves with whatever else the disk
-    holds that day; it shapes a run only where the run fills it, and the
-    gates would credit the code with a cache held back in one run and not
-    in the other, or held back at different limits. The tolerance is the
-    gates' own: a cache that holds within it is within their resolution."""
+    """Leaves out of the comparisons (run.invalid) each usable run of a tree
+    under test whose SSD cache is not comparable with that of a usable run
+    of a tree its cell's gates compare it with: no limit lies in both runs'
+    ranges (ssd_cache). Under --max-cache-disk auto the limit is a quarter
+    of the volume's free space beyond a floor (docs/server.md), so it moves
+    with whatever else the disk holds that day; it shapes a run only where
+    the run fills it, and the gates would credit the code with a cache held
+    back in one run and not in the other, or held back at different limits.
+    The tolerance is the gates' own: a cache that holds within it is within
+    their resolution. Such a run is not voided: its G4, G8 and G9 do not
+    depend on the disk, and it is judged on them. A tree compared with a
+    tree under test (the floor = cap control with cand) is checked after
+    it, against its runs still usable."""
 
     def gib(size):
         return f"{size / 2**30:.2f} GiB"
@@ -623,9 +628,12 @@ def compare_ssd_caches(cell: dict, runs: list[Run], tolerance: float) -> None:
         )
 
     used = [run for run in runs if not run.invalid]
-    for run in used:
+    under_test = {run.tree for run in used if compared_trees(cell, run.tree)}
+    for run in sorted(
+        used, key=lambda r: bool(compared_trees(cell, r.tree) & under_test)
+    ):
         trees = compared_trees(cell, run.tree)
-        for other in (r for r in used if r.tree in trees):
+        for other in (r for r in used if r.tree in trees and not r.invalid):
             mine, theirs = ssd_cache(run, tolerance), ssd_cache(other, tolerance)
             if mine is None or theirs is None:
                 continue
@@ -638,7 +646,6 @@ def compare_ssd_caches(cell: dict, runs: list[Run], tolerance: float) -> None:
                     f"{other.label} {held(theirs)}"
                 )
                 run.invalid.append(reason)
-                run.voided.append(reason)
                 break
 
 
@@ -1363,8 +1370,9 @@ def churn_cell(
         )
 
     # G4, G8 and G9 are judged on every candidate run (amend/V.md §5) but
-    # the voided: one the server's own failures made unusable fails G8; one
-    # run.py refused to measure or its surroundings voided (heat, other
+    # the voided, also on one the server's own failures made unusable (it
+    # fails G8) or whose SSD cache is not comparable with its references';
+    # one run.py refused to measure or its surroundings voided (heat, other
     # processes, the laptop's owner) is listed under the runs not used, to be
     # repeated, and judged on G8 alone, which fails on the server's own
     # failures it also shows. G4 holds for a tree when none of its runs
@@ -2037,8 +2045,8 @@ def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
     a rerun began (a rerun takes the next repeat numbers) are judged; one
     whose cand runs are all of another build than the build under test is
     passed over, its runs listed, and one with a run that is not valid or
-    not of its tree's build is not judged; the runs not used are returned
-    with why."""
+    not of its tree's build is not judged (a second copy of a run it uses
+    is only listed); the runs not used are returned with why."""
     planned = cell["abba"].get("sets", 1)
     begun = [((meta.get("repeat") or 0) + 1) // 2 for meta in cell_metas(results, cell)]
     runs = abba_runs(cell, max([planned, *begun]))
@@ -2068,22 +2076,24 @@ def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
             continue
         if not found and not copies and index // 4 >= planned:
             continue
-        invalid = list(copies)
+        # A copy of a run that is used leaves its set whole; one of a label
+        # none of whose copies is used leaves it without that run.
+        unused += copies
+        left_out = [entry["label"] for entry in copies if entry["label"] not in kept]
         for run in found:
             validate(run, spec, cell)
             verdicts += g8_verdict(cell, spec, run)
             if run.invalid:
-                invalid.append(unused_entry(cell, run.label, run.tree, run.invalid))
-        unused += invalid
-        if len(found) < 4 or invalid:
+                unused.append(unused_entry(cell, run.label, run.tree, run.invalid))
+                left_out.append(run.label)
+        if len(found) < 4 or left_out:
             verdicts.append(
                 {
                     "cell": cell["name"],
                     "rule": f"G7 set {index // 4 + 1}",
                     "verdict": INCONCLUSIVE,
-                    "numbers": "runs not used: "
-                    + ", ".join(entry["label"] for entry in invalid)
-                    if invalid
+                    "numbers": "runs not used: " + ", ".join(dict.fromkeys(left_out))
+                    if left_out
                     else "not run",
                 }
             )
@@ -2153,7 +2163,9 @@ def single_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list
     LABEL.backend-regression.json: every repeat of each model's (a rerun
     takes the next repeat number) whose candidate rounds ran the cand build
     under test, and whose baseline rounds the baseline's where analyze is
-    given it. The others are returned with why."""
+    given it, and every one that ended in an error before it wrote its
+    rounds (backend_regression.py writes them once all four ran), judged on
+    that error. The others are returned with why."""
     verdicts, unused = [], []
     for model in cell["models"]:
         tree = f"cand-{model}"
@@ -2175,10 +2187,13 @@ def single_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list
                 if not path.exists():
                     continue
                 document = json.loads(path.read_text())
-                reason = other_build(
-                    spec, tree, round_build(document, "candidate")
-                ) or other_build(
-                    spec, cell["baseline"], round_build(document, "baseline")
+                reason = (
+                    other_build(spec, tree, round_build(document, "candidate"))
+                    or other_build(
+                        spec, cell["baseline"], round_build(document, "baseline")
+                    )
+                    if document.get("rounds")
+                    else None
                 )
                 # The job's own validity verdict on its surroundings (no
                 # run.py here: final160 lib.sh single() writes LABEL.void
@@ -2333,7 +2348,9 @@ def analyze(spec: dict, results: list[Path]) -> dict:
                         "numbers": None,
                     }
                 )
-            elif prices is None:
+                continue
+            if prices is None:
+                # Its work gates are INCONCLUSIVE; the rest are judged.
                 verdicts.append(
                     {
                         "cell": cell["name"],
@@ -2342,8 +2359,7 @@ def analyze(spec: dict, results: list[Path]) -> dict:
                         "numbers": f"no complete {cell.get('prices_from')} or rerun of it",
                     }
                 )
-            else:
-                verdicts.extend(churn_cell(cell, spec, cell_runs, gains, prices))
+            verdicts.extend(churn_cell(cell, spec, cell_runs, gains, prices))
         elif cell.get("abba"):
             found, unused = abba_cell(cell, spec, results)
             verdicts.extend(found)
@@ -2478,9 +2494,9 @@ def free_bytes(directory: Path) -> int:
 def disk(spec: dict, results: list[Path], name: str, tree: str) -> int:
     """matrix.py disk: whether the volume's free space now lies in the
     window ssd_window gives a run of `tree` in cell `name` against the valid
-    runs in the results, printed with it; 1 outside it (the run would be
-    voided at analyze, compare_ssd_caches), else 0: also for a cell outside
-    the spec (the 122B check's), which analyze never reads."""
+    runs in the results, printed with it; 1 outside it (analyze would leave
+    the run out of the comparisons, compare_ssd_caches), else 0: also for a
+    cell outside the spec (the 122B check's), which analyze never reads."""
     cell = next((c for c in spec["cells"] if c["name"] == name), None)
     if cell is None:
         print(f"disk {name}: not a cell of {spec['path']}: no run of it is compared")
