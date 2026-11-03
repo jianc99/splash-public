@@ -579,8 +579,10 @@ Returning Cache::returningOf(const Request *active) const noexcept {
   for (const Write &write : writes_) {
     if (!own(write.block))
       continue;
+    // A demotion lands a page only where its page frees as it lands; every
+    // one counts as a transfer in flight.
     if (write.write == WriteClass::Reclaim)
-      ++result.landingPages[static_cast<size_t>(pool_.form(kv_.page(write.block)))];
+      result.landingPages[static_cast<size_t>(pool_.form(kv_.page(write.block)))] += freesOnLanding(write);
     else if (spill_ && spillsOnLanding(write))
       ++spilling;
     else

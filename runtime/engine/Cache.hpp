@@ -740,7 +740,8 @@ public:
                                                    const engine::Victim *after) const override;
   FreeResult take(const VictimQuery &query, const engine::Victim &victim) override;
   // What the transfers in flight and the copies Spill requests owe free as
-  // they land. Landing: demotions, by the form of their pages, and the pages
+  // they land. Landing: demotions whose pages free as they land
+  // (freesOnLanding), by the form of their pages, and the pages
   // Spill requests hold, written through or copied ahead, that spill once
   // their copies land, as far as free Index pages take them. Owed: the
   // copies Spill requests owe of the pages that spill once copied, while the

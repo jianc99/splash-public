@@ -5824,6 +5824,53 @@ void testRestoresReturnNothing() {
   fixture.cache.endRequest(2);
 }
 
+// A demotion returns its page as it lands only from a leaf
+// (Cache::freesOnLanding): once a request matched the leaf meanwhile and
+// wrote a block below it, the page lands nowhere, though the write is still
+// a transfer in flight, and a claim that can wait and lacks that page finds
+// nothing to wait for (MemoryLedger::free). Once the block below has left,
+// the page lands again.
+void testHeldDemotionReturnsNoPage() {
+  test::TestKvTier tier;
+  CacheFixture fixture(&tier);
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
+  require(reclaimStateBytes(fixture.cache, CacheReclaimMode::KeepExtents) == 100 && fixture.cache.pollTransfers() &&
+              fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+              tier.demotions == 1,
+          "the leaf's demotion did not start");
+  constexpr auto full = static_cast<size_t>(kv::PageForm::Full);
+  constexpr uint32_t extended = 5 * KvCache::pageTokens;
+  const Need page{.pages = 1};
+  std::vector<uint32_t> longer = fixture.prompt;
+  longer.pop_back();
+  for (uint32_t row = 0; row <= KvCache::pageTokens; ++row)
+    longer.push_back(5000 + row);
+  fixture.storage.budgetPages = 5;
+  auto lookup = fixture.lookup(129);
+  fixture.cache.beginRequest(2);
+  require(admitRestore(fixture.cache, 2, lookup).granted() && admitTokens(fixture.cache, 2, extended).granted(),
+          "the request did not extend the chain being demoted");
+  lookup = {};
+  fixture.cache.publishCommittedBlocks(2, longer, extended, {});
+  const Returning held = fixture.cache.returning();
+  require(fixture.cache.blockAt(2, extended) && held.transfers == 1 && !held.landingPages[full] &&
+              !held.landingBytes,
+          "a demotion whose block keeps a resident child returned its page");
+  require(test::freeFromCache(fixture.cache, {}, page).outcome == FreeOutcome::Short,
+          "a claim that can wait waited for the page of a demotion a resident child holds");
+  fixture.cache.endRequest(2);
+  require(fixture.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress &&
+              fixture.pool.freePageCount() == 1,
+          "the block below the leaf did not go");
+  require(fixture.cache.returning().landingPages[full] == 1 &&
+              test::freeFromCache(fixture.cache, {}, page).outcome == FreeOutcome::Pending,
+          "a demotion whose block is a leaf again did not return its page");
+  tier.complete();
+  require(fixture.cache.pollTransfers() && fixture.pool.freePageCount() == 2, "the demotion did not free its page");
+}
+
 // What spilling returns: landing, the pages written through that spill once
 // their copies land, as far as free Index pages take them, and none of a
 // dense history's; owed, the copies not started yet of the pages that spill
@@ -6655,6 +6702,7 @@ int main() {
     testFullShortfallsAtTheWallTakeDeadLeavesFirst();
     testHeldPagesStayFree();
     testRestoresReturnNothing();
+    testHeldDemotionReturnsNoPage();
     testReturningSplitsLandingAndOwed();
     testPeekHasNoSideEffects();
     testVictimCostsFollowCopiesAndReuse();
