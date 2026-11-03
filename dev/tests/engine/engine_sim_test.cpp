@@ -2,6 +2,13 @@
 // its native loop on the fakes, at the fitted profiles of the Macs the matrix
 // runs on and the memory their recorded /status shows, each asserting the
 // rules the design makes the parts keep together. CPU only; seconds each.
+// Every input is fixed: the profiles carry no noise, the churns arrive in
+// fixed orders and each prompt is built from its id, so a run repeats
+// itself exactly and one run stands for any number of seeds (DESIGN §8.2's
+// 20 a scenario). The checks that compare two runs (SIM-value's,
+// SIM-35b-churn's, SIM-low-host's, SIM-turns-dense's) compare them on one
+// clock: noise in the commands' times would need a tolerance per check,
+// which no recorded scatter of repeated commands gives.
 //
 // The machines' numbers are the recorded churn runs' first status samples
 // (notes/churn: sL for the Studio at --max-memory 18G, fn15b for the 24 GB
@@ -382,16 +389,40 @@ struct Serving final {
     }
     fixture.output.clear();
   }
-  // Ticks until done(), observing each step.
-  void run(const std::function<bool()> &done, const std::function<void()> &observe, std::string_view what) {
+  // Requests are in flight, yet no command has run for a resource wait (the
+  // longest a claim waits before its request fails) since `since` or the
+  // last command's end, and no claim waits that the engine would still fail
+  // in time: the loop has stalled.
+  [[nodiscard]] bool stalled(double since) const {
+    if (!commands.empty())
+      since = std::max(since, commands.back().startMilliseconds + commands.back().wallMilliseconds);
+    if (fixture.loop.commandInFlight() || fixture.monotonic - since <= engine::kResourceWaitTimeoutMilliseconds ||
+        std::ranges::none_of(submittedAt, [&](const auto &request) { return active(request.first); }))
+      return false;
+    const engine::MemoryClaimsSnapshot claims = memory().claims;
+    return !claims.waiting || claims.oldestMilliseconds > engine::kResourceWaitTimeoutMilliseconds;
+  }
+  // Ticks until done(), observing each step, until the clock passes `until`
+  // or the loop stalls; whether done.
+  [[nodiscard]] bool runUntil(const std::function<bool()> &done, const std::function<void()> &observe,
+                              std::optional<double> until = std::nullopt) {
+    const double since = fixture.monotonic;
     fixture.run(
         [&] {
           drain();
           if (observe)
             observe();
-          return done();
+          return done() || (until && fixture.monotonic >= *until) || stalled(since);
         },
-        what, 100'000'000);
+        "the loop did not move", std::numeric_limits<uint32_t>::max());
+    return done();
+  }
+  // Ticks until done(), failing with `what` once the clock passes `until` or
+  // the loop stalls.
+  void run(const std::function<bool()> &done, const std::function<void()> &observe, std::string_view what,
+           std::optional<double> until = std::nullopt) {
+    require(runUntil(done, observe, until),
+            at(machine) + std::string(what) + " at " + std::to_string(fixture.monotonic / 1000.0) + " s" + holders());
   }
   // What FakeMemory holds by holder, and the requests' phases, for a
   // failure's message.
@@ -474,7 +505,7 @@ struct Churn final {
                 return true;
             return !inFlight[0] && !inFlight[1] && !inFlight[2] && serving.now() >= nextArrival;
           },
-          observe, "the churn did not move");
+          observe, "the churn did not move", endMilliseconds);
       require(serving.errors.empty(), at(serving.machine) + "a churn request failed: " +
                                           (serving.errors.empty() ? std::string() : serving.errors.front()) +
                                           serving.holders());
@@ -847,7 +878,7 @@ void testChurnOrderKeepsLeadersAndSpillLanes() {
 bool idleUntil(Serving &serving, double milliseconds, const std::function<bool()> &done,
                const std::function<void()> &observe = {}) {
   const double end = serving.now() + milliseconds;
-  serving.run([&] { return done() || serving.now() >= end; }, observe, "the idle loop did not move");
+  serving.run([&] { return done() || serving.now() >= end; }, observe, "the idle loop did not move", end);
   return done();
 }
 
@@ -1004,76 +1035,100 @@ void testShortStartRegrowsWhenTheHostFrees() {
 
 // --- SIM-value ------------------------------------------------------------------------------------------------
 
-// What memory took first when both decoders' growth found no room: a lane's
-// conversion to Spill or a store chunk; and when both decoders ended.
+// What memory gave the decoders first once both decode: Spill (a lane's
+// conversion, or Spill from its start where the plan places it so) or a
+// store chunk; and when both decoders ended.
 struct ValueRun final {
-  enum class Action { None, Conversion, StoreUnit } action = Action::None;
+  enum class Action { None, Spill, StoreUnit } action = Action::None;
   double endMilliseconds = 0.0;
   // A decoder failed: its run did the least work.
   std::optional<std::string> failure;
 };
 
+// SIM-value's Mac: no other application holds its memory, so the governor's
+// limit, not the host, leaves the decoders no room (the host's rules are
+// SIM-churn's, SIM-warning-M6's and SIM-low-host's questions). With the 18G
+// runs' other applications, the 36 GB Studio's host leaves 0.58 GB beside
+// its spare reserve with the store at its cap, less than two 45K prompts'
+// KV (1.19 GB), and the M6's 2.24 GB less than two 128K prompts' (3.47 GB):
+// the host would bind first.
+Machine valueMachine(const Machine &machine) {
+  Machine result = machine;
+  result.otherBytes = 0;
+  return result;
+}
+
 // Two prompts of `context` tokens, the first decoding while the second
-// prefills: the moment both decode, what the engine holds then (with the
-// reserves, the limit that leaves their growth no room) and the tokens the
-// first has generated by then. Commands ask memory every 128 tokens (extents
-// of 4 pages).
+// prefills, with room: the first time the KV storage takes another extent
+// while both decode, what the engine held just before (with the reserves,
+// the limit that leaves that extent no room) and the tokens each had
+// generated.
 struct ValueSetup final {
   uint64_t limitBytes = 0;
-  uint32_t generated = 0;
+  std::array<uint32_t, 2> generated{};
 };
 ValueSetup valueSetup(const Machine &machine, uint32_t context) {
-  Machine roomy = machine;
-  roomy.extentPages = 4;
+  const Machine roomy = valueMachine(machine);
   Serving serving(roomy, {}, std::nullopt, machine.hostBytes);
   serving.submit(1, prompt(1, context), 100'000);
   serving.submit(2, prompt(2, context), 100'000);
-  ValueSetup setup;
+  ValueSetup setup, before;
+  uint64_t kv = 0;
+  bool decoding = false;
   serving.run([&] { return setup.limitBytes != 0; },
               [&] {
-                if (!serving.ttft(2))
+                if (decoding && serving.fixture.storage.allocatedBytes() > kv) {
+                  setup = before;
                   return;
-                const engine::EngineSnapshot counts = serving.fixture.loop.statusSnapshot();
-                setup.limitBytes = serving.fixture.memory->total() + machine.untrackedBytes;
-                setup.generated = counts.activeRequests.front().generatedTokens;
+                }
+                decoding = serving.ttft(2).has_value();
+                kv = serving.fixture.storage.allocatedBytes();
+                before.limitBytes = serving.fixture.memory->total() + machine.untrackedBytes;
+                for (const engine::ActiveRequestSnapshot &request :
+                     serving.fixture.loop.statusSnapshot().activeRequests)
+                  before.generated.at(request.id - 1) = request.generatedTokens;
               },
-              "the two prompts did not both decode");
+              "the two prompts did not both decode and grow");
   require(serving.errors.empty(), at(machine) + "a sizing request failed: " +
                                       (serving.errors.empty() ? std::string() : serving.errors.front()));
   return setup;
 }
 
-// The two decoders with `output` tokens left each once both decode, on
-// `machine` with Spill's decode costing `spillMilliseconds` a token, the
-// store at its cap and no free room: free, the store pinned at its cap, or
-// Spill unavailable.
+// The two decoders with `output` tokens left each once their growth finds
+// no room, on `machine` with Spill's decode costing `spillMilliseconds` a
+// token, the store at its cap: free, the store pinned at its cap, or Spill
+// unavailable.
 enum class Counterfactual { Free, StorePinned, NoSpill };
 ValueRun runValue(const Machine &base, double spillMilliseconds, uint32_t context, uint32_t output,
                   Counterfactual which, const ValueSetup &setup) {
   test::TimingProfile profile = *base.profile;
   profile.spillDecodeMilliseconds = spillMilliseconds * kTokensPerCommand;
-  Machine machine = base;
+  Machine machine = valueMachine(base);
   machine.profile = &profile;
-  machine.extentPages = 4;
   if (which == Counterfactual::StorePinned)
     machine.store.floor = machine.store.cap;
   if (which == Counterfactual::NoSpill)
     machine.spill.reset();
   Serving serving(machine, {}, std::nullopt, setup.limitBytes);
-  serving.submit(1, prompt(1, context), setup.generated + output);
-  serving.submit(2, prompt(2, context), output);
+  serving.submit(1, prompt(1, context), setup.generated[0] + output);
+  serving.submit(2, prompt(2, context), setup.generated[1] + output);
   ValueRun result;
-  serving.run([&] { return !serving.active(1) && !serving.active(2); },
-              [&] {
-                if (result.action != ValueRun::Action::None || !serving.ttft(2))
-                  return;
-                if (serving.experts->shrinks)
-                  result.action = ValueRun::Action::StoreUnit;
-                else if (serving.fixture.loop.statusSnapshot().spill.converted)
-                  result.action = ValueRun::Action::Conversion;
-              },
-              "the decoders did not end");
-  if (!serving.errors.empty())
+  const bool ended = serving.runUntil([&] { return !serving.active(1) && !serving.active(2); },
+                                      [&] {
+                                        if (result.action != ValueRun::Action::None || !serving.ttft(2))
+                                          return;
+                                        const engine::EngineSnapshot counts = serving.fixture.loop.statusSnapshot();
+                                        if (serving.experts->shrinks)
+                                          result.action = ValueRun::Action::StoreUnit;
+                                        else if (counts.spill.converted ||
+                                                 std::ranges::any_of(counts.activeRequests, [](const auto &request) {
+                                                   return request.kvMode == engine::KvMode::Spill;
+                                                 }))
+                                          result.action = ValueRun::Action::Spill;
+                                      });
+  if (!ended)
+    result.failure = "the decoders stalled at " + std::to_string(serving.now() / 1000.0) + " s" + serving.holders();
+  else if (!serving.errors.empty())
     result.failure = serving.errors.front();
   result.endMilliseconds = result.failure ? std::numeric_limits<double>::infinity() : serving.now();
   return result;
@@ -1082,23 +1137,26 @@ ValueRun runValue(const Machine &base, double spillMilliseconds, uint32_t contex
 // SIM-value (amend/V.md §3.4; owner 20:45 OQ1: the value outcome): on the
 // M6 and the 36 GB Studio, Spill's decode costing the D3 median and worst
 // (M6 1.0 and 2.7 ms a token, Studio 1.7 and 3.8), the decoders with 300 or
-// 1500 tokens left over 8K or 45K of context, and 128K, where amend/V.md
-// §3.3 puts the M6's choice: what the free run takes first
-// (a conversion or a store chunk) is what the counterfactual that does
-// better takes (the store pinned, so the lane converts; Spill unavailable,
-// so the store gives a chunk), unless the two end within one decode token's
-// work of each other (amend/V.md §3.4): a token of the two decoders'
-// command, Resident, at the store's cap. On the 36 GB Studio this follows
-// AMENDMENTS OQ1's answer: the value outcome, no spill-capability order.
+// 1500 tokens left over 8K or 45K of context (§3.4's grid), and on the M6
+// over 128K, where amend/V.md §3.3 puts its choice (there the plan starts
+// both prompts Spill): what the free run gives first (Spill or a store
+// chunk) is what the counterfactual that does better gives (the store
+// pinned, so Spill; Spill unavailable, so a store chunk), unless the two end
+// within one decode token's work of each other (amend/V.md §3.4): a token of
+// the two decoders' command, Resident, at the store's cap. On the 36 GB
+// Studio this follows AMENDMENTS OQ1's answer: the value outcome, no
+// spill-capability order.
 void testValueChoiceFollowsTheCalibratedCost() {
   struct Point final {
     const Machine *machine;
     std::array<double, 2> spill;
+    std::vector<uint32_t> contexts;
   };
   Checks checks;
-  for (const Point &point : {Point{&kM6, {1.0, 2.7}}, Point{&kStudio36, {1.7, 3.8}}}) {
+  for (const Point &point :
+       {Point{&kM6, {1.0, 2.7}, {8192, 45'056, 131'072}}, Point{&kStudio36, {1.7, 3.8}, {8192, 45'056}}}) {
     const Machine &machine = *point.machine;
-    for (const uint32_t context : {8192u, 45'056u, 131'072u}) {
+    for (const uint32_t context : point.contexts) {
       const ValueSetup setup = valueSetup(machine, context);
       for (const double spill : point.spill)
         for (const uint32_t output : {304u, 1504u}) {
@@ -1115,21 +1173,22 @@ void testValueChoiceFollowsTheCalibratedCost() {
           const double token =
               decodeCommand(*machine.profile, 2, double(machine.store.cap) / machine.store.whole, 0) /
               kTokensPerCommand;
-          note(where + (free.action == ValueRun::Action::Conversion ? "converted" : "gave a store chunk") +
-               "; ends free " + std::to_string(free.endMilliseconds / 1000.0) + " s, converted " +
-               std::to_string(pinned.endMilliseconds / 1000.0) + " s, store chunk " +
-               std::to_string(noSpill.endMilliseconds / 1000.0) + " s");
-          if (std::abs(pinned.endMilliseconds - noSpill.endMilliseconds) <= token)
+          // A counterfactual whose decoder failed or that did not end did
+          // the least work.
+          const auto end = [](const ValueRun &run) {
+            return run.failure ? "never (" + *run.failure + ")" : std::to_string(run.endMilliseconds / 1000.0) + " s";
+          };
+          const auto gave = [](ValueRun::Action action) {
+            return action == ValueRun::Action::Spill ? "Spill" : "a store chunk";
+          };
+          const std::string ends = "Spill " + end(pinned) + ", a store chunk " + end(noSpill);
+          note(where + "gave " + gave(free.action) + "; ends " + end(free) + "; " + ends);
+          if ((pinned.failure && noSpill.failure) || std::abs(pinned.endMilliseconds - noSpill.endMilliseconds) <= token)
             continue;
-          const ValueRun::Action better = pinned.endMilliseconds < noSpill.endMilliseconds
-                                              ? ValueRun::Action::Conversion
-                                              : ValueRun::Action::StoreUnit;
+          const ValueRun::Action better =
+              pinned.endMilliseconds < noSpill.endMilliseconds ? ValueRun::Action::Spill : ValueRun::Action::StoreUnit;
           checks.expect(free.action == better,
-                        where + "memory took " +
-                            (free.action == ValueRun::Action::Conversion ? "a conversion" : "a store chunk") +
-                            " where the other ends first (converted " +
-                            std::to_string(pinned.endMilliseconds / 1000.0) + " s, store chunk " +
-                            std::to_string(noSpill.endMilliseconds / 1000.0) + " s)");
+                        where + "memory gave " + gave(free.action) + " where the other ends first (" + ends + ")");
         }
     }
   }
