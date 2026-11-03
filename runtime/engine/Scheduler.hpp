@@ -191,9 +191,11 @@ public:
   void remove(uint64_t requestId);
 
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
-  // The candidates the next command would serve: admission starts only
-  // those, planning again without the ones a plan leaves out until it keeps
-  // all it plans, with the candidates' shapes in `in`.
+  // The candidates the next command would serve and leave waiting for no
+  // other prompt: running them to their prompt's end, leading them now or
+  // next, or as they are overdue. Admission starts only those, planning again
+  // without the others until it serves all it plans, with the candidates'
+  // shapes in `in`.
   [[nodiscard]] std::vector<uint64_t>
   prefillAdmissionOrder(std::span<const PrefillAdmission> candidates, const PlanInputs &in) const;
   // The highest priority among requests that prefill or decode. A waiting
@@ -311,6 +313,9 @@ private:
   [[nodiscard]] static bool byPriorityThenOrder(const Request *a,
                                                 const Request *b) noexcept;
   [[nodiscard]] static bool samePlan(const BatchPlan &a, const BatchPlan &b) noexcept;
+  // Whether prefill takes lane `a` before lane `b`: the order planning leads
+  // by and joins in.
+  [[nodiscard]] static bool leadsBefore(const Lane &a, const Lane &b) noexcept;
 
   [[nodiscard]] LaneShape shapeOf(uint64_t requestId, const PlanInputs &in) const;
   [[nodiscard]] Lane lane(const Request &request, uint32_t processed, const PlanInputs &in) const;

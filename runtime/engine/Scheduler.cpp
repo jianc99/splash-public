@@ -238,19 +238,35 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
     if (request.phase == Phase::Prefill)
       lanes.push_back(lane(request, request.promptProcessed, in));
   }
-  // Admission starts only lanes the next command serves: it plans again
-  // without the candidates a plan leaves out until it keeps all it plans, as
-  // without them the plan can take another leader.
+  // Admission starts only lanes the next command serves and leaves waiting
+  // for no other prompt: one whose prompt its rows end, one it leads or that
+  // leads next, every lane ordered before it ending its prompt there, or an
+  // overdue one (amend/S.md A103). A start holds its memory from its first
+  // command to its last, so a prompt that would join with the rows that
+  // spare it a command and then wait out another's stays queued until it
+  // leads. Admission plans again without the candidates a plan does not
+  // serve until it serves all it plans, as without them the plan can take
+  // another leader.
   std::optional<Planned> planned;
   size_t count = 0;
   do {
     count = pending.size();
     std::vector<Lane> ready = lanes;
     ready.insert(ready.end(), pending.begin(), pending.end());
-    planned = planPrefill(std::move(ready));
+    planned = planPrefill(ready);
     if (!planned)
       return result;
-    std::erase_if(pending, [&](const Lane &view) { return !holds(planned->plan.items, view.request->spec.id); });
+    const std::vector<BatchItem> &items = planned->plan.items;
+    const auto ends = [&](const Lane &view) {
+      const auto item = std::ranges::find(items, view.request->spec.id, &BatchItem::requestId);
+      return item != items.end() && item->tokenCount == view.remaining();
+    };
+    std::erase_if(pending, [&](const Lane &view) {
+      return !holds(items, view.request->spec.id) ||
+             (!view.overdue && !ends(view) && std::ranges::any_of(ready, [&](const Lane &other) {
+                return other.request != view.request && leadsBefore(other, view) && !ends(other);
+              }));
+    });
   } while (pending.size() != count);
   // Admission ranks candidates against every decoder, left out of a plan or
   // not.
@@ -540,20 +556,7 @@ std::vector<Scheduler::Lane> Scheduler::readyLanes(const PlanInputs &in) const {
 std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready) const {
   if (ready.empty())
     return std::nullopt;
-  // Priority first; then overdue lanes, oldest first; then the least expected
-  // remaining cost, of equal cost (as before any price) the fewest remaining
-  // rows, then submission order.
-  std::sort(ready.begin(), ready.end(), [](const Lane &a, const Lane &b) {
-    if (a.request->spec.priority != b.request->spec.priority)
-      return a.request->spec.priority < b.request->spec.priority;
-    if (a.overdue != b.overdue)
-      return a.overdue;
-    if (!a.overdue && a.remainingMilliseconds != b.remainingMilliseconds)
-      return a.remainingMilliseconds < b.remainingMilliseconds;
-    if (!a.overdue && a.remaining() != b.remaining())
-      return a.remaining() < b.remaining();
-    return a.request->order < b.request->order;
-  });
+  std::sort(ready.begin(), ready.end(), leadsBefore);
   const Lane &leader = ready.front();
   const RequestPriority tier = leader.request->spec.priority;
   const bool contend = contended(tier);
@@ -953,6 +956,21 @@ bool Scheduler::byPriorityThenOrder(const Request *a,
   if (a->spec.priority != b->spec.priority)
     return a->spec.priority < b->spec.priority;
   return a->order < b->order;
+}
+
+bool Scheduler::leadsBefore(const Lane &a, const Lane &b) noexcept {
+  // Priority first; then overdue lanes, oldest first; then the least expected
+  // remaining cost, of equal cost (as before any price) the fewest remaining
+  // rows, then submission order.
+  if (a.request->spec.priority != b.request->spec.priority)
+    return a.request->spec.priority < b.request->spec.priority;
+  if (a.overdue != b.overdue)
+    return a.overdue;
+  if (!a.overdue && a.remainingMilliseconds != b.remainingMilliseconds)
+    return a.remainingMilliseconds < b.remainingMilliseconds;
+  if (!a.overdue && a.remaining() != b.remaining())
+    return a.remaining() < b.remaining();
+  return a.request->order < b.request->order;
 }
 
 bool Scheduler::samePlan(const BatchPlan &a, const BatchPlan &b) noexcept {
