@@ -760,10 +760,13 @@ public:
   // compaction returns. A restore frees nothing, nor does the state write,
   // whose RAM copy left as it started, nor a copy ahead of a page that stays.
   [[nodiscard]] Returning returning() const noexcept;
-  // What returning() counts of the request's own pages: those of its page
-  // table, written through or copied ahead, that spill once their copies
-  // land, as far as free Index pages take them, and the copies it owes.
-  [[nodiscard]] Returning returningFor(uint64_t requestId) const noexcept;
+  // What returning() counts of the requests' own pages: those of their page
+  // tables, written through or copied ahead, that spill once their copies
+  // land, as far as free Index pages take them, and the copies they owe,
+  // each block once; their owed bytes are the extents the owed pages
+  // complete beside every landing, which returning()'s landing bytes count
+  // (amend/M.md B5).
+  [[nodiscard]] Returning returningFor(std::span<const uint64_t> requestIds) const noexcept;
   // The chains the requests waiting to start restore (their admission
   // probes): the KV of every block of each, and the state at its last, which
   // the request resumes from (CacheProbe::restoredChain), are of certain
@@ -1366,9 +1369,9 @@ private:
   // past the empty one a runway keeps with keepRunway.
   [[nodiscard]] uint64_t extentsCompleted(kv::PageForm form, uint32_t pages, uint32_t beside = 0,
                                           bool keepRunway = false) const noexcept;
-  // Returning's count of the request's writes and owed copies, or of every
-  // request's without one.
-  [[nodiscard]] Returning returningOf(const Request *active) const noexcept;
+  // Returning's count of the requests' writes and owed copies, or of every
+  // request's without them.
+  [[nodiscard]] Returning returningOf(std::optional<std::span<const uint64_t>> requestIds) const noexcept;
   // Rescans every Spill request's blocks from its dense history: a holder
   // that kept some of them Full ended or began to spill.
   void rescanSpills() noexcept;

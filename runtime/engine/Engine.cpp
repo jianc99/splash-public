@@ -70,7 +70,7 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   ledger.addSource(cache_);
   ledger.addSource(victims_);
   ledger.setReturning([&cache = cache_] { return cache.returning(); },
-                      [&cache = cache_](uint64_t requestId) { return cache.returningFor(requestId); });
+                      [&cache = cache_](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
   ledger.setBufferBytes(
       [&model = model_](uint32_t states) { return model.idleBufferBytes(states) - model.idleBufferBytes(0); });
   ledger.setPageBytes({cache_.bytesPerPage(kv::PageForm::Full), cache_.bytesPerPage(kv::PageForm::Index),

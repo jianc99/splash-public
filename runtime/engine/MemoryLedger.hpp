@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -287,8 +288,10 @@ public:
   void addSource(VictimSource &source);
   void removeSource(VictimSource &source) noexcept;
   // What transfers return when they land: all of them (Cache::returning),
-  // and those of one request's own pages (Cache::returningFor).
-  void setReturning(std::function<Returning()> all, std::function<Returning(uint64_t requestId)> ofRequest);
+  // and those of some requests' own pages, the extents their owed copies
+  // complete beside every landing (Cache::returningFor).
+  void setReturning(std::function<Returning()> all,
+                    std::function<Returning(std::span<const uint64_t> requestIds)> ofRequests);
   // The bytes the model's pool releases of `states` more state buffers
   // (Model::idleBufferBytes beyond its value at none): what the buffers a
   // unit frees give a need of bytes once they leave the pool.
@@ -389,7 +392,7 @@ private:
   std::map<uint32_t, ClaimState> claims_;
   uint32_t nextClaim_ = 1;
   std::function<Returning()> returning_;
-  std::function<Returning(uint64_t)> returningFor_;
+  std::function<Returning(std::span<const uint64_t>)> returningFor_;
   std::function<uint64_t(uint32_t)> bufferBytes_;
   std::array<uint64_t, 3> pageBytes_{};
   MemoryRates rates_;

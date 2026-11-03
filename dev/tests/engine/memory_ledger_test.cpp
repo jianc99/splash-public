@@ -260,7 +260,9 @@ void waitForItsCopies(MemoryLedger &ledger, ClaimId claim, const Need &need) {
   const uint64_t id = ledger.claim(claim).spec.requestId;
   Returning own{.owedBytes = need.bytes};
   own.owedPages[static_cast<size_t>(need.form)] = need.pages;
-  ledger.setReturning([] { return Returning{}; }, [=](uint64_t lane) { return lane == id ? own : Returning{}; });
+  ledger.setReturning([] { return Returning{}; }, [=](std::span<const uint64_t> lanes) {
+    return std::ranges::find(lanes, id) != lanes.end() ? own : Returning{};
+  });
   require(ledger.free(claim, need, 0, false, false).outcome == FreeOutcome::Pending && ledger.claim(claim).waiting,
           "a claim its lane's owed copies cover did not wait");
 }
@@ -342,7 +344,7 @@ void testSnapshotRendersEveryAccount() {
   ledger.addPool(experts);
   ledger.setReturning([] { return Returning{.landingBytes = 3 * kMiB, .owedBytes = 5 * kMiB, .transfers = 2,
                                             .oldestMilliseconds = 40.0}; },
-                      [](uint64_t) { return Returning{}; });
+                      [](std::span<const uint64_t>) { return Returning{}; });
   serve(ledger, experts, 400.0, 0.0, 10.0);
   const ClaimId waiting = ledger.open(request(7, RequestPriority::Normal));
   require(ledger.free(waiting, {.bytes = 2 * kMiB}, 0, false, false).outcome == FreeOutcome::Pending,
@@ -373,7 +375,8 @@ void testWaitingClaimHoldsRoomForItsRank() {
   Fixture fixture(host(32 * kGiB), 10 * kGiB);
   fixture.memory.hold("weights", 9 * kGiB);
   MemoryLedger &ledger = fixture.ledger();
-  ledger.setReturning([] { return Returning{.landingBytes = 2 * kGiB}; }, [](uint64_t) { return Returning{}; });
+  ledger.setReturning([] { return Returning{.landingBytes = 2 * kGiB}; },
+                      [](std::span<const uint64_t>) { return Returning{}; });
   const auto waits = [&](ClaimId claim) {
     return fixture.governor->free(claim, fixture.governor->need(claim)).outcome == FreeOutcome::Pending;
   };
@@ -424,7 +427,8 @@ void testNestedScopesRestore() {
   // Once they end, an admission is for the claim whose scope is open then: a
   // claim ranked above the one that waits, for what lands, is not held back
   // by it.
-  ledger.setReturning([] { return Returning{.landingBytes = 3 * kGiB}; }, [](uint64_t) { return Returning{}; });
+  ledger.setReturning([] { return Returning{.landingBytes = 3 * kGiB}; },
+                      [](std::span<const uint64_t>) { return Returning{}; });
   require(fixture.governor->free(outer, fixture.governor->need(outer)).outcome == FreeOutcome::Pending,
           "a claim the landings cover did not wait");
   const ClaimId above = ledger.open(request(3, RequestPriority::Foreground));
@@ -552,7 +556,7 @@ void testPendingGrowthGrowsOnItsLandedVictims() {
   cache.units = {unit(1, kGiB, 0.5, true)};
   MemoryLedger &ledger = fixture.ledger();
   Returning inFlight{.landingBytes = kGiB};
-  ledger.setReturning([&] { return inFlight; }, [](uint64_t) { return Returning{}; });
+  ledger.setReturning([&] { return inFlight; }, [](std::span<const uint64_t>) { return Returning{}; });
   ledger.addSource(cache);
   ledger.addPool(experts);
   serve(ledger, experts, 400.0, 0.0, 10.0);
@@ -1202,7 +1206,7 @@ void testLandingThenVictimsThenOwed() {
   cache.units = {unit(1, kGiB, 0.5)};
   ledger.addSource(cache);
   ledger.setReturning([] { return Returning{.landingBytes = 256 * kMiB, .owedBytes = 4 * kGiB}; },
-                      [](uint64_t) { return Returning{}; });
+                      [](std::span<const uint64_t>) { return Returning{}; });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
   require(ledger.free(claim, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{1},
@@ -1210,7 +1214,8 @@ void testLandingThenVictimsThenOwed() {
   require(ledger.free(claim, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Pending &&
               ledger.claim(claim).waiting,
           "with no victim left the claim did not wait for the owed copies");
-  ledger.setReturning([] { return Returning{.landingBytes = 2 * kGiB}; }, [](uint64_t) { return Returning{}; });
+  ledger.setReturning([] { return Returning{.landingBytes = 2 * kGiB}; },
+                      [](std::span<const uint64_t>) { return Returning{}; });
   cache.units = {unit(2, kGiB, 0.5)};
   require(ledger.free(claim, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Pending && cache.taken.size() == 1,
           "landings that meet the need did not come first");
@@ -1223,7 +1228,8 @@ void testImmediateSkipsLandings() {
   TestSource cache("cache");
   cache.units = {unit(1, kGiB, 0.1, true), unit(2, kGiB, 0.5)};
   ledger.addSource(cache);
-  ledger.setReturning([] { return Returning{.landingBytes = 4 * kGiB}; }, [](uint64_t) { return Returning{}; });
+  ledger.setReturning([] { return Returning{.landingBytes = 4 * kGiB}; },
+                      [](std::span<const uint64_t>) { return Returning{}; });
   const ClaimId claim = ledger.open({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate});
   require(ledger.free(claim, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{2},
@@ -1258,7 +1264,9 @@ void testLandingCountsBeforeVictimsInPart() {
     TestSource cache("cache");
     cache.units = {unit(1, 512 * kMiB, 0.5), unit(2, 512 * kMiB, 0.6)};
     ledger.addSource(cache);
-    ledger.setReturning([&] { return each.all; }, [&](uint64_t id) { return id == 1 ? each.own : Returning{}; });
+    ledger.setReturning([&] { return each.all; }, [&](std::span<const uint64_t> lanes) {
+      return std::ranges::find(lanes, 1) != lanes.end() ? each.own : Returning{};
+    });
     ClaimSpec spec = request(1, RequestPriority::Normal);
     spec.timing = each.timing;
     const ClaimId claim = ledger.open(spec);
@@ -1271,7 +1279,8 @@ void testLandingCountsBeforeVictimsInPart() {
     MemoryLedger ledger;
     TestSource cache("cache");
     ledger.addSource(cache);
-    ledger.setReturning([] { return Returning{.landingPages = {2, 0, 0}}; }, [](uint64_t) { return Returning{}; });
+    ledger.setReturning([] { return Returning{.landingPages = {2, 0, 0}}; },
+                        [](std::span<const uint64_t>) { return Returning{}; });
     if (heldAbove) {
       const ClaimId high = ledger.open(request(2, RequestPriority::Foreground));
       require(ledger.free(high, {.pages = 2}, 0, false, false).outcome == FreeOutcome::Pending,
@@ -1479,7 +1488,10 @@ void testAvailableCountsWhatLandsForAClaimThatCanWait() {
   cache.units = {unit(1, 256 * kMiB, 0.1)};
   ledger.addSource(cache);
   ledger.setReturning([] { return Returning{.landingBytes = 512 * kMiB}; },
-                      [](uint64_t id) { return id == 1 ? Returning{.owedBytes = 128 * kMiB} : Returning{}; });
+                      [](std::span<const uint64_t> lanes) {
+                        return std::ranges::find(lanes, 1u) != lanes.end() ? Returning{.owedBytes = 128 * kMiB}
+                                                                           : Returning{};
+                      });
   const ClaimSpec start = request(1, RequestPriority::Normal, ClaimClass::Start);
   require(ledger.available(start, 2 * kGiB, 128 * kMiB, false, false) == 1024 * kMiB,
           "available() did not count what lands and the copies the request owes before its victims");
@@ -1621,7 +1633,7 @@ void testCriticalTakesWhatItFindsWhateverLands() {
   certain.certainReuse = true;
   cache.units = {inUse, certain};
   fixture.ledger().setReturning([] { return Returning{.landingBytes = kGiB, .transfers = 4}; },
-                                [](uint64_t) { return Returning{}; });
+                                [](std::span<const uint64_t>) { return Returning{}; });
   fixture.ledger().addSource(cache);
   static_cast<void>(fixture.pass(0.5));
   require(cache.units.empty() && fixture.memory.held("cache") == 0,
@@ -1670,7 +1682,7 @@ void testDeficitNetOfReturning() {
     fixture.memory.hold("cache", 800 * kMiB);
     fixture.ledger().addSource(cache);
     fixture.ledger().setReturning([&] { return Returning{.landingBytes = landing}; },
-                                  [](uint64_t) { return Returning{}; });
+                                  [](std::span<const uint64_t>) { return Returning{}; });
     static_cast<void>(fixture.pass(1.0));
     require(cache.taken.size() == (landing == 512 * kMiB ? 0u : 4u),
             "the band pass did not free the deficit net of what is landing");
@@ -1807,7 +1819,7 @@ void testGrowthPendsOnlyOnItsOwnVictims() {
     fixture.memory.hold("cache", kGiB);
     MemoryLedger &ledger = fixture.ledger();
     Returning returning{.landingBytes = kGiB};
-    ledger.setReturning([&] { return returning; }, [](uint64_t) { return Returning{}; });
+    ledger.setReturning([&] { return returning; }, [](std::span<const uint64_t>) { return Returning{}; });
     ledger.addPool(experts);
     serve(ledger, experts, 400.0, 0.0, 10.0);
     const ClaimId lane = ledger.open(request(1, RequestPriority::Normal));
@@ -1826,7 +1838,8 @@ void testGrowthPendsOnlyOnItsOwnVictims() {
     FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
     fixture.memory.hold("weights", 4608 * kMiB);
     MemoryLedger &ledger = fixture.ledger();
-    ledger.setReturning([] { return Returning{.owedBytes = 4 * kGiB}; }, [](uint64_t) { return Returning{}; });
+    ledger.setReturning([] { return Returning{.owedBytes = 4 * kGiB}; },
+                        [](std::span<const uint64_t>) { return Returning{}; });
     ledger.addPool(experts);
     serve(ledger, experts, 400.0, 0.0, 10.0);
     static_cast<void>(fixture.pass(10.5));
@@ -2001,7 +2014,10 @@ void testALoneConvertedLaneWaitsForItsOwnCopies() {
   MemoryLedger ledger;
   ledger.addPool(experts);
   ledger.setReturning([] { return Returning{.owedBytes = 2 * kGiB}; },
-                      [](uint64_t id) { return id == 5 ? Returning{.owedBytes = 2 * kGiB} : Returning{}; });
+                      [](std::span<const uint64_t> lanes) {
+                        return std::ranges::find(lanes, 5) != lanes.end() ? Returning{.owedBytes = 2 * kGiB}
+                                                                          : Returning{};
+                      });
   const ClaimId lane = ledger.open(request(5, RequestPriority::Normal));
   require(ledger.free(lane, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Pending && experts.units() == 3,
           "a lone Spill lane took a store unit instead of waiting for its own copies");
@@ -2020,8 +2036,11 @@ void testARetryAfterItsConversionTakesNothingElse() {
   }
   ledger.addSource(engine);
   ledger.setReturning([&] { return Returning{}; },
-                      [&](uint64_t id) {
-                        return std::ranges::count(engine.taken, id) ? Returning{.owedBytes = kGiB} : Returning{};
+                      [&](std::span<const uint64_t> lanes) {
+                        const auto converted = [&](uint64_t id) { return std::ranges::count(engine.taken, id) != 0; };
+                        return std::ranges::any_of(lanes, converted)
+                                   ? Returning{.owedBytes = kGiB}
+                                   : Returning{};
                       });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
   require(ledger.free(claim, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Pending &&
@@ -2040,7 +2059,10 @@ void testOneConversionDoesNotStallTheStore() {
   MemoryLedger ledger;
   ledger.addPool(experts);
   ledger.setReturning([] { return Returning{.owedBytes = 4 * kGiB}; },
-                      [](uint64_t id) { return id == 9 ? Returning{.owedBytes = 4 * kGiB} : Returning{}; });
+                      [](std::span<const uint64_t> lanes) {
+                        return std::ranges::find(lanes, 9) != lanes.end() ? Returning{.owedBytes = 4 * kGiB}
+                                                                          : Returning{};
+                      });
   const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
   require(ledger.free(claim, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Met && experts.units() == 2,
           "another lane's write-through held the claim back from the store");

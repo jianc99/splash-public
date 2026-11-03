@@ -5845,7 +5845,7 @@ void testRestoresReturnNothing() {
           "the restore did not start");
   const Returning restoring = fixture.cache.returning();
   require(!restoring.transfers && restoring.landingPages == std::array<uint32_t, 3>{} && !restoring.landingBytes &&
-              fixture.cache.returningFor(2).landingPages == std::array<uint32_t, 3>{},
+              fixture.cache.returningFor(std::vector<uint64_t>{2}).landingPages == std::array<uint32_t, 3>{},
           "a restore counted as memory on its way back");
   tier.complete();
   static_cast<void>(fixture.cache.pollTransfers());
@@ -5916,13 +5916,25 @@ void testReturningSplitsLandingAndOwed() {
   // stays in its window; request 2's pages 1 and 2 spill once copied.
   constexpr auto full = static_cast<size_t>(kv::PageForm::Full);
   const Returning all = spill.cache.returning();
-  const Returning first = spill.cache.returningFor(1);
-  const Returning second = spill.cache.returningFor(2);
+  const Returning first = spill.cache.returningFor(std::vector<uint64_t>{1});
+  const Returning second = spill.cache.returningFor(std::vector<uint64_t>{2});
   require(all.transfers == 1 && all.landingPages[full] == 1 && all.owedPages[full] == 7,
           "the spilling writes and the owed copies were not split into landing and owed");
   require(first.transfers == 1 && first.landingPages[full] == 1 && first.owedPages[full] == 5 &&
               !second.transfers && !second.landingPages[full] && second.owedPages[full] == 2,
           "a request's own count took in another's pages");
+  // The two requests' owed copies, as one claim waits for them (its
+  // request's and a lane it converted): the extents they complete beside
+  // every landing, the free Full pages counted once, so that with what lands
+  // they come to the extents all of those pages complete (amend/M.md B5).
+  const Returning both = spill.cache.returningFor(std::vector<uint64_t>{1, 2});
+  const uint32_t free = spill.pool.freePageCount(kv::PageForm::Full);
+  const auto extents = [](uint64_t pages) { return pages / 4; };
+  const uint64_t completed = (extents(free + all.landingPages[full] + 7) - extents(free)) * 4 * 100;
+  require(both.owedPages[full] == 7 && all.landingBytes + both.owedBytes == completed,
+          "the requests' owed copies counted the free Full pages once a request: " +
+              std::to_string(all.landingBytes + both.owedBytes) + " bytes come back, not " +
+              std::to_string(completed));
   // With no free Index page a landing spills nothing; the owed copies count
   // all the same.
   KvPageAcquisition index = spill.pool.acquirePages(spill.pool.freePageCount(kv::PageForm::Index), kv::PageForm::Index);

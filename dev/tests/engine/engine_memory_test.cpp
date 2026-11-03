@@ -4040,7 +4040,7 @@ void testTrimsAtTheSlimRunwaysLastPagesAllocateNothing() {
   MemoryLedger &ledger = host.governor.ledger();
   ledger.addSource(cache);
   ledger.setReturning([&cache] { return cache.returning(); },
-                      [&cache](uint64_t requestId) { return cache.returningFor(requestId); });
+                      [&cache](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
   // Two conversations cached under a start's Floor claim: the first's eight
   // pages trim, which leaves the Slim runway an extent of free pages, and
   // the second's four Full pages wait to trim.

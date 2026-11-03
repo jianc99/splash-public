@@ -559,22 +559,26 @@ TokenAdmission Cache::admitPages(uint32_t count, std::vector<uint32_t> &pages,
   return {};
 }
 
-Returning Cache::returning() const noexcept { return returningOf(nullptr); }
+Returning Cache::returning() const noexcept { return returningOf(std::nullopt); }
 
-Returning Cache::returningFor(uint64_t requestId) const noexcept {
-  const auto found = requests_.find(requestId);
-  return found == requests_.end() ? Returning{} : returningOf(&found->second);
-}
+Returning Cache::returningFor(std::span<const uint64_t> requestIds) const noexcept { return returningOf(requestIds); }
 
-Returning Cache::returningOf(const Request *active) const noexcept {
+Returning Cache::returningOf(std::optional<std::span<const uint64_t>> requestIds) const noexcept {
   Returning result;
-  // A request's own pages: the blocks of its page table on its pages.
+  std::vector<const Request *> holders;
+  if (requestIds)
+    for (const uint64_t id : *requestIds)
+      if (const auto found = requests_.find(id); found != requests_.end())
+        holders.push_back(&found->second);
+  // The requests' own pages: the blocks of their page tables on their pages.
   const auto own = [&](uint64_t block) {
-    if (!active)
+    if (!requestIds)
       return true;
     const uint32_t index = kv_.chainLength(block) - 1;
-    return index < active->cachedBlocks.size() && active->cachedBlocks[index] == block &&
-           active->pages[index] == kv_.page(block);
+    return std::ranges::any_of(holders, [&](const Request *active) {
+      return index < active->cachedBlocks.size() && active->cachedBlocks[index] == block &&
+             active->pages[index] == kv_.page(block);
+    });
   };
   uint32_t spilling = 0;
   for (const Write &write : writes_) {
@@ -594,18 +598,22 @@ Returning Cache::returningOf(const Request *active) const noexcept {
   constexpr auto full = static_cast<size_t>(kv::PageForm::Full);
   result.landingPages[full] += std::min(spilling, pool_.freePageCount(kv::PageForm::Index));
   if (spill_ && writes(WriteClass::Spill)) {
-    // Requests on one prefix owe its blocks each.
+    // Requests on one prefix owe its blocks each; a block another request's
+    // write drains already lands among the transfers.
     std::unordered_set<uint64_t> owed;
     for (const auto &[_, holder] : requests_)
-      if (holder.mode == KvMode::Spill && (!active || &holder == active))
+      if (holder.mode == KvMode::Spill && (!requestIds || std::ranges::find(holders, &holder) != holders.end()))
         for (const uint64_t block : holder.owedCopies)
-          if (spillEligibility(block) == Eligibility::Eligible)
+          if (kv_.transfer(block) == KvCache::Transfer::None && spillEligibility(block) == Eligibility::Eligible)
             owed.insert(block);
     result.owedPages[full] = static_cast<uint32_t>(owed.size());
   }
   for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
     result.landingBytes += extentsCompleted(form, result.landingPages[static_cast<size_t>(form)]);
-  result.owedBytes = extentsCompleted(kv::PageForm::Full, result.owedPages[full], result.landingPages[full]);
+  // The owed pages complete extents beside every landing, the free pages
+  // counted once.
+  const uint32_t landing = requestIds ? returningOf(std::nullopt).landingPages[full] : result.landingPages[full];
+  result.owedBytes = extentsCompleted(kv::PageForm::Full, result.owedPages[full], landing);
   return result;
 }
 

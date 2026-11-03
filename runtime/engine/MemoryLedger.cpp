@@ -150,9 +150,10 @@ void MemoryLedger::addSource(VictimSource &source) {
 
 void MemoryLedger::removeSource(VictimSource &source) noexcept { std::erase(sources_, &source); }
 
-void MemoryLedger::setReturning(std::function<Returning()> all, std::function<Returning(uint64_t)> ofRequest) {
+void MemoryLedger::setReturning(std::function<Returning()> all,
+                                std::function<Returning(std::span<const uint64_t>)> ofRequests) {
   returning_ = std::move(all);
-  returningFor_ = std::move(ofRequest);
+  returningFor_ = std::move(ofRequests);
 }
 
 void MemoryLedger::setBufferBytes(std::function<uint64_t(uint32_t)> bytes) { bufferBytes_ = std::move(bytes); }
@@ -621,12 +622,7 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
       std::vector<uint64_t> lanes = claim.converted;
       if (spec.requestId)
         lanes.push_back(spec.requestId);
-      for (uint64_t lane : lanes) {
-        const Returning of = returningFor_(lane);
-        own.owedBytes = plus(own.owedBytes, of.owedBytes);
-        for (size_t each = 0; each < own.owedPages.size(); ++each)
-          own.owedPages[each] += of.owedPages[each];
-      }
+      own = returningFor_(lanes);
     }
     heldPagesAbove = heldPages(ClaimId{id})[form];
   }
@@ -709,7 +705,7 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
   if (!host && spec.timing == NeedTiming::CanWait && spec.cls != ClaimClass::Growth) {
     landing = returning().landingBytes;
     if (returningFor_ && spec.requestId)
-      landing = plus(landing, returningFor_(spec.requestId).owedBytes);
+      landing = plus(landing, returningFor_(std::span<const uint64_t>(&spec.requestId, 1)).owedBytes);
   }
   const uint64_t room = host ? 0 : plus(freeBytes, landing);
   if (less(room, held) >= enough)

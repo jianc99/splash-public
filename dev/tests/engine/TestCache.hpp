@@ -113,7 +113,7 @@ inline engine::FreeResult freeFromCache(engine::Cache &cache, const engine::Clai
   engine::MemoryLedger ledger;
   ledger.addSource(cache);
   ledger.setReturning([&cache] { return cache.returning(); },
-                      [&cache](uint64_t requestId) { return cache.returningFor(requestId); });
+                      [&cache](std::span<const uint64_t> requestIds) { return cache.returningFor(requestIds); });
   const engine::ClaimId claim = ledger.open(spec);
   const engine::FreeResult result = ledger.free(claim, need, 0, false, false);
   ledger.close(claim);
