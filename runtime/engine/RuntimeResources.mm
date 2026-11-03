@@ -606,6 +606,13 @@ RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
       budgetDescription_(std::move(budgetDescription)),
       shortfall_(std::move(shortfall)) {}
 
+RuntimeResourcesError::RuntimeResourcesError(RuntimeResourceStage stage,
+                                             const metal::MetalBackendError &error,
+                                             std::string budgetDescription)
+    : RuntimeResourcesError(stage, error.what(), std::move(budgetDescription)) {
+  commandOutOfMemory_ = error.outOfMemory();
+}
+
 RuntimeResources::RuntimeResources(
     PersistentCacheFiles persistentCache,
     std::unique_ptr<metal::MetalBackend> backend, std::shared_ptr<model::SsdReaders> readers,
@@ -914,6 +921,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what(), {},
                                   resourceAllocationFailure(error.failure()));
+    } catch (const metal::MetalBackendError &error) {
+      // A command of the load, the expert store's fill.
+      throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading, error);
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(RuntimeResourceStage::ModelLoading,
                                   error.what());
@@ -1249,6 +1259,11 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                 error.what(),
                                 memoryPlan.breakdown().describe(),
                                 resourceAllocationFailure(error.failure()));
+  } catch (const metal::MetalBackendError &error) {
+    // A command before any warmup: the Neural Engine split's setup and
+    // calibration.
+    throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation, error,
+                                memoryPlan.breakdown().describe());
   } catch (const std::exception &error) {
     throw RuntimeResourcesError(RuntimeResourceStage::StorageAllocation,
                                 error.what(),

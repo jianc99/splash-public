@@ -36,6 +36,7 @@ reportForResourceFailure(const RuntimeResourcesError &error) {
   report.message = error.what();
   report.budgetDescription = error.budgetDescription();
   report.shortfall = error.shortfall();
+  report.commandOutOfMemory = error.commandOutOfMemory();
   return report;
 }
 

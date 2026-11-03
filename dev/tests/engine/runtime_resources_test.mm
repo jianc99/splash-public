@@ -754,6 +754,41 @@ void testFailedStepIsNamed(const char *metallibPath) {
           "a start the host refused was not retried");
 }
 
+// A Metal command of resource assembly that ran out of GPU memory fails the
+// start as CommandMemory, which no start retries, as a warmup's does: the
+// Neural Engine split's setup and calibration run theirs before any warmup.
+// Another process holds what the commands need, and a retry, in the process
+// or the server's relaunch, would take it from that process. A command that
+// failed otherwise fails its step as before. The automatic SSD cache's
+// volume, read as its files open, stands in for the split's command here.
+void testACommandOutOfMemoryInAssemblyIsCommandMemory(const char *metallibPath) {
+  using namespace std::chrono_literals;
+  using Kind = protocol::StartFailureKind;
+  const test::TemporaryDirectory root("splash-command-memory");
+  RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "command-memory-test");
+  config.cacheDisk = {.automatic = true};
+  for (const bool outOfMemory : {true, false}) {
+    config.diskVolume = [outOfMemory](const std::filesystem::path &) -> std::optional<DiskVolume> {
+      throw metal::MetalBackendError("Metal command 2 failed: Insufficient Memory", outOfMemory);
+    };
+    const std::string what = outOfMemory ? "for want of GPU memory" : "otherwise";
+    try {
+      static_cast<void>(test::capturedStderr([&] { static_cast<void>(RuntimeResources::create(config, 0)); }));
+      throw std::runtime_error("resources were assembled past a command that failed " + what);
+    } catch (const RuntimeResourcesError &error) {
+      const RuntimeBootstrapReport report = RuntimeBootstrapError(error).report();
+      const Kind kind = startFailedEvent(report).kind;
+      require(report.resourceStage == RuntimeResourceStage::StorageAllocation &&
+                  kind == (outOfMemory ? Kind::CommandMemory : Kind::Internal) &&
+                  report.message == "Metal command 2 failed: Insufficient Memory",
+              "a start whose command failed " + what + " in resource assembly failed as kind " +
+                  std::to_string(static_cast<int>(kind)));
+      require(!StartupRetryWindow(30s).retryUntil(report, StartupRetryWindow::Clock::time_point{}),
+              "a start whose command failed " + what + " in resource assembly was retried");
+    }
+  }
+}
+
 // What a start allocates, the KV runway and then the arenas and the warmup as
 // RuntimeBootstrap::start allocates them, is memory a request in service
 // needs: neither the warning margin above the spare reserve nor macOS's
@@ -1696,6 +1731,7 @@ int main(int argc, char **argv) {
       testModelBeyondBudgetIsRefusedBeforeLoading(argv[1]);
       testStartupAdmissionIgnoresModelSize(argv[1]);
       testFailedStepIsNamed(argv[1]);
+      testACommandOutOfMemoryInAssemblyIsCommandMemory(argv[1]);
       testStartGrowsThroughHostPressure(argv[1]);
       testStartChecksTheReserveWithWhatItServes(argv[1]);
       testYarnRuntime(argv[1]);

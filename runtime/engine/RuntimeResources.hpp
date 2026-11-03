@@ -216,6 +216,9 @@ public:
                             RuntimeResourceFailure::Other,
                         std::optional<protocol::StartShortfall> shortfall =
                             std::nullopt);
+  // A step whose Metal command failed, with whether for want of GPU memory.
+  RuntimeResourcesError(RuntimeResourceStage stage, const metal::MetalBackendError &error,
+                        std::string budgetDescription = {});
 
   [[nodiscard]] RuntimeResourceStage stage() const noexcept { return stage_; }
   [[nodiscard]] RuntimeResourceFailure failure() const noexcept {
@@ -230,12 +233,18 @@ public:
   shortfall() const noexcept {
     return shortfall_;
   }
+  // A Metal command of the step failed for want of GPU memory
+  // (metal::MetalBackendError::outOfMemory), as before any warmup the
+  // Neural Engine split's setup and calibration or the expert store's fill
+  // may: the start fails as CommandMemory, which it never retries.
+  [[nodiscard]] bool commandOutOfMemory() const noexcept { return commandOutOfMemory_; }
 
 private:
   RuntimeResourceStage stage_;
   RuntimeResourceFailure failure_;
   std::string budgetDescription_;
   std::optional<protocol::StartShortfall> shortfall_;
+  bool commandOutOfMemory_ = false;
 };
 
 // The bound of a Metal memory budget: --max-memory where it set the budget,
