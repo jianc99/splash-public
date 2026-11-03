@@ -250,12 +250,15 @@ final class Server {
         }
     }
 
-    /// Why a start by process `pid` failed: what its serve record says, where the record is this
-    /// start's; else the first error line of the log; else that it stopped.
+    /// Why a start by process `pid` failed: the engine's class of it, where this start's serve
+    /// record has one; else the first error line of the log, which is the server's own failure or
+    /// what made it fail, such as an engine refusing its arguments before it could class anything;
+    /// else the record's message; else that it stopped.
     nonisolated static func startProblem(record: ServeRecord?, pid: pid_t, firstError: String?) -> String {
-        if let record, record.pid == pid, let failure = record.failure { return problem(failure) }
+        let failure = record?.pid == pid ? record?.failure : nil
+        if let failure, failure.source == "engine" { return problem(failure) }
         if let firstError { return plainProblem(firstError) }
-        return "It stopped unexpectedly. The log has the details."
+        return failure?.message ?? "It stopped unexpectedly. The log has the details."
     }
 
     /// A start failure in the words of the launch options: the model, with its reserves, needs more

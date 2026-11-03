@@ -329,6 +329,18 @@ struct ServerTests {
             == "It stopped unexpectedly. The log has the details.")
     }
 
+    /// An engine refusing its arguments or its model's files exits before it can send StartFailed:
+    /// the server's record then says only that the engine ended, and the engine's own line, first in
+    /// the log, says why.
+    @Test func wordsAServerFailedStartByTheLogsFirstError() throws {
+        let record = try JSONDecoder().decode(ServeRecord.self, from: Data("""
+            {"pid":4242,"phase":"failed","failure":{"source":"server","kind":"server","message":"native protocol reached EOF"}}
+            """.utf8))
+        let refusal = "MAX_CONTEXT: Flint serves at most 262144 tokens of context"
+        #expect(Server.startProblem(record: record, pid: 4242, firstError: refusal) == refusal)
+        #expect(Server.startProblem(record: record, pid: 4242, firstError: nil) == "native protocol reached EOF")
+    }
+
     /// The app gives a server the engine's stop budget twice, the longest the server's own stop of
     /// its engine takes, as the golden both sides read holds it.
     @Test func appStopBudgetIsTheEngines() throws {
