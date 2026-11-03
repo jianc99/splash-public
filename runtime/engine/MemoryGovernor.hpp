@@ -285,8 +285,9 @@ public:
   // after it. True when the host claim waits for memory on its way back:
   // the transport runs the pass again at the next command-free point.
   [[nodiscard]] bool controlPass(double nowMilliseconds);
-  // At startup, before Ready: grows the pools into the free room.
-  void growToTargets(double nowMilliseconds);
+  // At startup, before Ready: grows the pools into the free room, by the
+  // host's rule at macOS's `pressure` now.
+  void growToTargets(double nowMilliseconds, MemoryPressure pressure);
 
 private:
   // Held while an admitted allocation runs; released when it ends.
@@ -309,17 +310,18 @@ private:
 
   // The host's one rule at its latest sample (DESIGN section 4.4 R4;
   // amend/M.md B3, B4): its headroom h is its spare memory above the spare
-  // reserve, beside what is being allocated. The band begins when h falls
-  // below the margin M (kHostMarginBytes) or cannot be measured, and ends
-  // once h clears M by the largest unit a pool grows by, or by what the
-  // claims the host refused wait for while that is less (amend/M.md B3: the
-  // band never holds them once h has room for them), or once a host pass
-  // finds nothing to take. Floor work passes; in-service work passes while h
-  // keeps M beyond it at normal pressure, and, once nothing in place meets
-  // it, as a claim the host exempts; growth within its credit passes, leaving
-  // the host's footprint where it was; anything else needs h to keep M
-  // beyond it outside the band and macOS's warning. macOS's critical
-  // pressure refuses everything.
+  // reserve, beside what is being allocated and what pools grew that the
+  // host's counters do not show yet. The band begins when h falls below the
+  // margin M (kHostMarginBytes) or cannot be measured, and ends once h
+  // clears M by the largest unit a pool grows by, or by what the claims the
+  // host refused wait for while that is less (amend/M.md B3: the band never
+  // holds them once h has room for them), or once a host pass finds nothing
+  // to take. Floor work passes; in-service work passes while h keeps M
+  // beyond it at normal pressure, and, once nothing in place meets it, as a
+  // claim the host exempts; growth within its credit passes, leaving the
+  // host's footprint where it was; anything else needs h to keep M beyond it
+  // outside the band and macOS's warning. macOS's critical pressure refuses
+  // everything.
   class HostRule final {
   public:
     void sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
@@ -359,6 +361,11 @@ private:
   [[nodiscard]] std::optional<HostMemory> sampleHost() const noexcept;
   [[nodiscard]] uint64_t hostHeadroomBytes(const std::optional<HostMemory> &host,
                                            uint64_t reservedBytes) const noexcept;
+  // Of what pools grew within kHostSettleMilliseconds, what the host's
+  // reading `host` does not show yet: what the headroom has fallen since the
+  // growth does not cover (a store chunk's pages count only once experts load
+  // into it).
+  [[nodiscard]] uint64_t unseenGrowthBytes(const std::optional<HostMemory> &host) const noexcept;
   [[nodiscard]] MemoryGovernorSnapshot
   snapshot(const std::optional<HostMemory> &hostMemory, const HostRule &rule) const noexcept;
   void release(uint64_t bytes) noexcept;
@@ -388,6 +395,13 @@ private:
   // waiver).
   double nextHostPassMilliseconds_ = 0.0;
   bool bandWaived_ = false;
+  // The latest control pass's clock, or the start growth's.
+  double clockMilliseconds_ = 0.0;
+  // Pools' growth the host's counters may not show yet (unseenGrowthBytes):
+  // its bytes, the host's raw headroom before it, and when it lapses.
+  uint64_t unseenGrowthBytes_ = 0;
+  uint64_t unseenGrowthHeadroom_ = 0;
+  double unseenGrowthUntilMilliseconds_ = 0.0;
 };
 
 // Connects an engine to the governor that admits its memory and whose ledger

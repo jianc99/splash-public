@@ -136,29 +136,36 @@ struct MarginalCost final {
   return {.growRatePerSecond = rate.nearGhostHitsPerSecond() * share,
           .shrinkRatePerSecond = rate.tailHitsPerSecond() * share};
 }
+// What giving a pool's unit back takes of the engine thread: the pool's
+// measured release time per byte (the store's compactions).
+[[nodiscard]] inline double releaseSeconds(const model::PoolValue &value, uint64_t unitBytes) noexcept {
+  return value.releasedBytes ? double(unitBytes) * value.releaseMilliseconds / double(value.releasedBytes) / 1000.0
+                             : 0.0;
+}
 // What growth that displaces other memory costs beyond what it takes: the
 // unit read back key by key once it comes back (PoolValue::keyBytes a miss;
-// none priced for a pool that reports no key), and given back again at the
-// pool's measured release time per byte (the store's compactions).
+// none priced for a pool that reports no key), and given back again.
 [[nodiscard]] inline double cycleSeconds(const model::PoolValue &value, uint64_t unitBytes) noexcept {
   const double unit = double(unitBytes);
   const double refill = value.keyBytes ? unit / double(value.keyBytes) * value.missMilliseconds / 1000.0 : 0.0;
-  const double release =
-      value.releasedBytes ? unit * value.releaseMilliseconds / double(value.releasedBytes) / 1000.0 : 0.0;
-  return refill + release;
+  return refill + releaseSeconds(value, unitBytes);
 }
 // What a pool's next unit saves over kValueHorizonSeconds.
 [[nodiscard]] inline double growthBenefit(const PoolRate &rate, const model::PoolValue &value, uint64_t unitBytes,
                                           uint64_t missingBytes, const MemoryRates &rates) noexcept {
   return poolUnit(rate, value, unitBytes, missingBytes, kValueHorizonSeconds, rates).at(kValueHorizonSeconds);
 }
+// What a unit grown back is expected to cost in its being taken back within
+// the horizon: claims that take the pool's units at the measured rate take
+// one within it with probability 1 - exp(-rate * horizon) (Poisson), each
+// time costing its cycle.
+[[nodiscard]] inline double retakeSeconds(const PoolRate &rate, double cycle) noexcept {
+  return cycle * (1.0 - std::exp(-rate.takesPerSecond() * kValueHorizonSeconds));
+}
 // Whether a unit grown into free room pays for being taken back within the
-// horizon: claims that take the pool's units at the measured rate take one
-// within it with probability 1 - exp(-rate * horizon) (Poisson), each time
-// costing its cycle. A pool no claim has taken from grows unconditionally.
+// horizon. A pool no claim has taken from grows unconditionally.
 [[nodiscard]] inline bool growsIntoFreeRoom(const PoolRate &rate, double benefitSeconds, double cycle) noexcept {
-  const double takes = rate.takesPerSecond();
-  return takes == 0.0 || benefitSeconds >= cycle * (1.0 - std::exp(-takes * kValueHorizonSeconds));
+  return rate.takesPerSecond() == 0.0 || benefitSeconds >= retakeSeconds(rate, cycle);
 }
 // A cache unit: its tokens computed again, or its copy read back, as often
 // as it is reused.

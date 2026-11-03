@@ -2458,6 +2458,144 @@ void testTheLedgerValuesTheStoreByItsScans() {
   }
 }
 
+// Displacement pays for the retake it expects, as growth into free room
+// does (amend/V.md A30: no unit taken back within kValueHorizonSeconds of its
+// regrow): a 1 GiB store unit worth about 0.12 s over the horizon (160 ghost
+// hits a second at 0.25 ms over the 20 GiB its ghosts span) whose 256 keys
+// of 4 MiB read back in 64 ms displaces cached KV worth 0.03 s while no
+// claim takes the store's units (0.03 < 0.12 - 0.064). A claim of 1 GiB
+// every 10 s takes a store unit (0.004 s over its 2 s hold) before the cache
+// each time: a retake within the horizon is likely, which the unit does not
+// pay for, and the cache stays.
+void testDisplacementPaysForItsExpectedRetake() {
+  Fixture fixture(host(32 * kGiB), 12 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 10, 30, 10, 0.25, 0.0);
+  experts.keyBytes = 4 * kMiB;
+  TestSource cache("cache", &fixture.memory);
+  fixture.memory.hold("weights", 2 * kGiB);
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  serve(ledger, experts, 160.0, 0.0, 10.0);
+  std::optional<ClaimId> claim;
+  std::optional<double> regrown;
+  uint64_t recurrences = 0, retaken = 0, grows = 0, shrinks = 0;
+  std::string history;
+  for (int step = 0; step < 320; ++step) {
+    const double seconds = 10.5 + step * 0.5;
+    experts.served(0, 80, 0, 0);
+    if (step % 20 == 0) {
+      claim = ledger.open(request(1 + step, RequestPriority::Normal, ClaimClass::InService, 2.0));
+      require(fixture.allocateFreeing(*claim, kGiB), "the claim was refused");
+      ++recurrences;
+    } else if (step % 20 == 10) {
+      // It ends: its KV is cache.
+      fixture.memory.release("kv", kGiB);
+      ledger.close(*claim);
+      cache.units.push_back(unit(100 + step, kGiB, 0.03));
+      fixture.memory.hold("cache", kGiB);
+    }
+    static_cast<void>(fixture.pass(seconds));
+    // A regrown unit taken back is the next unit the store gives after it.
+    if (experts.shrinks != shrinks) {
+      shrinks = experts.shrinks;
+      if (regrown && seconds - *regrown < kValueHorizonSeconds)
+        ++retaken;
+      regrown.reset();
+    }
+    if (experts.grows != grows) {
+      grows = experts.grows;
+      regrown = seconds;
+      history += " regrew at " + std::to_string(seconds) + " s to " + std::to_string(experts.units()) + " units;";
+    }
+  }
+  require(grows * 3 <= recurrences && retaken == 0,
+          "displacement regrew the store " + std::to_string(grows) + " times in " + std::to_string(recurrences) +
+              " recurrences, " + std::to_string(retaken) + " of them taken back within the horizon:" + history);
+}
+
+// Growth counts what the host's counters do not show yet (smoke a: a store
+// chunk's pages count once experts load into it, a second after it grew on
+// the 122B and the M6): with the host's reading 1 s behind, a pass grows only
+// the units the headroom keeps M beside, and none goes back once the reading
+// shows them.
+void testGrowthCountsWhatTheHostDoesNotShowYet() {
+  // M + 1.5 GiB of headroom beside the store's 2 GiB.
+  FakeMemory::Config config = host(2 * kGiB + kGiB + 1536 * kMiB);
+  config.readingLagMilliseconds = 1000.0;
+  Fixture fixture(std::move(config));
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 6, 7, 2, 0.25, 60.0);
+  fixture.ledger().addPool(experts);
+  for (double t = 1.0; t <= 10.0; t += 0.5) {
+    experts.served(0, 200, 0, 0);
+    static_cast<void>(fixture.pass(t));
+  }
+  require(experts.units() == 3 && experts.shrinks == 0,
+          "growth admitted against a reading that did not show it: " + std::to_string(experts.grows) + " grown, " +
+              std::to_string(experts.shrinks) + " given back");
+}
+
+// A claim pays the release a pool's unit takes of the engine thread (the
+// store's compaction, amend/M.md D4): an optional claim worth one state's
+// read, 5 ms, takes the copied state that costs that, not a store chunk
+// whose value is gone (about one miss) but whose release took 60 ms.
+void testAClaimPaysForAPoolUnitsRelease() {
+  FakeMemory memory({});
+  FakeElasticPool experts("experts", memory, kGiB, 2, 4, 4, 4, 0.25, 60.0);
+  static_cast<void>(experts.release(1));
+  static_cast<void>(experts.grow([](uint64_t, const std::function<void()> &allocate) {
+    allocate();
+    return metal::AllocationResult{};
+  }));
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  cache.units = {unit(1, 64 * kMiB, 0.005)};
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  const ClaimId claim =
+      ledger.open({.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate, .benefitSeconds = 0.005});
+  require(ledger.free(claim, {.bytes = 64 * kMiB}, 0, false, false).outcome == FreeOutcome::Met &&
+              cache.taken == std::vector<uint64_t>{1} && experts.units() == 4,
+          "an optional claim took a store chunk whose release costs more than its benefit");
+}
+
+// A need of bytes beside buffers no state can give (Model::statesToActivate
+// with no draft ring idle) is met by the bytes of the states it evicts,
+// which leave the model's pool (smoke a trace: the lane's activation was
+// refused again with the evicted state's buffers still pooled).
+void testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes() {
+  MemoryLedger ledger;
+  BufferPool pool(64 * kMiB);
+  CachedStates cache(pool);
+  cache.units.push_back({.key = 1, .stateBuffers = 1, .cost = {.onceSeconds = 0.1}});
+  ledger.addSource(cache);
+  ledger.addSource(pool);
+  ledger.setBufferBytes([](uint32_t states) { return uint64_t{states} * 64 * kMiB; });
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
+  const FreeResult freed = ledger.free(
+      claim, {.bytes = 48 * kMiB, .stateBuffers = std::numeric_limits<uint32_t>::max()}, 0, false, false);
+  require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 64 * kMiB &&
+              cache.taken == std::vector<uint64_t>{1} && !pool.idle,
+          "the evicted state's buffers stayed in the pool for a need no state meets in place");
+}
+
+// The pools grow before Ready by the host's rule at macOS's pressure then: a
+// warning that began after the governor was built holds them at their
+// floors; at normal pressure they grow to their cap.
+void testStartGrowthFollowsThePressureNow() {
+  for (const MemoryPressure pressure : {MemoryPressure::Warning, MemoryPressure::Normal}) {
+    Fixture fixture(host(32 * kGiB, MemoryPressure::Normal, {at(100.0, 32 * kGiB, pressure)}));
+    FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 2, 0.25, 60.0);
+    fixture.ledger().addPool(experts);
+    fixture.memory.advanceTo(100.0);
+    fixture.governor->growToTargets(100.0, fixture.memory.pressure());
+    require(experts.units() == (pressure == MemoryPressure::Warning ? 2u : 4u),
+            pressure == MemoryPressure::Warning ? "the start's growth went on under a warning that began after the "
+                                                  "governor was built"
+                                                : "the start's growth did not reach the cap at normal pressure");
+  }
+}
+
 } // namespace
 
 std::span<const test::TestCase> ledgerTests() {
@@ -2543,6 +2681,12 @@ std::span<const test::TestCase> ledgerTests() {
       {"testHiSparseOnStudio36GWeighsSpillDecode", testHiSparseOnStudio36GWeighsSpillDecode},
       {"testHiSparseOffTakesCacheThenStoreAndNeverConverts", testHiSparseOffTakesCacheThenStoreAndNeverConverts},
       {"testTheLedgerValuesTheStoreByItsScans", testTheLedgerValuesTheStoreByItsScans},
+      {"testDisplacementPaysForItsExpectedRetake", testDisplacementPaysForItsExpectedRetake},
+      {"testGrowthCountsWhatTheHostDoesNotShowYet", testGrowthCountsWhatTheHostDoesNotShowYet},
+      {"testAClaimPaysForAPoolUnitsRelease", testAClaimPaysForAPoolUnitsRelease},
+      {"testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes",
+       testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes},
+      {"testStartGrowthFollowsThePressureNow", testStartGrowthFollowsThePressureNow},
   };
   return kTests;
 }

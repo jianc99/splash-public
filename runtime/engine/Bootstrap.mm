@@ -460,7 +460,7 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
   NativeRuntime *loopPointer = nativeLoop.get();
   RuntimeBootstrapReport report = requireWarmupAndAnnounce(
       resources->memoryPlan(), *modelRuntime, resources->kvPool(),
-      [resourcesPointer, modelPointer, loopPointer] {
+      [resourcesPointer, modelPointer, loopPointer, pressure = config.resources.memoryPressure] {
         // Audit every attempted warmup before reclaiming idle buffers.
         // Wider batches and cache memory grow on demand after Ready.
         ActualMemoryReport report = resourcesPointer->actualMemoryReport(
@@ -485,8 +485,11 @@ std::unique_ptr<RuntimeBootstrap> RuntimeBootstrap::start(
         }
         // The pools start at their floors and grow before Ready into the
         // room the host's rule for growth leaves (MemoryGovernor::
-        // growToTargets), which serving's control passes keep to.
-        resourcesPointer->memoryGovernor().growToTargets(loopPointer->monotonicMilliseconds());
+        // growToTargets), which serving's control passes keep to, at
+        // macOS's pressure now: a warning that began during the start holds
+        // them at their floors.
+        resourcesPointer->memoryGovernor().growToTargets(loopPointer->monotonicMilliseconds(),
+                                                         pressure ? pressure() : MemoryPressure::Normal);
         return report;
       },
       *nativeLoop, ready);

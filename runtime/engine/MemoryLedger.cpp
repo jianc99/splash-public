@@ -376,10 +376,12 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     if (!head.state.releaseUnitBytes || head.taken >= above)
       return std::nullopt;
     const uint64_t bytes = std::min(head.state.releaseUnitBytes, above - head.taken);
-    return Victim{.key = head.taken / head.state.releaseUnitBytes,
-                  .bytes = bytes,
-                  .cost = value::poolUnit(account.rate, head.counters, bytes, missingBytes(head.state),
-                                          spec.holdSeconds, rates_)};
+    // What the unit is worth over the claim's hold, and the release it takes
+    // of the engine thread now.
+    UnitCost cost =
+        value::poolUnit(account.rate, head.counters, bytes, missingBytes(head.state), spec.holdSeconds, rates_);
+    cost.onceSeconds += value::releaseSeconds(head.counters, bytes);
+    return Victim{.key = head.taken / head.state.releaseUnitBytes, .bytes = bytes, .cost = cost};
   };
   for (size_t index = 0; index < sources_.size(); ++index)
     heads.push_back(Head{.victim = sources_[index]->peek(query, nullptr), .source = index});
@@ -665,7 +667,11 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
     if (run->covered) {
       bool whole = true;
       FreeResult taken = take(*run, query, &claim, whole);
-      if (run->bufferBytes && !need.stateBuffers)
+      // The buffers its states freed leave the model's pool unless they met
+      // the need in place: a need of bytes beside buffers no state can give
+      // (Model::statesToActivate with no ring idle) is met by their bytes.
+      const bool metInPlace = need.stateBuffers && run->buffers >= need.stateBuffers;
+      if (run->bufferBytes && !metInPlace)
         taken.nowBytes = plus(taken.nowBytes, takeUnsized(query));
       const bool alone = (lackingBytes && run->bytes >= lackingBytes) ||
                          (lackingPages && run->pages >= lackingPages) ||
@@ -733,12 +739,13 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 // host admits each unit and, once claims take a pool's units, while a unit
 // is worth its expected retake. At most one unit per pass then displaces
 // other memory, outside critical pressure, when the victims cost less than
-// the unit is worth beyond its cycle: with the host's consent the victims
-// need only meet what the room lacks; without it they free a whole unit,
-// which the growth then takes from the host's footprint again (its
-// credit), and what the room lacks besides. Either way victims that free
-// memory only once their transfers land make the unit the pool's pending
-// growth. The room is the pass's less what the pass has grown.
+// the unit is worth beyond its cycle and its expected retake: with the
+// host's consent the victims need only meet what the room lacks; without
+// it they free a whole unit, which the growth then takes from the host's
+// footprint again (its credit), and what the room lacks besides. Either way
+// victims that free memory only once their transfers land make the unit the
+// pool's pending growth. The room is the pass's less what the pass has
+// grown.
 bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
   bool acted = false;
   uint64_t waitingBytes = 0;
@@ -845,7 +852,7 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
     return acted;
   for (const Candidate &next : candidates) {
     Account &account = accounts_[next.account];
-    const double benefit = next.benefit - next.cycle;
+    const double benefit = next.benefit - next.cycle - value::retakeSeconds(account.rate, next.cycle);
     if (!next.unit || account.pendingGrowth || benefit <= 0.0)
       continue;
     const bool consents = host.admits(next.unit);

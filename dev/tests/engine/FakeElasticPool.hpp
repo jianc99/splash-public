@@ -54,6 +54,7 @@ public:
             .missMilliseconds = missMilliseconds_,
             .releasedBytes = releasedBytes_,
             .releaseMilliseconds = releaseMilliseconds_,
+            .keyBytes = keyBytes,
             .nearGhostHits = nearGhostHits,
             .tailHits = tailHits,
             .marginBytes = unitBytes_};
@@ -100,6 +101,9 @@ public:
   // The hits at the edge it reports (model::PoolValue::nearGhostHits,
   // tailHits), which the test moves.
   uint64_t nearGhostHits = 0, tailHits = 0;
+  // The bytes a miss reads, which a unit grown back reads key by key; none
+  // unless the test sets them.
+  uint64_t keyBytes = 0;
 
 private:
   std::string name_;
