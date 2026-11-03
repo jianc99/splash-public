@@ -238,6 +238,11 @@ struct ClaimState final {
   Need need;
   bool waiting = false;
   double waitingSinceSeconds = 0.0;
+  // Its request waits to retry an allocation the host refused
+  // (Engine::syncClaims): what that refusal asked counts in the host's
+  // deficit (amend/M.md B3) until the wait ends. It holds no room: the
+  // host, not the engine's limit, refused it.
+  bool hostRefusedWaiting = false;
   // The host refused it after in-place units could not meet it: the
   // retries of that allocation pass the host with each of their
   // reservations (a Floor or InService claim), until the allocation ends
@@ -309,6 +314,7 @@ public:
   void update(ClaimId claim, const ClaimSpec &spec);
   void refused(ClaimId claim, const Need &need);
   void setWaiting(ClaimId claim, bool waiting);
+  void setHostRefusedWaiting(ClaimId claim, bool waiting);
   void setHostExempt(ClaimId claim, bool exempt);
   void close(ClaimId claim) noexcept;
   [[nodiscard]] const ClaimState &claim(ClaimId claim) const;
@@ -323,7 +329,9 @@ public:
   // bytes they lack in that form's pages, the room a hand-out from free
   // pages in kept extents would take from what they wait for.
   [[nodiscard]] std::array<uint32_t, 3> heldPages(ClaimId claim) const;
-  // The waiting claims, and the bytes those the host refused lack.
+  // The waiting claims, and the bytes the latest refusals of the claims that
+  // wait, or whose requests wait to retry what the host refused, asked of
+  // the host.
   [[nodiscard]] bool claimWaiting() const noexcept;
   [[nodiscard]] uint64_t hostRefusedWaitingBytes() const noexcept;
   // The largest unit a pool grows by next: the host's band reaches past its

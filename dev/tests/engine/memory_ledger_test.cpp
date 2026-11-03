@@ -815,6 +815,48 @@ void testDeficitCountsHostRefusedClaimsNotAnIdleMargin() {
   }
 }
 
+// A start the host refused, whose request waits to retry it, is admitted
+// within two control passes (amend/M.md B3; design/M.md T6, starts held in
+// the band to their wait limit): what its refusal asked counts in the
+// deficit whatever the free() of that refusal decided, the deficit pass runs
+// in the band or not, and in the band a pass that met the deficit ends it.
+// In the band as on the M6 (the store a unit below its cap, H = 1 GiB, 1.1
+// GiB of headroom, a start of 300 MiB) and outside it as on the Studio (the
+// store at its cap, H = 0, 1.5 GiB of headroom, a start of 600 MiB).
+void testAHostRefusedStartIsAdmittedWithinTwoPasses() {
+  for (const bool band : {true, false}) {
+    const uint64_t headroom = band ? 1100 * kMiB : 1536 * kMiB;
+    const uint64_t need = band ? 300 * kMiB : 600 * kMiB;
+    Fixture fixture(host(headroom + kGiB + 2 * kGiB));
+    FakeElasticPool experts("experts", fixture.memory, kGiB, 1, band ? 2 : 1, 3, 1, 0.2, 60.0);
+    fixture.ledger().addPool(experts);
+    TestSource cache("cache", &fixture.memory);
+    for (uint64_t key = 1; key <= 16; ++key)
+      cache.units.push_back(unit(key, 128 * kMiB, 0.1));
+    fixture.memory.hold("cache", 2 * kGiB);
+    fixture.ledger().addSource(cache);
+    static_cast<void>(fixture.governor->evaluate());
+    const ClaimId start = fixture.ledger().open(request(1, RequestPriority::Normal, ClaimClass::Start));
+    bool admitted = false;
+    for (uint32_t pass = 0; pass < 2 && !admitted; ++pass) {
+      // As the engine has it: the request waits to retry what the host
+      // refused (Engine::syncClaims), its allocation is refused and the
+      // ledger asked, then the control pass runs.
+      fixture.ledger().setHostRefusedWaiting(start, true);
+      const metal::AllocationResult result = fixture.allocate(start, need);
+      admitted = static_cast<bool>(result);
+      if (admitted)
+        break;
+      require(result.failure == metal::AllocationFailure::HostPressure, "the start was not refused by the host");
+      static_cast<void>(fixture.governor->free(start, fixture.governor->need(start)));
+      static_cast<void>(fixture.pass(1.0 + 1.5 * pass));
+    }
+    admitted = admitted || static_cast<bool>(fixture.allocate(start, need));
+    require(admitted, band ? "a start the host refused waited in the band after a pass met its deficit"
+                           : "no pass freed for a start the host refused outside the band");
+  }
+}
+
 // free() takes the cheapest unit per byte across sources first.
 void testCheapestPerByteFirstAcrossSources() {
   MemoryLedger ledger;
@@ -2255,6 +2297,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testBandWaivedWhenTheHostClaimFindsNothing", testBandWaivedWhenTheHostClaimFindsNothing},
       {"testEveryHostPassGivesBackIdleBuffers", testEveryHostPassGivesBackIdleBuffers},
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
+      {"testAHostRefusedStartIsAdmittedWithinTwoPasses", testAHostRefusedStartIsAdmittedWithinTwoPasses},
       {"testCheapestPerByteFirstAcrossSources", testCheapestPerByteFirstAcrossSources},
       {"testAUnitLargerThanTheNeedCostsItsWholeCost", testAUnitLargerThanTheNeedCostsItsWholeCost},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},

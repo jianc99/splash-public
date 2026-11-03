@@ -1042,7 +1042,9 @@ private:
   // (resourceDeadline). A waiting claim holds room against claims ranked
   // below it (amend/M.md B14); past that limit or deadline it holds none,
   // whatever its retries find (ResourceWait::holdEnded); a wait for the SSD
-  // cache's quota is no memory claim.
+  // cache's quota is no memory claim. One whose latest refusal was the
+  // host's, retried within its deadline, counts in the host's deficit
+  // (MemoryLedger::setHostRefusedWaiting).
   void syncClaims(double nowMilliseconds);
   // What copies ahead are worth now (WriteBehind::run): none unless a
   // recent free() reached cache a copy would have let go at once

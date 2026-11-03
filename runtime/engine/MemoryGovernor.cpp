@@ -260,7 +260,7 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   const std::optional<HostMemory> host = sampleHost();
   // The rule at this sample, from the one the governor last moved.
   HostRule rule = hostRule_;
-  rule.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_, growthUnitBytes_, hostPassShort_);
+  rule.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_, growthUnitBytes_, bandWaived_);
   MemoryGovernorSnapshot result = snapshot(host, rule);
   result.hostTelemetry = queryHostTelemetry();
   return result;
@@ -364,10 +364,10 @@ uint64_t MemoryGovernor::HostRule::deficitBytes(uint64_t refusedWaitingBytes, ui
 }
 
 void MemoryGovernor::sampleHostRule(const std::optional<HostMemory> &host) noexcept {
-  hostRule_.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_, growthUnitBytes_, hostPassShort_);
+  hostRule_.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_, growthUnitBytes_, bandWaived_);
   // A waiver lasts the band it ended: the next band starts unwaived.
   if (!hostRule_.constrained())
-    hostPassShort_ = false;
+    bandWaived_ = false;
 }
 
 uint64_t MemoryGovernor::roomBytes() const noexcept {
@@ -439,12 +439,12 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
   growthUnitBytes_ = ledger_.largestGrowthUnit();
   sampleHostRule(sampleHost());
   std::optional<FreeResult> pass;
+  uint64_t deficit = 0;
   if (hostRule_.level() == MemoryPressure::Critical) {
     ledger_.dropToFloors();
     pass = hostPass(std::numeric_limits<uint64_t>::max(), true, true);
   } else {
-    const uint64_t deficit =
-        hostRule_.deficitBytes(ledger_.hostRefusedWaitingBytes(), ledger_.returning().landingBytes);
+    deficit = hostRule_.deficitBytes(ledger_.hostRefusedWaitingBytes(), ledger_.returning().landingBytes);
     // While the host lacks nothing past its margin its claim may take only
     // cache, which the pools rank above: they grow first, so that the cache
     // the pass gives back buys their units first. With a deficit it may
@@ -454,16 +454,19 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
     if (nowMilliseconds >= nextHostPassMilliseconds_) {
       if (hostRule_.level() == MemoryPressure::Warning)
         pass = hostPass(kHostMarginBytes, false, deficit != 0);
-      else if (hostRule_.constrained() && deficit)
+      else if (deficit)
         pass = hostPass(std::min(kHostMarginBytes, deficit), false, true);
     }
     if (deficit)
       ledger_.grow(roomBytes(), growthHost(true));
   }
   if (pass) {
-    // Only a pass while the host is short can waive the band.
+    // Only a pass while the host is short can waive the band: one that found
+    // nothing to take, since only other applications could return the rest,
+    // or one that met the deficit of the claims the host refused, which the
+    // band would hold to their wait limit otherwise (amend/M.md B3).
     if (hostRule_.constrained())
-      hostPassShort_ = pass->outcome == FreeOutcome::Short;
+      bandWaived_ = pass->outcome == FreeOutcome::Short || (deficit && pass->outcome == FreeOutcome::Met);
     if (pass->nowBytes || pass->laterBytes)
       nextHostPassMilliseconds_ = nowMilliseconds + kHostSettleMilliseconds;
   }

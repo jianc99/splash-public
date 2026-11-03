@@ -274,10 +274,11 @@ public:
   // otherwise the pools grow (MemoryLedger::grow) and, on a pass the host
   // has settled from the last one that returned memory, under macOS's
   // warning the host claim frees the margin from cache alone while the host
-  // lacks nothing past it; with a deficit, under macOS's warning or in the
-  // band, the host claim frees the margin or the deficit first and the pools
-  // grow after it. True when the host claim waits for memory on its way
-  // back: the transport runs the pass again at the next command-free point.
+  // lacks nothing past it; with a deficit (what the claims the host refused
+  // ask counts in it), under macOS's warning or not, in the band or not, the
+  // host claim frees the margin or the deficit first and the pools grow
+  // after it. True when the host claim waits for memory on its way back:
+  // the transport runs the pass again at the next command-free point.
   [[nodiscard]] bool controlPass(double nowMilliseconds);
   // At startup, before Ready: grows the pools into the free room.
   void growToTargets(double nowMilliseconds);
@@ -371,9 +372,10 @@ private:
   // pool's growth runs inside does not read the pool.
   uint64_t growthUnitBytes_ = 0;
   // When the host has settled from the last pass that returned memory, and
-  // whether the last host pass found nothing to take (the band's waiver).
+  // whether the last host pass in the band found nothing to take or met the
+  // deficit of the claims the host refused (the band's waiver).
   double nextHostPassMilliseconds_ = 0.0;
-  bool hostPassShort_ = false;
+  bool bandWaived_ = false;
 };
 
 // Connects an engine to the governor that admits its memory and whose ledger

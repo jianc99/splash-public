@@ -198,6 +198,10 @@ void MemoryLedger::setWaiting(ClaimId claim, bool waiting) {
   state.waiting = waiting;
 }
 
+void MemoryLedger::setHostRefusedWaiting(ClaimId claim, bool waiting) {
+  claims_.at(claim.value).hostRefusedWaiting = waiting;
+}
+
 void MemoryLedger::setHostExempt(ClaimId claim, bool exempt) { claims_.at(claim.value).hostExempt = exempt; }
 
 void MemoryLedger::close(ClaimId claim) noexcept { claims_.erase(claim.value); }
@@ -252,7 +256,7 @@ bool MemoryLedger::claimWaiting() const noexcept {
 uint64_t MemoryLedger::hostRefusedWaitingBytes() const noexcept {
   uint64_t bytes = 0;
   for (const auto &[id, state] : claims_)
-    if (state.waiting && state.refusal.hostRefused)
+    if ((state.waiting || state.hostRefusedWaiting) && state.refusal.hostRefused)
       bytes = plus(bytes, state.refusal.bytes);
   return bytes;
 }
