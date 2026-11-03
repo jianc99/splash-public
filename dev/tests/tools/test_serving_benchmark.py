@@ -1901,6 +1901,15 @@ class GateTests(unittest.TestCase):
             "none again within 60 s (isolated take backs, counted)",
             facts["notes"],
         )
+        # One regrow and two takes after it: the regrown unit taken back
+        # once, then a unit the store held before, as smoke b's 35B run at
+        # 18G on the Studio: isolated, not a repeating cycle.
+        once = self.store_run("once", [(0, 4), (10, 5), (18, 4), (30, 3), (900, 3)])
+        facts = matrix.health(once, self.machine, self.gates)
+        self.assertFalse(
+            [f for f in facts["failures"] if f.startswith("store")], facts["failures"]
+        )
+        self.assertEqual(facts["readouts"]["store"]["taken_back_within_horizon"], 1)
         cycling = self.store_run(
             "cycling", [(0, 4), (8, 5), (10, 4), (20, 5), (22, 4), (900, 4)]
         )

@@ -822,11 +822,13 @@ def ssd_counters(run: Run, work: float | None) -> dict:
 
 def store_churn(run: Run, horizon: float) -> dict:
     """The experts' grows and shrinks over the run, the units taken back
-    within `horizon` seconds of the regrow that brought them, and of those
-    the ones taken back within `horizon` of the take back before, where a
-    regrow and its take back repeat: an oscillation (amend/V.md A30,
-    coordinator 11-03 09:20: an isolated take back is counted, an
-    oscillation fails; engine-sim's RegrowthWatch judges it alike)."""
+    within `horizon` seconds of the regrow that brought them (a take back
+    uses its regrow up), and of those the ones taken back within `horizon`
+    of the take back before, where a regrow and its take back repeat: an
+    oscillation (amend/V.md A30; coordinator 11-03 09:20: an isolated take
+    back is counted, an oscillation fails). engine-sim's RegrowthWatch,
+    which sees every control pass, also counts a second shrink after one
+    regrow."""
     series = [(s["t"], store_size(s["status"])) for s in run.samples]
     series = [(t, size) for t, size in series if size is not None]
     grows = shrinks = retaken = oscillations = 0
@@ -842,6 +844,9 @@ def store_churn(run: Run, horizon: float) -> dict:
                 if last_take_back is not None and t - last_take_back <= horizon:
                     oscillations += 1
                 last_take_back = t
+                # The take back uses its regrow up: a later shrink is one only
+                # after another regrow.
+                last_grow = None
     return {
         "grows": grows,
         "shrinks": shrinks,
