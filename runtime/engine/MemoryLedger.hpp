@@ -63,7 +63,8 @@ inline constexpr AccountId kFixedAccount{0};
 // For status only: nothing branches on an account's role or name.
 enum class AccountRole : uint8_t { Fixed, Kv, States, Pool };
 
-// Why an allocation is made: decides the host's rule and what free() may take.
+// Why an allocation is made: decides the host's rule (but for what a lane
+// needs, ClaimSpec::laneNeeds) and what free() may take.
 enum class ClaimClass : uint8_t { Floor, InService, Start, Optional, Growth, Host };
 // Whether the claimant can wait for memory a transfer returns.
 enum class NeedTiming : uint8_t { CanWait, Immediate };
@@ -96,6 +97,16 @@ struct ClaimSpec final {
   // service (pools serve every lane). The rank still orders held room. A
   // claim that is no lane's (the host, a pool's growth) takes Foreground.
   RequestPriority priority = RequestPriority::Foreground;
+  // An Optional claim for memory its lane in service takes in any case,
+  // which the claim only asks for sooner: the KV past a prefill command's
+  // first state boundary, which the lane's next command takes should this
+  // one end there (amend/S.md A04). The host judges it as the lane's
+  // growth, an InService claim: by the margin, not the band; refused, it
+  // takes the units in place its class may take whatever they cost, as that
+  // growth would, and past the margin once none meets the refusal
+  // (MemoryGovernor::free). Otherwise it takes only units its benefit pays
+  // for.
+  bool laneNeeds = false;
 };
 
 struct ClaimId final {
@@ -254,8 +265,9 @@ struct ClaimState final {
   bool hostRefusedWaiting = false;
   // The host refused it after in-place units could not meet it: the
   // retries of that allocation pass the host with each of their
-  // reservations (a Floor or InService claim), until the allocation ends
-  // (Engine::allocate), as the serving mark did (design/M.md R2).
+  // reservations (a Floor or InService claim, or an Optional one its lane
+  // needs), until the allocation ends (Engine::allocate), as the serving
+  // mark did (design/M.md R2).
   bool hostExempt = false;
   // The lanes free() converted for it, whose copies it waits for as its own.
   std::vector<uint64_t> converted;

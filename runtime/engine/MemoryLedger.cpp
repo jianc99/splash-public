@@ -379,6 +379,12 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
                      .form = query.need.form,
                      .buffers = query.need.stateBuffers};
   const bool immediate = spec.timing == NeedTiming::Immediate;
+  // What its lane takes in any case (ClaimSpec::laneNeeds), refused by the
+  // host, is worth every unit in place it may take: the lane's growth would
+  // take them all the same before it passed the host, as 1.5.0 reused
+  // cached pages before its serving mark.
+  const double benefit =
+      spec.laneNeeds && query.need.hostRefused ? std::numeric_limits<double>::infinity() : spec.benefitSeconds;
   // What each class may take (amend/M.md B2, B3): InUse units only for
   // in-service work that reaches them or the host under critical pressure;
   // units a request will certainly reuse never for growth, and for the host
@@ -549,7 +555,7 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
       continue;
     }
     const double cost = victim.cost.at(spec.holdSeconds);
-    if (run.cost + cost > spec.benefitSeconds)
+    if (run.cost + cost > benefit)
       break;
     run.cost += cost;
     run.bytes = plus(run.bytes, victim.bytes);

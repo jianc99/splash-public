@@ -6110,6 +6110,66 @@ void testCaptureKvPastABoundaryTakesNothingInUse() {
   fixture.finish();
 }
 
+// The KV a prefill command takes past its first state boundary is KV its
+// lane's next command takes anyway: refused by the host's margin with
+// nothing in place cheaper than cutting the command (amend/S.md A04), it
+// passes the host as the lane's own growth does once nothing in place meets
+// it (amend/M.md B2), as 1.5.0's serving mark passed it, and the command is
+// not cut for an extent the next one would take past the host all the same.
+// On the M6's Flash-Next (its timing; commands of up to 8192 rows in up to
+// 48 passes; KV extents of 8192 tokens, 256 pages of 423,936 bytes,
+// amend/M.md D9) the host leaves one extent beside its margin and 60 MiB, a
+// headroom of about 1.06 GiB once the first extent is taken (amend/M.md D1:
+// the M6's p50 is 1.06-1.13 GiB). Lone prompts run the commands 1.5.0 runs:
+// 12,000 tokens as 6144 + 5856 rows, the second command's checkpoint at
+// 8192 ending the first extent and the KV past it, up to the replay point at
+// 11,968, needing the second; 18,000 tokens as 6144 + 6144 + 5696 + 16, the
+// second command passing the checkpoint at 8192 on its way to 12,288, the
+// third ending at the replay point at 17,984, whose own buffers the margin
+// refuses while the lane holds a checkpoint, in 1.5.0 too.
+void testCaptureKvPastTheMarginCutsNoCommand() {
+  constexpr uint64_t pageBytes = 423'936;
+  constexpr uint32_t extentPages = 256;
+  struct Case final {
+    uint32_t length;
+    std::vector<uint32_t> commands;
+    uint64_t cuts;
+  };
+  std::string failures;
+  for (const Case &expected : {Case{12'000, {6144, 5856}, 0}, Case{18'000, {6144, 6144, 5696, 16}, 1}}) {
+    test::EngineHarness harness({.pages = 4 * extentPages,
+                                 .pageBytes = pageBytes,
+                                 .extentPages = extentPages,
+                                 .memory = test::FakeMemory::Config{},
+                                 .timing = &test::kM6FlashNextQ2,
+                                 .shape = test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget,
+                                                             test::kM6FlashNextQ2.layers)});
+    test::seedAsStartup(harness.engine, harness.model, test::kM6FlashNextQ2);
+    const test::GovernorLimits limits;
+    harness.memory->setHost(harness.memory->hostBytes() - limits.hostSpareReserveBytes - harness.memory->total() -
+                                kHostMarginBytes - (60ULL << 20) - pageBytes * extentPages,
+                            MemoryPressure::Normal);
+    EngineRequest prompt = harness.request(1, std::vector<uint32_t>(expected.length, 1));
+    prompt.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(prompt));
+    harness.runUntilIdle();
+    std::vector<uint32_t> rows;
+    std::string shown;
+    for (const test::EngineHarness::Command &command : harness.commands())
+      if (command.kind == WorkKind::Prefill && command.pass == 0) {
+        rows.push_back(command.rows.front());
+        shown += " " + std::to_string(command.rows.front());
+      }
+    require(harness.events.completedCount == 1 && harness.events.failedCount == 0,
+            "a prompt of " + std::to_string(expected.length) + " tokens did not complete");
+    const uint64_t cuts = harness.engine.snapshot().captureCuts;
+    if (cuts != expected.cuts || rows != expected.commands)
+      failures += "; " + std::to_string(expected.length) + " tokens: " + std::to_string(cuts) +
+                  " capture cuts, prefill commands of" + shown + " rows";
+  }
+  require(failures.empty(), "the KV past a checkpoint the host's margin refused cut a lone prompt's command" + failures);
+}
+
 // The prompt's replay point, refused at the engine's limit with nothing
 // ordinary left, takes a unit of the expert store above its floor before
 // another request's state in use, which goes only with the store at its
@@ -6340,6 +6400,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testReplayPointCopiesCacheBeforeTheExpertStore", testReplayPointCopiesCacheBeforeTheExpertStore},
       {"testCopyAheadOfALeafHoldsARefusalBack", testCopyAheadOfALeafHoldsARefusalBack},
       {"testCaptureKvPastABoundaryTakesNothingInUse", testCaptureKvPastABoundaryTakesNothingInUse},
+      {"testCaptureKvPastTheMarginCutsNoCommand", testCaptureKvPastTheMarginCutsNoCommand},
       {"testReplayPointTakesTheExpertStoreBeforeWhatIsInUse", testReplayPointTakesTheExpertStoreBeforeWhatIsInUse},
       {"testReplayPointAdmittedInMarginBand", testReplayPointAdmittedInMarginBand},
       {"testEveryEndReleasesTheReplayPoint", testEveryEndReleasesTheReplayPoint},

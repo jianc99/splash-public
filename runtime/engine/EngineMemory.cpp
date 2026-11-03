@@ -729,7 +729,11 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
     // it would have passed: the lane runs, and its next command asks again.
     // So it is an Optional claim, worth what cutting the command here costs
     // (amend/S.md A04): the rows past the boundary in a command of their
-    // own, beside the one command for all of them.
+    // own, beside the one command for all of them. The lane takes that KV
+    // in any case, so the host judges it as the lane's growth in its next
+    // command would be judged: refused with nothing in place to meet it, it
+    // passes the host and does not end this one (ClaimSpec::laneNeeds;
+    // 1.5.0's serving mark).
     const uint32_t next = index + 1 < boundaries.size() && boundaries[index + 1].tokens < end
                               ? boundaries[index + 1].tokens
                               : end;
@@ -755,7 +759,8 @@ uint32_t Engine::reserveCaptures(Request &active, const BatchItem &item,
          .supersedes = supersedes,
          .holdSeconds = remainingSeconds(active),
          .benefitSeconds = splitSeconds,
-         .priority = active.request.priority});
+         .priority = active.request.priority,
+         .laneNeeds = true});
     if (!kv.admission.granted()) {
       if (passed)
         static_cast<void>(reserve(index));

@@ -1225,7 +1225,9 @@ the margin by a pool's unit; a pool's growth past what it displaced leaves
 the host, besides the margin, what the requests it refused wait to retry. A
 request in service keeps the margin too, and
 grows past it, short of critical pressure, once nothing it holds in place
-meets a refusal. A claim refused memory asks the ledger to free what it
+meets a refusal; so does the KV a prefill command takes past its first
+state boundary, which the request's next command would take anyway. A
+claim refused memory asks the ledger to free what it
 lacks: the units that cost nothing first (idle state buffers), then, unless
 memory on its way back covers it, the cheapest units its class may take,
 each priced at what losing it costs: cached KV and states (computing them

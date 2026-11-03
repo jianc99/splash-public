@@ -222,7 +222,8 @@ public:
   // allocation is for a claim: it runs inside that claim's Scope, and one
   // outside any is a defect (std::logic_error). It reserves the bytes under
   // the limit, beside the room claims ranked above it hold, while the
-  // allocation runs, if the host's rule admits them for the claim's class,
+  // allocation runs, if the host's rule admits them for the claim (its
+  // class's, or a lane's growth's for what the lane needs),
   // or refuses them with the cause: HostPressure when the host refuses,
   // whether or not the limit does too, and EngineBudget when only the limit
   // does. A refusal records what the claim lacks (need).
@@ -266,8 +267,9 @@ public:
   [[nodiscard]] Need need(ClaimId claim, const std::optional<Need> &inPlace = {}) const;
   // Frees what the claim lacks (MemoryLedger::free). A need the host refused
   // is met in place first, from the pages and state buffers already
-  // allocated; failing that, a Floor or InService claim's retries pass the
-  // host, and another class's claim falls short.
+  // allocated; failing that, the retries of a Floor or InService claim, or
+  // of an Optional one its lane needs (ClaimSpec::laneNeeds), pass the host,
+  // and another claim falls short.
   [[nodiscard]] FreeResult free(ClaimId claim, const Need &need);
   // What free() would find for such a claim, up to `enough`, taking nothing
   // and leaving the chains `kept` (VictimQuery::kept).

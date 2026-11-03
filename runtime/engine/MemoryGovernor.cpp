@@ -49,6 +49,11 @@ bool sampleHostPages(vm_statistics64_data_t &pages, vm_size_t &pageSize) noexcep
   return pagesResult == KERN_SUCCESS && pageSize;
 }
 
+// The class whose rule the host applies to a claim: memory a lane in
+// service takes in any case (ClaimSpec::laneNeeds) it judges as the lane's
+// growth.
+ClaimClass hostClass(const ClaimSpec &spec) noexcept { return spec.laneNeeds ? ClaimClass::InService : spec.cls; }
+
 } // namespace
 
 HostMemory estimateHostMemory(const HostMemoryPages &statistics, uint64_t pageSize,
@@ -230,8 +235,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   // host admits it by its class.
   const ClaimState &claim = ledger_.claim(scope_);
   const bool fits = engineFits && ledger_.heldBytes(scope_, growing_) <= limitBytes_ - observed - requested;
-  const bool hostAdmits =
-      hostRule_.admits(claim.spec.cls, hostBytes(claim.spec.cls, bytes, scopeCredit_), claim.hostExempt, scopeCredit_);
+  const ClaimClass cls = hostClass(claim.spec);
+  const bool hostAdmits = hostRule_.admits(cls, hostBytes(cls, bytes, scopeCredit_), claim.hostExempt, scopeCredit_);
   if (!fits || !hostAdmits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
@@ -409,7 +414,7 @@ Need MemoryGovernor::need(ClaimId claim, const std::optional<Need> &inPlace) con
 
 FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
   FreeResult result = ledger_.free(claim, need, roomBytes(), hostRule_.level() == MemoryPressure::Critical, false);
-  const ClaimClass cls = ledger_.claim(claim).spec.cls;
+  const ClaimClass cls = hostClass(ledger_.claim(claim).spec);
   if (need.hostRefused && result.outcome == FreeOutcome::Short &&
       (cls == ClaimClass::Floor || cls == ClaimClass::InService)) {
     ledger_.setHostExempt(claim, true);

@@ -925,6 +925,43 @@ void testOneHostRule() {
   }
 }
 
+// Memory its lane in service takes in any case, which an Optional claim
+// only asks for sooner (ClaimSpec::laneNeeds: the KV past a prefill
+// command's first state boundary), the host judges as the lane's growth: by
+// the margin, not the band, and once free() finds nothing in place to meet
+// a refusal, past the margin and macOS's warning, short of critical
+// pressure. Other optional work keeps the band and the margin.
+void testTheHostJudgesWhatALaneNeedsAsItsGrowth() {
+  const ClaimSpec needed{.cls = ClaimClass::Optional, .laneNeeds = true};
+  const ClaimSpec optional{.cls = ClaimClass::Optional};
+  // In the band, past the margin by less than the largest growth unit.
+  {
+    const uint64_t pool = 2 * kGiB;
+    Fixture fixture(host(900 * kMiB + pool, MemoryPressure::Normal, {at(100.0, 2 * kGiB - 100 * kMiB + pool)}));
+    FakeElasticPool experts("experts", fixture.memory, kGiB, 1, 4, 5, 2, 0.2, 60.0);
+    fixture.ledger().addPool(experts);
+    static_cast<void>(fixture.governor->evaluate());
+    fixture.memory.advanceTo(100.0);
+    require(fixture.allocate(fixture.ledger().open(optional), 64 * kMiB).failure ==
+                metal::AllocationFailure::HostPressure,
+            "the band admitted optional work");
+    require(fixture.allocate(fixture.ledger().open(needed), 64 * kMiB),
+            "the band refused what a lane needs, which keeps the margin");
+  }
+  // Inside the margin.
+  for (const MemoryPressure pressure : {MemoryPressure::Normal, MemoryPressure::Warning, MemoryPressure::Critical}) {
+    Fixture fixture(host(512 * kMiB, pressure));
+    const ClaimId lane = fixture.ledger().open(needed);
+    require(!fixture.allocate(lane, 256 * kMiB), "what a lane needs was admitted inside the margin unexempt");
+    require(static_cast<bool>(fixture.allocateFreeing(lane, 256 * kMiB)) == (pressure != MemoryPressure::Critical),
+            "what a lane needs, with nothing in place to meet it, was " +
+                std::string(pressure == MemoryPressure::Critical ? "admitted under critical pressure"
+                                                                 : "refused past the margin"));
+    require(!fixture.allocateFreeing(fixture.ledger().open(optional), 256 * kMiB),
+            "optional work passed the margin");
+  }
+}
+
 // The band ends once a host pass finds nothing to take: only other
 // applications could return the rest.
 void testBandWaivedWhenTheHostClaimFindsNothing() {
@@ -1738,6 +1775,37 @@ void testHostRefusedNeedIsMetInPlaceFirst() {
   require(fixture.governor->free(start, fixture.governor->need(start)).outcome == FreeOutcome::Short &&
               !fixture.ledger().claim(start).hostExempt,
           "a start was exempted from the host");
+}
+
+// What its lane needs (ClaimSpec::laneNeeds), refused by the host, is met
+// in place by any unit its class may take, whatever it costs, as the lane's
+// growth would be, before it passes the host; other optional work takes
+// only units its benefit pays for (amend/S.md A04).
+void testWhatALaneNeedsIsMetInPlaceBeforeTheHost() {
+  for (const bool needed : {false, true}) {
+    Fixture fixture(host(1200 * kMiB));
+    TestSource cache("cache", &fixture.memory);
+    fixture.memory.hold("cache", kGiB);
+    Victim leaf = unit(1, 0, 3.0);
+    leaf.pages = 8;
+    cache.units = {leaf};
+    fixture.ledger().addSource(cache);
+    const ClaimId claim = fixture.ledger().open({.cls = ClaimClass::Optional,
+                                                 .requestId = 1,
+                                                 .timing = NeedTiming::Immediate,
+                                                 .benefitSeconds = 1.0,
+                                                 .laneNeeds = needed});
+    require(fixture.allocate(claim, 512 * kMiB).failure == metal::AllocationFailure::HostPressure,
+            "the host did not refuse the claim");
+    const FreeResult freed = fixture.governor->free(claim, fixture.governor->need(claim, Need{.pages = 8}));
+    if (needed)
+      require(freed.outcome == FreeOutcome::Met && cache.taken == std::vector<uint64_t>{1} &&
+                  !fixture.ledger().claim(claim).hostExempt,
+              "what a lane needs passed the host beside pages in place dearer than its benefit");
+    else
+      require(freed.outcome == FreeOutcome::Short && cache.taken.empty() && !fixture.ledger().claim(claim).hostExempt,
+              "optional work took pages dearer than its benefit, or passed the host");
+  }
 }
 
 // The exemption covers the retry of the whole allocation, as the serving
@@ -3582,6 +3650,8 @@ std::span<const test::TestCase> ledgerTests() {
        testAPendingGrowthWhoseRegrowthNoLongerGainsHoldsNothing},
       {"testTakenPendingGrowthIsCancelled", testTakenPendingGrowthIsCancelled},
       {"testOneHostRule", testOneHostRule},
+      {"testTheHostJudgesWhatALaneNeedsAsItsGrowth", testTheHostJudgesWhatALaneNeedsAsItsGrowth},
+      {"testWhatALaneNeedsIsMetInPlaceBeforeTheHost", testWhatALaneNeedsIsMetInPlaceBeforeTheHost},
       {"testBandWaivedWhenTheHostClaimFindsNothing", testBandWaivedWhenTheHostClaimFindsNothing},
       {"testEveryHostPassGivesBackIdleBuffers", testEveryHostPassGivesBackIdleBuffers},
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
