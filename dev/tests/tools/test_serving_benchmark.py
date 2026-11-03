@@ -179,6 +179,35 @@ class ClientRequestTests(unittest.TestCase):
                 clients.run_serve1(1, directory, "bad", samples=1, sizes=(300, 2048))
             self.assertEqual(sampled(directory, "bad"), [3, 4])
 
+    def test_prompts_take_the_tokens_their_sizes_name(self):
+        # The prompt_tokens the servers recorded for churn_doc prompts (Qwen
+        # tokenizers, which split digits one by one): serve1's size-300
+        # prompt of sample 0, 75 words at the old 4 tokens a word, came back
+        # as 662 tokens (smoke-s-serve1-pass-1-132500 and
+        # smoke-a-mini-serve1-cand-1-201707), its size-2048 one, 512 words,
+        # as 4,190; churn's first rounds of 2,000 and 7,300 words as
+        # 16,205-16,259 (smoke-a-fn-churn-A1) and 59,043-59,144
+        # (smoke-a-s-fn-churn-18g-cand-A1-193918). A prompt of w words takes
+        # about 662 + (w - 75) x 8.09 tokens. Each serve1 size and s-warm's
+        # depths then come within 2 %, and s-warm's longest prompt, its
+        # 134K prefix and a suffix, fits its --max-context.
+        def tokens(words):
+            return 662 + (59141 - 662) / (7300 - 75) * (words - 75)
+
+        def words(messages):
+            return len(messages[-1]["content"].split("\n")[1].split())
+
+        for size in clients.SERVE1_SIZES + (32768,):
+            prompt = tokens(words(clients.serve1_messages(size, 0)))
+            self.assertAlmostEqual(prompt, size, delta=0.02 * size)
+        cell = next(c for c in matrix.load_spec(SPEC)["cells"] if c["name"] == "s-warm")
+        context = int(cell["server_args"].split()[-1])
+        for depth in cell["sizes"]:
+            prefix = clients.warm_prefix(depth, 1)
+            self.assertAlmostEqual(tokens(words(prefix)), depth, delta=0.02 * depth)
+            suffix = clients.warm_suffix(prefix, depth, 1, 9)[-1:]
+            self.assertLess(tokens(words(prefix) + words(suffix)), context)
+
 
 # A request that fails after its stream began: server.py's _sse_error.
 FAILED_EVENT = {
@@ -829,6 +858,73 @@ class GateTests(unittest.TestCase):
         self.assertEqual([f[:4] for f in facts["failures"]], ["G4b:"])
         self.assertAlmostEqual(facts["client_gap_p99_s"], 2.999)
 
+    def test_g4b_allows_the_runs_own_median_client_gap(self):
+        # G4b's allowance, the typical gap with no prefill unit between two
+        # tokens, is the median of the run's own client gaps between token
+        # events. metrics.decode_gap_ms.p50 is a log2 bucket's upper edge
+        # (runtime/model/LatencyHistogram.hpp), up to twice the gap it
+        # stands for: smoke-a-fn-churn-A1's read 524.288. Here a token event
+        # comes every 100 ms and 5 of the 297 gaps (1.7 %) are 1.2 s, over
+        # the 960 ms limit + the 100 ms median, under the limit + the 524 ms
+        # edge.
+        samples = [
+            self.schema7(0),
+            self.schema7(900, metrics__decode_gap_ms={"p50": 524.288, "max": 1200.0}),
+        ]
+        done = [
+            {
+                "tag": f"w{w}-r1",
+                "start": 0,
+                "t": 400,
+                "ttft": 5,
+                "decode_tps": 30,
+                "chunks_ms": [
+                    100 * event + 1100 * ((event + w) // 50) for event in range(100)
+                ],
+            }
+            for w in range(3)
+        ]
+        facts = matrix.health(
+            churn_run(self.directory, "edge", done, samples),
+            self.machine,
+            self.gates,
+        )
+        self.assertEqual(
+            facts["failures"], ["G4b: client gap p99 1200 ms over 1060 ms"]
+        )
+        self.assertAlmostEqual(facts["client_gap_p50_s"], 0.1)
+
+    def test_g4a_reads_no_quantile_above_the_largest_unit(self):
+        # LatencyHistogram reports a quantile as its log2 bucket's upper edge,
+        # never clamped to the largest value it holds: smoke-a-27b-churn-A1's
+        # decode_gap_ms p95 read 1048.576 with max 609.03. A contended p95
+        # read as 1048.576 whose largest unit took 900 ms is within the
+        # 960 ms limit.
+        samples = [
+            self.schema7(0),
+            self.schema7(
+                900, scheduler__contended_prefill_ms={"p95": 1048.576, "max": 900.0}
+            ),
+        ]
+        smooth = [
+            {
+                "tag": f"w{w}-r1",
+                "start": 0,
+                "t": 100,
+                "ttft": 5,
+                "decode_tps": 30,
+                "chunks_ms": [0, 100, 200],
+            }
+            for w in range(3)
+        ]
+        facts = matrix.health(
+            churn_run(self.directory, "edge", smooth, samples),
+            self.machine,
+            self.gates,
+        )
+        self.assertEqual(facts["failures"], [])
+        self.assertAlmostEqual(facts["g4"]["contended_p95_ms"], 900.0)
+
     def test_an_ample_run_starts_at_the_cap_on_a_host_without_pressure(self):
         # s-fn-churn-ample: ntie's recorded sNFa reads warning at Ready, right
         # after the load, in the engine's band state and in macOS's own level,
@@ -1384,7 +1480,8 @@ class GateTests(unittest.TestCase):
     def test_work_is_read_at_the_end_of_the_cells_load_window(self):
         # mini-35b-churn runs 10 minutes. pass's recorded series stopped at
         # 604.94 s; cand's run.py series runs on through the drain, where it
-        # keeps counting output. cand did 10 % less work in the window.
+        # keeps counting output. cand did 10 % less work in the window, in
+        # each order.
         spec = self.spec
         cell = next(c for c in spec["cells"] if c["name"] == "mini-35b-churn")
         self.assertEqual(matrix.work_second(cell), 600)
@@ -1392,44 +1489,47 @@ class GateTests(unittest.TestCase):
             {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
             for w in range(3)
         ]
-        churn_run(
-            self.directory,
-            "mini35PSa",
-            done,
-            [
-                status(0),
-                status(600.5, rows=585 * 1000, disk__read_bytes=1000),
-                status(604.94, rows=585 * 1003, disk__read_bytes=1003),
-            ],
-        )
-        label = "mini-35b-churn-cand-A1"
-        churn_run(
-            self.directory,
-            label,
-            done,
-            [
-                status(0),
-                status(599, rows=585 * 900, disk__read_bytes=900),
-                status(900, rows=585 * 1350, disk__read_bytes=1350),
-                status(1020, rows=585 * 1500, disk__read_bytes=1500),
-            ],
-        )
-        (self.directory / f"{label}.meta.json").write_text(
-            json.dumps(
-                {
-                    "label": label,
-                    "cell": "mini-35b-churn",
-                    "tree_name": "cand",
-                    "order": [2, 0, 1],
-                }
+        for reference, label, order in (
+            ("mini35PSa", "mini-35b-churn-cand-A1", [2, 0, 1]),
+            ("mini35PSb", "mini-35b-churn-cand-B1", [0, 1, 2]),
+        ):
+            churn_run(
+                self.directory,
+                reference,
+                done,
+                [
+                    status(0),
+                    status(600.5, rows=585 * 1000, disk__read_bytes=1000),
+                    status(604.94, rows=585 * 1003, disk__read_bytes=1003),
+                ],
             )
-        )
+            churn_run(
+                self.directory,
+                label,
+                done,
+                [
+                    status(0),
+                    status(599, rows=585 * 900, disk__read_bytes=900),
+                    status(900, rows=585 * 1350, disk__read_bytes=1350),
+                    status(1020, rows=585 * 1500, disk__read_bytes=1500),
+                ],
+            )
+            (self.directory / f"{label}.meta.json").write_text(
+                json.dumps(
+                    {
+                        "label": label,
+                        "cell": "mini-35b-churn",
+                        "tree_name": "cand",
+                        "order": order,
+                    }
+                )
+            )
         runs = [
             r
             for r in matrix.load_runs(spec, [self.directory])
             if r.cell == cell["name"]
         ]
-        self.assertEqual(sorted(r.tree for r in runs), ["cand", "pass"])
+        self.assertEqual(sorted(r.tree for r in runs), ["cand", "cand", "pass", "pass"])
         work = next(
             v
             for v in matrix.point_gate(
@@ -3039,6 +3139,258 @@ class GateTests(unittest.TestCase):
             (stats.FAIL, [error]),
         )
         self.assertEqual(document["invalid"], [])
+
+    def test_check_fails_a_run_analyze_would_void(self):
+        # Studio 20-s-fn-churn-18g-cand-A1 with mediaanalysisd at 117.8 % in
+        # the top five (it came back on 11-02 20:25): the job's check fails
+        # it at once, so it is rerun now, not after the batch's analyze. A
+        # serve1 run of m6-serve1 is checked as one: no churn workers or
+        # load window, but its voids and G8.
+        model = self.spec["models"]["fn-q2"]["model"]
+        busy = [[55828, 117.8, 0.5, "mediaanalysisd", False]]
+        quiet = [[145, 11.9, 0.1, "WindowServer", False]]
+
+        def meta(label, cell, scenario, rows):
+            (self.directory / f"{label}.meta.json").write_text(
+                json.dumps(
+                    {
+                        "label": label,
+                        "cell": cell,
+                        "tree_name": "cand",
+                        "scenario": scenario,
+                        "model": model,
+                        "complete": True,
+                        "pids": [700],
+                        "ps": [{"rows": rows}],
+                    }
+                )
+            )
+
+        def check(label, machine, *more):
+            command = ["check", str(self.directory), label, "--spec", str(SPEC)]
+            with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+                code = matrix.main(command + ["--machine", machine, *more])
+            return code, out.getvalue()
+
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        label = "s-fn-churn-18g-cand-A1"
+        churn_run(self.directory, label, done, [self.schema7(0), self.schema7(960)])
+        meta(label, "s-fn-churn-18g", "churn", busy)
+        code, out = check(label, "studio", "--minutes", "15")
+        self.assertEqual(code, 1, out)
+        self.assertIn(
+            "FAIL voided: a process this run did not start in the top five by "
+            "CPU: mediaanalysisd at 117.8 %",
+            out,
+        )
+        for label, rows, expected in (
+            ("m6-serve1-cand-1", quiet, 0),
+            ("m6-serve1-cand-2", busy, 1),
+        ):
+            write_jsonl(
+                self.directory / f"{label}.events.jsonl",
+                [{"kind": "request", "size": 300, "prompt": 300, "ttft_ms": 900}],
+            )
+            write_jsonl(self.directory / f"{label}.status.jsonl", [status(0)])
+            (self.directory / f"{label}.out").write_text("DONE\n")
+            meta(label, "m6-serve1", "serve1", rows)
+            code, out = check(label, "m6")
+            self.assertEqual(code, expected, out)
+        self.assertIn("FAIL voided: a process this run did not start", out)
+
+    def test_a_job_types_expected_time_is_its_first_measured_run(self):
+        # M6: 02-m6-fn-churn-cand-floorcap-A1 ran before 01 completed and
+        # failed in seconds (README: requeue it): it measured nothing, so 05
+        # of its type is held to the 20 minutes it states, not to twice 5 s.
+        # 01 waited 30 minutes for a build's slot and then ran 20: its type
+        # is held to its run, not to its wait.
+        queue = Path(tempfile.mkdtemp())
+        (queue / "done").mkdir()
+        (queue / "running").mkdir()
+        failed = queue / "done" / "02-m6-fn-churn-cand-floorcap-A1.sh.log"
+        failed.write_text("FAIL: no complete m6-fn-churn cand run\nEXIT=1\n")
+        born = failed.stat().st_birthtime
+        os.utime(failed, (born + 5, born + 5))
+        job = queue / "running" / "05-m6-fn-churn-cand-floorcap-B2.sh"
+        job.write_text("# Expected ~20 min\n")
+        (queue / "running" / "05-m6-fn-churn-cand-floorcap-B2.sh.log").write_text("")
+        self.assertEqual(matrix.overruns(queue, now=time.time() + 10 * 60), [])
+        measured = queue / "done" / "01-m6-fn-churn-cand-A1.sh.log"
+        measured.write_text("")
+        born = measured.stat().st_birthtime
+        measured.write_text(f"run started at epoch {int(born) + 1800}\nEXIT=0\n")
+        os.utime(measured, (born + 3000, born + 3000))
+        (queue / "running" / "04-m6-fn-churn-cand-B1.sh.log").write_text("")
+        late = matrix.overruns(queue, now=time.time() + 41 * 60)
+        self.assertEqual(
+            [line.split(":")[0] for line in late],
+            ["04-m6-fn-churn-cand-B1.sh", "05-m6-fn-churn-cand-floorcap-B2.sh"],
+        )
+
+    def test_the_ssd_rule_reports_its_ratios_without_reference_pairs(self):
+        # p-35b-churn-18g, the only HiSparse-off pressure cell: r150 and main
+        # recorded one run per order, so no reference pair gives a sigma.
+        # cand's own pairs give one (as sigma_for pools them), and with one
+        # cand run per order the machine's recorded SSD sigma does: the
+        # ratios are reported and judged, never "no sigma". A reference
+        # missing an order cannot clear a cand surely higher than the other.
+        cell = next(c for c in self.spec["cells"] if c["name"] == "p-35b-churn-18g")
+        machine = self.spec["machines"]["m5"]
+
+        def run(label, tree, order, read):
+            sample = status(
+                900,
+                rows=585 * 1000,
+                disk__read_bytes=read,
+                disk__written_bytes=read / 10,
+                streamed_experts__prefill__read_bytes=read * 100,
+            )
+            r = churn_run(self.directory, label, [], [sample])
+            r.tree, r.order = tree, order
+            return r
+
+        refs = [run(f"{t}{o}", t, o, 1e9) for t in ("r150", "main") for o in "AB"]
+        pairs = [
+            run(f"c{o}{i}", "cand", o, 1e9 * (1 + 0.01 * i))
+            for o in "AB"
+            for i in (0, 1)
+        ]
+        for runs in (refs + pairs, refs + pairs[::2]):
+            verdicts = matrix.ssd_rule(cell, runs, machine, PRICES, "cand")
+            self.assertEqual([v["verdict"] for v in verdicts], [stats.PASS] * 3)
+            for v in verdicts:
+                self.assertTrue(v["numbers"]["main"]["ratio"].startswith("1.0"), v)
+        self.assertEqual(
+            verdicts[0]["numbers"]["sigma"], machine["sigma"]["ssd"]["sigma"]
+        )
+        higher = [
+            run(f"h{o}{i}", "cand", o, 1.5e9 * (1 + 0.01 * i))
+            for o in "AB"
+            for i in (0, 1)
+        ]
+        verdicts = matrix.ssd_rule(cell, refs + higher, machine, PRICES, "cand")
+        self.assertEqual([v["verdict"] for v in verdicts], [stats.FAIL] * 3)
+        verdicts = matrix.ssd_rule(cell, refs[:3] + higher, machine, PRICES, "cand")
+        self.assertEqual([v["verdict"] for v in verdicts], [stats.INCONCLUSIVE] * 3)
+        self.assertEqual(
+            verdicts[0]["numbers"]["main"]["missing"], {"B": "no reference run"}
+        )
+
+    def test_one_order_alone_decides_no_gate(self):
+        # m6-27b-churn plans one cand run per order. With B1 voided, order A
+        # alone would decide G10; the orders are different workloads (the
+        # Studio's 18G TTFT: 175 s in A, 136 s in B, DATA.md), so G10 is
+        # INCONCLUSIVE and its numbers name the order it lacks.
+        cell = next(c for c in self.spec["cells"] if c["name"] == "m6-27b-churn")
+        found = []
+        for label, tree, order, rows in (
+            ("pa", "pass", "A", 1000),
+            ("pb", "pass", "B", 1000),
+            ("ca", "cand", "A", 900),
+        ):
+            done = [
+                {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+                for w in range(3)
+            ]
+            r = churn_run(
+                self.directory, label, done, [status(900, rows=int(rows * 585))]
+            )
+            r.tree, r.order = tree, order
+            found.append(r)
+        verdicts = {
+            v["rule"]: v
+            for v in matrix.point_gate(
+                cell, found, self.machine, PRICES, self.gates, True
+            )
+        }
+        work = verdicts["G10 work vs pass"]
+        self.assertEqual(work["verdict"], stats.INCONCLUSIVE, work)
+        self.assertEqual(work["numbers"]["orders"], {"A": "1 vs 1"})
+        self.assertEqual(work["numbers"]["missing"], {"B": "no candidate run"})
+        result = stats.interval({"A": ([1.0], [1.0]), "B": ([], [1.0])}, 0.02, 10)
+        self.assertIsNone(result["pooled"])
+        self.assertEqual(result["missing"], {"B": ["candidate"]})
+
+    def test_a_noisy_single_comparison_waits_for_its_rerun(self):
+        # p-single 27B repeat 1: one metric's ABBA spread was past abba's 5 %
+        # limit (it measured nothing: "rerun idle"), so G7 is INCONCLUSIVE,
+        # not FAIL, until repeat 2 measures; repeat 2 passes and replaces it.
+        # The 35B's FAIL stays beside its later PASS.
+        cell = next(c for c in self.spec["cells"] if c["name"] == "p-single")
+        spec = {**self.with_cand_build(self.spec, "src-new"), "cells": [cell]}
+        rounds = [
+            {"version": version, "identity": {"build_id": build}}
+            for version, build in (
+                ("baseline", "p"),
+                ("candidate", "src-new"),
+                ("candidate", "src-new"),
+                ("baseline", "p"),
+            )
+        ]
+        measured = {"verdict": "pass", "pass": True}
+
+        def comparison(label, speed, failures):
+            (self.directory / f"{label}.backend-regression.json").write_text(
+                json.dumps(
+                    {
+                        "rounds": rounds,
+                        "comparison": {
+                            "speed": speed,
+                            "failures": failures,
+                            "pass": not failures,
+                        },
+                        "weights": {"pass": True},
+                        "pass": not failures,
+                    }
+                )
+            )
+
+        comparison(
+            "p-single-cand-27b-q4-1",
+            {"decode": {"verdict": "inconclusive", "pass": False}, "short": measured},
+            ["decode: INCONCLUSIVE (rerun idle): noise 5.83%"],
+        )
+        comparison(
+            "p-single-cand-35b-q4-1",
+            {"decode": {"verdict": "fail", "pass": False}},
+            ["decode: FAIL: regression +4.00% (bound 2.00%)"],
+        )
+        comparison("p-single-cand-35b-q4-2", {"decode": measured}, [])
+
+        def verdicts():
+            document = matrix.analyze(spec, [self.directory])
+            return document, {v["rule"]: v["verdict"] for v in document["verdicts"]}
+
+        self.assertEqual(
+            verdicts()[1],
+            {
+                "G7 p-single-cand-27b-q4-1": stats.INCONCLUSIVE,
+                "G7 p-single-cand-35b-q4-1": stats.FAIL,
+                "G7 p-single-cand-35b-q4-2": stats.PASS,
+            },
+        )
+        comparison("p-single-cand-27b-q4-2", {"decode": measured}, [])
+        document, found = verdicts()
+        self.assertEqual(
+            found,
+            {
+                "G7 p-single-cand-27b-q4-2": stats.PASS,
+                "G7 p-single-cand-35b-q4-1": stats.FAIL,
+                "G7 p-single-cand-35b-q4-2": stats.PASS,
+            },
+        )
+        self.assertEqual(
+            [(u["label"], u["reasons"]) for u in document["invalid"]],
+            [
+                (
+                    "p-single-cand-27b-q4-1",
+                    ["too noisy to measure, superseded by repeat 2"],
+                )
+            ],
+        )
 
     def test_a_trade_carries_the_numbers_of_its_gains(self):
         # cand trails r150 by 3 % in work with a clearly better TTFT; the

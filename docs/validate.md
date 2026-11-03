@@ -347,7 +347,7 @@ schema, and the client times what a user sees.
 
 | Scenario | Requests |
 | --- | --- |
-| `churn` | three clients, each sending 1500-token answers to prompts that grow every round (about 8K tokens, then more; `CHURN_BASE`/`CHURN_STEP` words), every fourth round resending its conversation, the first requests in a fixed arrival order (`--order 2,0,1` or `0,1,2`, 0.6 s apart), for `--minutes`; `/status` every 2 s |
+| `churn` | three clients, each sending 1500-token answers to prompts that grow every round (about 16K tokens, then more; `CHURN_BASE`/`CHURN_STEP` words), every fourth round resending its conversation, the first requests in a fixed arrival order (`--order 2,0,1` or `0,1,2`, 0.6 s apart), for `--minutes`; `/status` every 2 s |
 | `ttft` | for each N of `--n`, on a fresh server: N conversations cache an ~8K-token prefix one at a time, then send it with distinct ~300-token suffixes at the same instant, `--rounds` times, each round recording its `/status` counters' changes and the largest `memory_governor.claims` its samples showed; `/status` every 0.5 s |
 | `serve1` | one request at a time on an idle server, cold prompts of about `--sizes` tokens (300, 2K and 14K): time to first token and decode milliseconds per token; the `/status` each request waited idle for, and one after the last |
 | `warm` | per cached depth of `--sizes`, a fresh cold prefix, then 2 discarded and 8 measured ~300-token suffixes after it: the server's prompt time of each (`--trial` picks the texts, the same for every tree); `/status` as `serve1` |
@@ -473,7 +473,7 @@ resolve it.
 | --- | --- |
 | G1, G2 | work and decode rate against 1.5.0: within 5 % only with a clear gain on TTFT, completion latency, freezes (1.5.0's own runs with a decode gap at or past the machine's G4 floor while the candidate holds G4) or concurrent TTFT, else no loss at all; completion latency: no loss at all |
 | G3 | TTFT against main within 2 %, failing once surely worse; under a memory cap also when G2 passes, no decode froze, and the TTFT is not surely worse than the cell's best tree that kept decoding, INCONCLUSIVE when only a usable run of that tree is missing |
-| G4 | per candidate run: contended prefill p95 and the p99 of the client gaps between token events (chunks less than half the shortest decode command apart are one event's) within the run's own bound (`max(decode_gap_target_ms, u/0.1)` with its estimate's p95 error), every client gap under the smallest stall rejected on that machine |
+| G4 | per candidate run: contended prefill p95 (no higher than the largest unit: the status histogram reports a log2 bucket's upper edge) within the run's own bound (`max(decode_gap_target_ms, u/0.1)` with its estimate's p95 error), and the p99 of the client gaps between token events (chunks less than half the shortest decode command apart are one event's) within that bound plus their median, every client gap under the smallest stall rejected on that machine |
 | G5 | concurrent TTFT: per N the median of each round's worst, at most the reference's times one plus its own spread |
 | G6 | ample memory: work, latency and TTFT within 2 % of the best measured tree, failing once surely worse |
 | G7 | single requests (`test-performance-real` against the base, `serve1`, `warm`): `abba.compare` on every metric, in session; a single cell's job removes an earlier comparison before its make and copies only the one its make wrote |

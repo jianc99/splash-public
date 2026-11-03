@@ -91,13 +91,22 @@ def pooled_sigma(groups: list[list[float]]) -> tuple[float | None, int]:
 def interval(by_order: dict, sigma: float, df: int) -> dict:
     """The log ratio candidate/reference per order and pooled, with each
     one-sided 90 % half-width. by_order: {order: (candidate values,
-    reference values)}; orders lacking either side are left out."""
+    reference values)}, every order the gate compares. The orders differ (a
+    fixed arrival order is its own workload), so the pooled estimate needs
+    all of them: an order lacking either side is named in "missing" with
+    the sides it lacks, and the pooled estimate is None (INCONCLUSIVE)."""
     t = t_quantile(CONFIDENCE, df)
-    orders, differences, inverse = {}, [], []
+    orders, differences, inverse, missing = {}, [], [], {}
     for order, (candidate, reference) in sorted(by_order.items()):
         candidate = [v for v in candidate if v and v > 0]
         reference = [v for v in reference if v and v > 0]
-        if not candidate or not reference:
+        lacks = [
+            side
+            for side, values in (("candidate", candidate), ("reference", reference))
+            if not values
+        ]
+        if lacks:
+            missing[order] = lacks
             continue
         difference = statistics.fmean(map(math.log, candidate)) - statistics.fmean(
             map(math.log, reference)
@@ -111,13 +120,35 @@ def interval(by_order: dict, sigma: float, df: int) -> dict:
         }
         differences.append(difference)
         inverse.append(weight)
-    if not differences:
-        return {"orders": orders, "pooled": None, "sigma": sigma, "df": df, "t": t}
+    found = {"orders": orders, "missing": missing, "sigma": sigma, "df": df, "t": t}
+    if missing or not differences:
+        return {**found, "pooled": None}
     pooled = {
         "log_ratio": statistics.fmean(differences),
         "half_width": t * sigma * math.sqrt(sum(inverse)) / len(differences),
     }
-    return {"orders": orders, "pooled": pooled, "sigma": sigma, "df": df, "t": t}
+    return {**found, "pooled": pooled}
+
+
+def compared_text(result: dict) -> dict:
+    """The orders an interval compared, with each side's run count, and the
+    orders it lacked: what a verdict's numbers say about its runs."""
+    return {
+        "orders": {
+            order: f"{found['n_candidate']} vs {found['n_reference']}"
+            for order, found in result["orders"].items()
+        },
+        **(
+            {
+                "missing": {
+                    order: f"no {' or '.join(sides)} run"
+                    for order, sides in result["missing"].items()
+                }
+            }
+            if result["missing"]
+            else {}
+        ),
+    }
 
 
 def verdict(

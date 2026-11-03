@@ -249,8 +249,9 @@ def churn_doc(seed: int, words: int) -> str:
 
 
 def churn_messages(worker: int, round_number: int, base: int, step: int) -> list[dict]:
-    """A worker's request of one round: about 8K tokens at the default base
-    and step, then more each round."""
+    """A worker's request of one round, base + step x round words: its
+    first, round 1, about 16.2K tokens at the default base and step (2,000
+    words; DOC_TOKENS_PER_WORD), then 7.3K more each round."""
     words = base + step * round_number
     log = churn_doc(worker * 1000 + round_number, words)
     return [
@@ -784,13 +785,26 @@ def run_ttft(
 # Prompt sizes, in tokens, of the one-request-at-a-time scenario.
 SERVE1_SIZES = (300, 2048, 14336)
 SERVE1_OUTPUT_TOKENS = 256
-# Tokens per word of churn_doc's words under the Qwen tokenizers (a churn
-# round of 2,000 words is about 8K tokens).
-SERVE1_TOKENS_PER_WORD = 4
+# A prompt of churn_doc words ("amber-123456") takes DOC_FRAME_TOKENS +
+# DOC_TOKENS_PER_WORD x words tokens under the Qwen tokenizers, which split
+# digits one by one: fitted to the prompt_tokens the servers recorded, 75
+# words -> 662 and 512 -> 4,190 (serve1, smoke-s-serve1-pass-1-132500 and
+# smoke-a-mini-serve1-cand-1-201707), 2,000 -> 16,205-16,259 and 7,300 ->
+# 59,043-59,144 (churn first rounds, smoke-a-fn-churn-A1 and
+# smoke-a-s-fn-churn-18g-cand-A1-193918). The frame is the chat template
+# and the prompt's own text around the words.
+DOC_TOKENS_PER_WORD = 8.09
+DOC_FRAME_TOKENS = 50
+
+
+def doc_words(tokens: int) -> int:
+    """The churn_doc words of a prompt of about `tokens` tokens, at most
+    that many."""
+    return max(1, int((tokens - DOC_FRAME_TOKENS) / DOC_TOKENS_PER_WORD))
 
 
 def serve1_messages(size: int, sample: int) -> list[dict]:
-    log = churn_doc(10**6 + size * 100 + sample, max(1, size // SERVE1_TOKENS_PER_WORD))
+    log = churn_doc(10**6 + size * 100 + sample, doc_words(size))
     return [
         {
             "role": "user",
@@ -871,7 +885,7 @@ WARM_SUFFIX_TOKENS = 300
 
 
 def warm_prefix(depth: int, trial: int) -> list[dict]:
-    log = churn_doc(2 * 10**6 + depth + trial, max(1, depth // SERVE1_TOKENS_PER_WORD))
+    log = churn_doc(2 * 10**6 + depth + trial, doc_words(depth))
     return [
         {"role": "user", "content": f"Archive {depth}-{trial}:\n{log}\nReply with OK."}
     ]
@@ -879,8 +893,7 @@ def warm_prefix(depth: int, trial: int) -> list[dict]:
 
 def warm_suffix(prefix: list[dict], depth: int, trial: int, index: int) -> list[dict]:
     log = churn_doc(
-        3 * 10**6 + depth * 100 + trial * 10 + index,
-        WARM_SUFFIX_TOKENS // SERVE1_TOKENS_PER_WORD,
+        3 * 10**6 + depth * 100 + trial * 10 + index, doc_words(WARM_SUFFIX_TOKENS)
     )
     return prefix + [
         {"role": "assistant", "content": "OK."},

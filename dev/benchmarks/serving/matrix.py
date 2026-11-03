@@ -13,9 +13,10 @@ plan writes one job script per run, each holding the machine's GPU lock
 around run.py, interleaved so that no tree owns the start or end of a
 machine's queue (--references plans the reference runs a cell still lacks).
 check judges one run on its own (completion, structural minimum, health,
-bounded gaps), or lists the queued jobs running past twice their expected
-time. disk refuses (exit 1) a churn run whose free disk would leave its SSD
-cache incomparable with its references'. analyze applies the spec's gates
+bounded gaps, and with its cell every reason analyze would void it for), or
+lists the queued jobs running past twice their expected time. disk refuses
+(exit 1) a churn run whose free disk would leave its SSD cache incomparable
+with its references'. analyze applies the spec's gates
 (DESIGN-1.6.0 §8.3 as amended by amend/V.md §5 and the owner's rulings) to
 every cell with results, on the runs of each tree's builds under test
 (--build; several pooled when the change between them is behaviour-neutral;
@@ -918,7 +919,10 @@ def gap_bound(status: dict, share: float) -> dict | None:
     """amend/V.md A09: the run's own decode gap bound max(G, u/share) with u
     the units term of its last prefill estimate, and that estimate's p95
     relative error (schema 7; None for older trees, and while the scheduler
-    reports no target: the contract renders it 0 until a scheduler sets it)."""
+    reports no target: the contract renders it 0 until a scheduler sets it).
+    The contended units' p95 is a LatencyHistogram quantile, its log2
+    bucket's upper edge (runtime/model/LatencyHistogram.hpp), so it is read
+    no higher than the largest unit."""
     scheduler = status.get("scheduler") or {}
     target, estimate = (
         scheduler.get("decode_gap_target_ms"),
@@ -934,11 +938,11 @@ def gap_bound(status: dict, share: float) -> dict | None:
         ),
         0.0,
     )
+    p95 = value(scheduler, "contended_prefill_ms.p95", 0.0)
     return {
         "bound_ms": max(target, unit / share),
         "e95": value(estimate, "relative_error.p95", 0.0),
-        "contended_p95_ms": value(scheduler, "contended_prefill_ms.p95", 0.0),
-        "decode_gap_p50_ms": value(status, "metrics.decode_gap_ms.p50", 0.0),
+        "contended_p95_ms": min(p95, value(scheduler, "contended_prefill_ms.max", p95)),
         "decode_gap_max_ms": value(status, "metrics.decode_gap_ms.max", 0.0),
     }
 
@@ -1193,11 +1197,23 @@ def g8_failures(run: Run, gates: dict) -> list[str]:
 
 def health(run: Run, machine: dict, gates: dict) -> dict:
     """One candidate run on its own: G4 from its client gaps and its own
-    status, G8 and G9, and the readouts verdict.md reports."""
+    status, G8 and G9, and the readouts verdict.md reports. G4b allows the
+    typical gap with no prefill unit between two tokens (amend/V.md A09) as
+    the median of the same client gaps, exact where metrics.decode_gap_ms'
+    p50 is a log2 bucket's upper edge."""
     gaps, client_max = run.client_gaps()
     ordered = sorted(gaps)
-    p99 = ordered[min(len(ordered) - 1, int(0.99 * len(ordered)))] if ordered else 0.0
-    facts = {"client_gap_max_s": client_max, "client_gap_p99_s": p99, "failures": []}
+
+    def quantile(q):
+        return ordered[min(len(ordered) - 1, int(q * len(ordered)))] if ordered else 0.0
+
+    p50, p99 = quantile(0.5), quantile(0.99)
+    facts = {
+        "client_gap_max_s": client_max,
+        "client_gap_p99_s": p99,
+        "client_gap_p50_s": p50,
+        "failures": [],
+    }
     if client_max >= machine["g4c_floor_s"]:
         facts["failures"].append(
             f"G4c: a client gap of {client_max:.2f} s, the floor is {machine['g4c_floor_s']} s"
@@ -1210,9 +1226,9 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
             facts["failures"].append(
                 f"G4a: contended prefill p95 {bound['contended_p95_ms']:.0f} ms over {limit:.0f} ms"
             )
-        if p99 * 1000 > limit + bound["decode_gap_p50_ms"]:
+        if p99 * 1000 > limit + p50 * 1000:
             facts["failures"].append(
-                f"G4b: client gap p99 {p99 * 1000:.0f} ms over {limit + bound['decode_gap_p50_ms']:.0f} ms"
+                f"G4b: client gap p99 {p99 * 1000:.0f} ms over {limit + p50 * 1000:.0f} ms"
             )
         facts["gap_causes"] = gap_causes(run, limit / 1000)
     last = run.last
@@ -1497,11 +1513,13 @@ def churn_cell(
                         "freeze": froze,
                         "sigma": round(estimates[metric]["sigma"], 4),
                         "df": estimates[metric]["df"],
+                        **stats.compared_text(estimates[metric]),
                     },
                     trade=bool(result == PASS and trailing),
                 )
         if ttft:
-            estimate = compare(used, machine, prices, candidate, ttft, "ttft")["pooled"]
+            found = compare(used, machine, prices, candidate, ttft, "ttft")
+            estimate = found["pooled"]
             result, why = (
                 stats.verdict(estimate, False, gates["tolerance"]),
                 "interval rule",
@@ -1529,7 +1547,11 @@ def churn_cell(
             record(
                 f"G3 {candidate} vs {ttft}",
                 result,
-                {"ratio": stats.ratio_text(estimate), "why": why},
+                {
+                    "ratio": stats.ratio_text(estimate),
+                    "why": why,
+                    **stats.compared_text(found),
+                },
             )
         for reference in cell.get("best_measured", []):
             for metric in ("work", "latency", "ttft"):
@@ -1547,7 +1569,7 @@ def churn_cell(
                         trade=True,
                     )
         if cell.get("ssd"):
-            verdicts.extend(ssd_rule(cell, used, prices, candidate))
+            verdicts.extend(ssd_rule(cell, used, machine, prices, candidate))
         if release:
             verdicts.extend(envelope_rule(cell, used, candidate, set(release.values())))
         verdicts.extend(short_hits(cell, used, candidate))
@@ -1556,13 +1578,16 @@ def churn_cell(
     if cell.get("ample_gate"):
         reference = cell["ample_gate"]
         for metric in ("work", "latency", "ttft"):
-            estimate = compare(used, machine, prices, "cand", reference, metric)[
-                "pooled"
-            ]
+            found = compare(used, machine, prices, "cand", reference, metric)
             record(
                 f"G6 {metric} vs {reference}",
-                stats.verdict(estimate, HIGHER_IS_BETTER[metric], gates["tolerance"]),
-                {"ratio": stats.ratio_text(estimate)},
+                stats.verdict(
+                    found["pooled"], HIGHER_IS_BETTER[metric], gates["tolerance"]
+                ),
+                {
+                    "ratio": stats.ratio_text(found["pooled"]),
+                    **stats.compared_text(found),
+                },
             )
     if cell.get("point_gate"):
         verdicts.extend(
@@ -1578,22 +1603,24 @@ def point_gate(
     goes to the owner): work and TTFT of cand against the reference, PASS
     when the bound on the good side clears the tolerance, FAIL when the
     bound on the bad side is past equality, else INCONCLUSIVE; a G4 failure
-    fails it. A cell without runs on both sides is INCONCLUSIVE."""
+    fails it. A cell without runs on both sides in each order is
+    INCONCLUSIVE."""
     reference = cell["point_gate"]
     verdicts = []
     for metric in ("work", "ttft"):
-        estimate = compare(runs, machine, prices, "cand", reference, metric)["pooled"]
+        found = compare(runs, machine, prices, "cand", reference, metric)
+        estimate = found["pooled"]
         result = stats.verdict(estimate, HIGHER_IS_BETTER[metric], gates["tolerance"])
         verdicts.append(
             {
                 "cell": cell["name"],
                 "rule": f"G10 {metric} vs {reference}",
                 "verdict": FAIL if estimate and not g4_holds else result,
-                "numbers": estimate
-                and {
+                "numbers": {
                     "ratio": stats.ratio_text(estimate),
-                    "point": round(math.exp(estimate["log_ratio"]), 4),
+                    "point": estimate and round(math.exp(estimate["log_ratio"]), 4),
                     "g4_holds": g4_holds,
+                    **stats.compared_text(found),
                 },
             }
         )
@@ -1608,10 +1635,17 @@ def ssd_counters_of(cell: dict) -> list[str]:
     )
 
 
-def ssd_rule(cell: dict, runs: list[Run], prices, candidate: str) -> list[dict]:
+def ssd_rule(
+    cell: dict, runs: list[Run], machine: dict, prices, candidate: str
+) -> list[dict]:
     """amend/V.md A30: SSD bytes per unit of work against each release
-    reference, tolerance 0, sigma from the references' same-tree runs; FAIL
-    when the candidate is surely higher than every reference."""
+    reference, tolerance 0; FAIL when the candidate is surely higher than
+    every reference, PASS when it is not surely higher than one, else (a
+    reference it cannot be compared with in an order, surely higher than the
+    others) INCONCLUSIVE. Sigma as sigma_for takes it: pooled over the
+    compared trees' groups of one tree in one order, the candidate's
+    included, else the machine's recorded per-run sigma of SSD bytes per
+    work (the spec's "ssd"), so the ratios are always reported."""
     verdicts = []
     references = cell["ssd"]
     for counter in ssd_counters_of(cell):
@@ -1621,36 +1655,33 @@ def ssd_rule(cell: dict, runs: list[Run], prices, candidate: str) -> list[dict]:
                 found = ssd_counters(run, run.work(prices)).get(counter)
                 if found:
                     groups.setdefault((run.tree, run.order), []).append(found)
-        sigma, df = stats.pooled_sigma(
-            [v for (tree, _), v in groups.items() if tree in references]
-        )
+        sigma, df = stats.pooled_sigma(list(groups.values()))
         if sigma is None:
-            verdicts.append(
-                {
-                    "cell": cell["name"],
-                    "rule": f"SSD {counter}",
-                    "verdict": INCONCLUSIVE,
-                    "numbers": "no sigma",
-                }
-            )
-            continue
-        estimates, higher = {}, []
+            sigma, df = machine["sigma"]["ssd"]["sigma"], machine["sigma"]["ssd"]["df"]
+        numbers, higher, open_ = {"sigma": round(sigma, 4), "df": df}, [], []
         for reference in references:
             by_order = {
                 o: (groups.get((candidate, o), []), groups.get((reference, o), []))
                 for o in ("A", "B")
             }
-            estimate = stats.interval(by_order, sigma, df)["pooled"]
-            estimates[reference] = stats.ratio_text(estimate)
-            higher.append(
-                bool(estimate) and estimate["log_ratio"] - estimate["half_width"] > 0
-            )
+            found = stats.interval(by_order, sigma, df)
+            estimate = found["pooled"]
+            numbers[reference] = {
+                "ratio": stats.ratio_text(estimate),
+                **stats.compared_text(found),
+            }
+            if estimate is None:
+                open_.append(reference)
+            else:
+                higher.append(estimate["log_ratio"] - estimate["half_width"] > 0)
         verdicts.append(
             {
                 "cell": cell["name"],
                 "rule": f"SSD {counter}",
-                "verdict": FAIL if higher and all(higher) else PASS,
-                "numbers": estimates,
+                "verdict": (
+                    PASS if not all(higher) else INCONCLUSIVE if open_ else FAIL
+                ),
+                "numbers": numbers,
             }
         )
     return verdicts
@@ -1754,15 +1785,16 @@ def floor_rule(cell: dict, runs: list[Run], machine: dict, prices) -> list[dict]
     rule = cell["floor_rule"]
     results = {}
     for metric in ("work", "latency", "ttft"):
-        estimate = compare(
+        found = compare(
             runs, machine, prices, rule["candidate"], rule["reference"], metric
-        )["pooled"]
+        )
         results[metric] = [
-            stats.verdict(estimate, HIGHER_IS_BETTER[metric], 0.0),
-            stats.ratio_text(estimate),
+            stats.verdict(found["pooled"], HIGHER_IS_BETTER[metric], 0.0),
+            stats.ratio_text(found["pooled"]),
+            stats.compared_text(found),
         ]
-    better = [m for m, (v, _) in results.items() if v == PASS]
-    worse = [m for m, (v, _) in results.items() if v == FAIL]
+    better = [m for m, (v, *_) in results.items() if v == PASS]
+    worse = [m for m, (v, *_) in results.items() if v == FAIL]
     decision = (
         "floor = cap"
         if better and not worse
@@ -2157,6 +2189,33 @@ def round_build(document: dict, version: str) -> str | None:
     return builds.pop() if len(builds) == 1 else None
 
 
+def single_verdict(document: dict) -> str:
+    """G7 of one backend regression comparison: PASS when it passed;
+    INCONCLUSIVE when all it failed on is metrics whose ABBA spread was past
+    abba's noise limit (they measured nothing: "rerun idle"); else FAIL."""
+    if document.get("pass"):
+        return PASS
+    comparison = document.get("comparison") or {}
+    noisy = [
+        name
+        for name, result in (comparison.get("speed") or {}).items()
+        if result.get("verdict") == abba.INCONCLUSIVE
+    ]
+    others = [
+        failure
+        for failure in comparison.get("failures", [document.get("error")])
+        if not any(str(failure).startswith(f"{name}: ") for name in noisy)
+    ]
+    images = (document.get("weights") or {}).get("pass") or document.get(
+        "expect_image_change"
+    )
+    return (
+        INCONCLUSIVE
+        if noisy and not others and images and not document.get("error")
+        else FAIL
+    )
+
+
 def single_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
     """G7 of the backend benchmark comparisons (make test-performance-real
     BASELINE=pass), each copied beside the run's records as
@@ -2165,7 +2224,9 @@ def single_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list
     under test, and whose baseline rounds the baseline's where analyze is
     given it, and every one that ended in an error before it wrote its
     rounds (backend_regression.py writes them once all four ran), judged on
-    that error. The others are returned with why."""
+    that error. The others are returned with why. A comparison too noisy to
+    measure (single_verdict's INCONCLUSIVE) is superseded by a later repeat
+    that measured, and listed; a FAIL stays."""
     verdicts, unused = [], []
     for model in cell["models"]:
         tree = f"cand-{model}"
@@ -2180,6 +2241,7 @@ def single_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list
             if repeat.isdigit()
         )
         judged: dict[str, Path] = {}
+        rows: list[tuple[int, dict]] = []
         for repeat in repeats:
             label = run_label(cell["name"], tree, "-", repeat)
             for directory in results:
@@ -2219,14 +2281,31 @@ def single_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list
                 failures = (document.get("comparison") or {}).get(
                     "failures", [document.get("error")]
                 )
-                verdicts.append(
-                    {
-                        "cell": cell["name"],
-                        "rule": f"G7 {label}",
-                        "verdict": PASS if document.get("pass") else FAIL,
-                        "numbers": failures,
-                    }
+                rows.append(
+                    (
+                        repeat,
+                        {
+                            "cell": cell["name"],
+                            "rule": f"G7 {label}",
+                            "verdict": single_verdict(document),
+                            "numbers": failures,
+                        },
+                    )
                 )
+        measured = [r for r, row in rows if row["verdict"] != INCONCLUSIVE]
+        for repeat, row in rows:
+            later = [r for r in measured if r > repeat]
+            if row["verdict"] == INCONCLUSIVE and later:
+                unused.append(
+                    unused_entry(
+                        cell,
+                        row["rule"].removeprefix("G7 "),
+                        tree,
+                        [f"too noisy to measure, superseded by repeat {later[0]}"],
+                    )
+                )
+            else:
+                verdicts.append(row)
         if not judged:
             verdicts.append(
                 {
@@ -2463,14 +2542,40 @@ def check_run(
     machine: dict,
     gates: dict,
     streamed: bool = False,
+    spec: dict | None = None,
 ) -> list[str]:
-    """What is wrong with one churn run on its own: no DONE, an end before
-    its load window, a worker that completed nothing, an engine restart, HTTP
-    errors, a G4/G8/G9 failure of its own status and gaps, or, with
-    `streamed`, a model that did not start with its routed experts
-    streamed."""
+    """What is wrong with one run on its own, so that its job fails at once
+    rather than at the batch's analyze: no DONE, the server's own failures
+    (G8), and, for a run of a spec cell, every reason analyze would void it
+    for (validate: a process it did not start in the top five by CPU, the
+    laptop in use or another process's sleep assertion, heat, a busy GPU at
+    its start, another model, an ample start below the cap). A churn run
+    also: an end before its load window, a worker that completed nothing, a
+    G4/G9 failure of its own status and gaps, or, with `streamed`, a model
+    that did not start with its routed experts streamed."""
     run = Run(directory, label)
+    cell = next(
+        (c for c in (spec or {}).get("cells", []) if c["name"] == run.meta.get("cell")),
+        None,
+    )
     problems = [] if run.complete else ["the run did not end with DONE"]
+    if cell is not None:
+        run = Run(
+            directory,
+            label,
+            cell["name"],
+            run.meta.get("tree_name") or "",
+            window=work_second(cell),
+        )
+        validate(run, spec, cell)
+        # An end without DONE is the line above.
+        problems += [
+            f"voided: {reason}"
+            for reason in run.voided
+            if not reason.startswith("the run did not end with DONE")
+        ]
+    if (cell or run.meta).get("scenario", "churn") != "churn":
+        return problems + g8_failures(run, gates)
     if streamed and not value(
         run.samples[0]["status"] if run.samples else {}, "streamed_experts.cap_bytes"
     ):
@@ -2528,22 +2633,38 @@ def job_type(name: str) -> str:
     return name.split("-", 1)[-1].removesuffix(".sh").rsplit("-", 1)[0]
 
 
+# The line a final-test job writes inside its locks right before its run
+# (final160 lib.sh locked, the Studio's and the mini's cell wrappers).
+RUN_STARTED = re.compile(r"\brun started at epoch (\d+)")
+
+
+def measured_seconds(log: Path) -> float | None:
+    """How long a finished job's run took: from its RUN_STARTED line, else
+    its log's creation, to the log's last write; None unless the log ends
+    with EXIT=0 (a refusal, a failure or a stop measured nothing)."""
+    text = log.read_text(errors="replace")
+    lines = text.rstrip().splitlines()
+    if not lines or lines[-1] != "EXIT=0":
+        return None
+    status = log.stat()
+    started = RUN_STARTED.search(text)
+    return status.st_mtime - (int(started.group(1)) if started else status.st_birthtime)
+
+
 def overruns(
     queue: Path, now: float | None = None, churn_minutes: float = 20.0
 ) -> list[str]:
-    """Jobs in QUEUE/running past twice their expected time (owner 13:29):
-    the time the first finished job of the same type took on this machine,
-    from its log's creation to its last write, else the minutes the job
-    states (its "EXPECT=N" or "Expected ~N min" line, amend/base.md §2.10),
-    else `churn_minutes` per run (amend/V.md A104)."""
+    """Jobs in QUEUE/running past twice their expected time (owner 13:29),
+    the wait for their locks included: the first measured run of the same
+    type on this machine (amend/V.md A104: measured_seconds, its lock wait
+    left out), else the minutes the job states (its "EXPECT=N" or "Expected
+    ~N min" line, amend/base.md §2.10), else `churn_minutes` per run."""
     now = time.time() if now is None else now
     expected = {}
     for log in sorted((queue / "done").glob("*.sh.log")):
-        status = log.stat()
-        expected.setdefault(
-            job_type(log.name.removesuffix(".log")),
-            status.st_mtime - status.st_birthtime,
-        )
+        seconds = measured_seconds(log)
+        if seconds is not None:
+            expected.setdefault(job_type(log.name.removesuffix(".log")), seconds)
     late = []
     for log in sorted((queue / "running").glob("*.sh.log")):
         took = now - log.stat().st_birthtime
@@ -2795,7 +2916,11 @@ def parse_args(argv=None):
     c = commands.add_parser("check")
     c.add_argument("directory", type=Path, nargs="?")
     c.add_argument("label", nargs="?")
-    c.add_argument("--spec", type=Path, help="takes the machine's floors from it")
+    c.add_argument(
+        "--spec",
+        type=Path,
+        help="takes the machine's floors and the run's cell (its void rules) from it",
+    )
     c.add_argument("--machine", default="studio")
     c.add_argument("--minutes", type=float, help="the run's load window")
     c.add_argument(
@@ -2881,6 +3006,7 @@ def main(argv=None) -> int:
             spec["machines"][args.machine],
             spec["gates"],
             args.streamed,
+            spec,
         )
         for problem in problems:
             print(f"FAIL {problem}")
