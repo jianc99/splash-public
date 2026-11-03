@@ -185,15 +185,17 @@ void requireBooks(Served &served, const std::string &when) {
 // growing prompts and a decoder. At every sample the books hold; within each
 // level of the host the experts account moves one way only; through the
 // episodes and the drain after them the store's regrowth is A30's (owner
-// 11-03 03:55, RegrowthWatch): no unit it grew back is taken back within the
-// horizon, and it is never short of its cap for more than two settled passes
+// 11-03 03:55, RegrowthWatch): it does not oscillate (a regrow and take back
+// repeating within the horizon; coordinator 09:20), and it is never short of
+// its cap for more than two settled passes
 // while its next unit would grow by the rule's terms. B4's "back at its size
 // before each episode within its normal level" is not A30's: the fed
 // prompts' starts wait for memory at each normal level, and a unit grown into
 // free room then would go back to the start (MemoryLedger::grow holds it while
-// a start waits); the store grows back once none waits, after the episodes. A
-// critical level's drop to the floors within the horizon of a regrowth counts
-// as a take back here too. Every request completes or ends for capacity;
+// a start waits); the store grows back once none waits, after the episodes.
+// Without that hold it regrew and was taken back in each episode, 12 s apart:
+// an oscillation. A critical level's drop within the horizon of a regrowth
+// counts as a take back here too. Every request completes or ends for capacity;
 // Metal stays healthy.
 void testEpisodesKeepTheBooksAndRegrow() {
   const test::TemporaryDirectory root("splash-pressure-serving");
@@ -243,9 +245,9 @@ void testEpisodesKeepTheBooksAndRegrow() {
   }
   served.stepFor(60'000.0, [&] { served.watch(regrowth); },
                  [&] { return served.ended.size() == served.submitted.size(); });
-  require(regrowth.retaken == 0, std::to_string(regrowth.retaken) +
-                                     " store units were taken back within the value horizon of their regrowth:" +
-                                     regrowth.history);
+  require(regrowth.oscillations == 0, "the store oscillated: " + std::to_string(regrowth.retaken) +
+                                          " units taken back within the value horizon of their regrowth:" +
+                                          regrowth.history);
   require(regrowth.stuck.empty(), regrowth.stuck);
   std::string unended;
   for (const uint64_t id : served.submitted)

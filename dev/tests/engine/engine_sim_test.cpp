@@ -592,8 +592,9 @@ double estimatedPrice(const engine::CostEstimateSnapshot &estimate, const model:
 // takes a unit. Value may take a store unit for a long prompt's prefill
 // outside it (brief §2.12, DESIGN §0 19:45; which one is SIM-value's
 // question, on calibrated counterfactuals). The store's regrowth is A30's
-// (owner 11-03 03:55, RegrowthWatch): through the whole run no unit it grew
-// back is taken back within kValueHorizonSeconds, and it is never short of
+// (owner 11-03 03:55, RegrowthWatch): through the whole run it does not
+// oscillate (coordinator 09:20: an isolated take back is counted, not
+// failed), and it is never short of
 // its cap for more than two settled passes while its next unit would grow by
 // the rule's terms (#645: a store that shrinks and never regrows, 32.9
 // against 48.9 tokens a second). It regrows into free room after the take
@@ -671,14 +672,14 @@ void testChurnRegrowsAfterTheHostEpisode() {
     require(turns <= 1, at(machine) + "the store changed direction " + std::to_string(turns) +
                             " times at one host level (" + std::to_string(level) + ")");
   require(episodeShrank, at(machine) + "the host's episode took no store unit");
-  require(regrowth.retaken == 0, at(machine) + std::to_string(regrowth.retaken) +
-                                     " store units were taken back within the value horizon of their regrowth:" +
-                                     regrowth.history);
+  require(regrowth.oscillations == 0, at(machine) + "the store oscillated: " + std::to_string(regrowth.retaken) +
+                                          " units taken back within the value horizon of their regrowth:" +
+                                          regrowth.history);
   require(regrowth.stuck.empty(), at(machine) + regrowth.stuck + serving.holders());
   note(at(machine) + std::to_string(churn.finished.size()) + " requests, work " + std::to_string(churn.work()) +
        ", longest decode gap " + std::to_string(longestGap) + " ms of " + std::to_string(gapLimit) + ", " +
        std::to_string(givenOutside) + " units given outside the episode, " + std::to_string(regrowth.grows) +
-       " regrown, store " +
+       " regrown, " + std::to_string(regrowth.retaken) + " taken back within the horizon, store " +
        (backAt ? "back " + std::to_string((*backAt - release) / 1000.0) + " s after the episode"
                : "short to the churn's end (the most room the lanes left after the episode " +
                      std::to_string(roomAfter >> 20) + " MiB, its unit " + std::to_string(machine.store.unitBytes >> 20) +

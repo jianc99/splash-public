@@ -2,9 +2,11 @@
 
 // A pool's regrowth under amend/V.md A30 (owner 11-03 03:55) and the
 // ledger's growth rule (amend/M.md R3), watched at each control pass of a
-// serving loop: no unit it grew back is taken back within
-// kValueHorizonSeconds, by a claim of any class (the host's too, as
-// matrix.py's store churn counts them); and it is never left short of its
+// serving loop: it does not oscillate, a unit it grew back taken back within
+// kValueHorizonSeconds again within that of the last such take back
+// (coordinator 11-03 09:20, as matrix.py's store line judges it: an isolated
+// take back, by a claim of any class, the host's too, is counted, not failed);
+// and it is never left short of its
 // cap for more than two settled passes while its next unit would grow by the
 // rule's own terms: its regrowth gains at the rate claims take its units
 // (MemoryAccountSnapshot::regrowthSeconds; into free room also while no claim
@@ -42,6 +44,9 @@ public:
     } else if (units_ && units < *units_ && grownAt_ &&
                nowMilliseconds - *grownAt_ <= 1000.0 * engine::kValueHorizonSeconds) {
       ++retaken;
+      if (takenBackAt_ && nowMilliseconds - *takenBackAt_ <= 1000.0 * engine::kValueHorizonSeconds)
+        ++oscillations;
+      takenBackAt_ = nowMilliseconds;
       history += " regrew at " + seconds(*grownAt_) + ", taken back at " + seconds(nowMilliseconds) + ";";
     }
     units_ = units;
@@ -99,8 +104,9 @@ public:
     return terms + " (what it displaces costs less than its regrowth gains)";
   }
 
-  // Units grown back, and those taken back within the horizon of the last.
-  uint32_t grows = 0, retaken = 0;
+  // Units grown back, those taken back within the horizon of the last, and
+  // those taken back so within the horizon of the take back before.
+  uint32_t grows = 0, retaken = 0, oscillations = 0;
   std::string history, stuck;
 
 private:
@@ -108,7 +114,7 @@ private:
 
   std::string pool_;
   std::optional<uint32_t> units_;
-  std::optional<double> grownAt_, since_;
+  std::optional<double> grownAt_, takenBackAt_, since_;
   uint64_t passes_ = 0;
   uint32_t count_ = 0;
 };
