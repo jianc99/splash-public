@@ -1292,16 +1292,16 @@ struct Turns final {
       return std::nullopt;
     return found->second.front() - submitted.at(id);
   }
-  // The prefill units that ran while `decoder` decoded, and the decoder's
-  // gaps, as the harness's clock saw them.
-  [[nodiscard]] std::vector<double> contendedUnits(uint64_t decoder) const {
+  // The prefill units that ran while `decoder` decoded, as the harness's
+  // clock saw them.
+  [[nodiscard]] std::vector<test::EngineHarness::Command> contendedUnits(uint64_t decoder) const {
     const std::vector<double> &tokens = harness.events.tokenTimes.at(decoder);
-    std::vector<double> walls;
+    std::vector<test::EngineHarness::Command> units;
     for (const test::EngineHarness::Command &command : harness.commands())
       if (command.kind == WorkKind::Prefill && command.startMilliseconds > tokens.front() &&
           command.startMilliseconds < tokens.back())
-        walls.push_back(command.wallMilliseconds);
-    return walls;
+        units.push_back(command);
+    return units;
   }
 
   test::EngineHarness harness;
@@ -1341,8 +1341,13 @@ std::vector<double> turnsTogether(Turns &turns, uint64_t firstId, uint32_t count
 // past the prefix and an 8192-row command from nothing within 15 % of the
 // profile's walls; every contended prefill unit within the run's unit bound
 // by its price's p95 error (G4a, A09: each unit, not their p95); the
-// decoder's gaps within that and one decode command of its one lane. Then,
-// as the TTFT bench runs (no decoder, A74): N = 1, 2 and 4 turns together,
+// decoder's gaps within that and one decode command, of its lane and the
+// turn's that decodes its first tokens beside it. The bound stays G until
+// units of other pass counts identify u (owner 11-03 00:10): the first
+// contended command after compute-bound ones, its reads no longer hidden,
+// may run 20-25 % over its price, so its units, and the gaps beside them,
+// are held within a quarter over G instead. Then, as the TTFT bench runs
+// (no decoder, A74): N = 1, 2 and 4 turns together,
 // the worst of two within 1.51 times one turn's and the worst of four within
 // 1.71 times (the pass tree's statistics against its N=1, 4622 and 5247
 // against 3065 ms, A74), the four within 1.2 of each other (passes' gain,
@@ -1378,26 +1383,64 @@ void testTurnsSettleAndShareACommand() {
                       std::to_string(wall) + " ms");
   }
   const double bound = unitBound(scheduler);
-  std::vector<double> units = turns.contendedUnits(2);
+  const double firstBound = std::max(bound, 1.25 * scheduler.decodeGapTargetMilliseconds);
+  // The contended units, those of the first contended command (its passes)
+  // first.
+  const std::vector<test::EngineHarness::Command> contended = turns.contendedUnits(2);
+  size_t first = 0;
+  while (first < contended.size() && contended[first].lanes == contended.front().lanes &&
+         contended[first].passes == contended.front().passes && contended[first].pass == contended.front().pass + first)
+    ++first;
+  std::vector<double> units;
+  for (size_t index = first; index < contended.size(); ++index)
+    units.push_back(contended[index].wallMilliseconds);
   std::ranges::sort(units);
-  checks.expect(units.size() >= 20, "only " + std::to_string(units.size()) + " prefill units ran beside the decoder");
+  double longestFirst = 0.0;
+  for (size_t index = 0; index < first; ++index)
+    longestFirst = std::max(longestFirst, contended[index].wallMilliseconds);
+  double turnaround = 0.0;
+  for (const engine::CostTermSnapshot &term : scheduler.prefillEstimate.terms)
+    if (term.quantity == "units")
+      turnaround = term.millisecondsPerUnit;
+  const std::string terms = " (G " + std::to_string(scheduler.decodeGapTargetMilliseconds) + ", turnaround " +
+                            std::to_string(turnaround) + " ms, p95 error " +
+                            std::to_string(scheduler.prefillEstimate.relativeErrorP95) + ")";
+  checks.expect(contended.size() >= 20,
+                "only " + std::to_string(contended.size()) + " prefill units ran beside the decoder");
+  checks.expect(longestFirst <= firstBound, "the longest of the first contended command's " + std::to_string(first) +
+                                                " units, " + std::to_string(longestFirst) + " ms, passed " +
+                                                std::to_string(firstBound) + " ms" + terms);
   if (!units.empty()) {
     const double p95 = units[(units.size() * 95 + 99) / 100 - 1];
-    double turnaround = 0.0;
-    for (const engine::CostTermSnapshot &term : scheduler.prefillEstimate.terms)
-      if (term.quantity == "units")
-        turnaround = term.millisecondsPerUnit;
-    checks.expect(units.back() <= bound,
-                  "the longest of " + std::to_string(units.size()) + " contended prefill units, " +
-                      std::to_string(units.back()) + " ms (p95 " + std::to_string(p95) + "), passed the bound's " +
-                      std::to_string(bound) + " ms (G " + std::to_string(scheduler.decodeGapTargetMilliseconds) +
-                      ", turnaround " + std::to_string(turnaround) + " ms, p95 error " +
-                      std::to_string(scheduler.prefillEstimate.relativeErrorP95) + ")");
+    checks.expect(units.back() <= bound, "the longest of " + std::to_string(units.size()) +
+                                             " later contended prefill units, " + std::to_string(units.back()) +
+                                             " ms (p95 " + std::to_string(p95) + "), passed the bound's " +
+                                             std::to_string(bound) + " ms" + terms);
   }
-  const double command = decodeCommand(profile, 1, profile.measuredResidentShare, 0);
-  checks.expect(turns.harness.longestDecodeGap(2) <= bound + command,
-                "the decoder's longest gap, " + std::to_string(turns.harness.longestDecodeGap(2)) + " ms, passed " +
-                    std::to_string(bound + command) + " ms");
+  // The decoder's gaps, those with a unit of the first contended command
+  // apart.
+  const double command = decodeCommand(profile, 2, profile.measuredResidentShare, 0);
+  const std::vector<double> &tokens = turns.harness.events.tokenTimes.at(2);
+  double longest = 0.0, longestBesideFirst = 0.0;
+  for (size_t index = 1; index < tokens.size(); ++index) {
+    const double gap = tokens[index] - tokens[index - 1];
+    const bool besideFirst =
+        std::any_of(contended.begin(), contended.begin() + std::ptrdiff_t(first), [&](const auto &unit) {
+          return unit.startMilliseconds >= tokens[index - 1] && unit.startMilliseconds < tokens[index];
+        });
+    double &longestOfKind = besideFirst ? longestBesideFirst : longest;
+    longestOfKind = std::max(longestOfKind, gap);
+  }
+  checks.expect(longest <= bound + command, "the decoder's longest gap, " + std::to_string(longest) + " ms, passed " +
+                                                std::to_string(bound + command) + " ms");
+  checks.expect(longestBesideFirst <= firstBound + command,
+                "the decoder's longest gap beside the first contended command, " + std::to_string(longestBesideFirst) +
+                    " ms, passed " + std::to_string(firstBound + command) + " ms");
+  note("SIM-turns: " + std::to_string(contended.size()) + " contended units, the first command's " +
+       std::to_string(first) + " up to " + std::to_string(longestFirst) + " ms of " + std::to_string(firstBound) +
+       ", the rest up to " + std::to_string(units.empty() ? 0.0 : units.back()) + " ms of " + std::to_string(bound) +
+       "; the decoder's gaps up to " + std::to_string(longest) + " ms, " + std::to_string(longestBesideFirst) +
+       " ms beside the first command" + terms);
   turns.harness.engine.cancel(2);
   turns.harness.runUntilIdle();
   const double alone = turnsTogether(turns, id, 1, 0.0, prefix)[0];
