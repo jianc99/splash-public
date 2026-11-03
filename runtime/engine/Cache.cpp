@@ -2375,10 +2375,18 @@ std::optional<engine::Victim> Cache::peek(const VictimQuery &query, const engine
     return peekReclaim(walk, rates, after);
   const Unit afterUnit = after ? static_cast<Unit>(unitOfKey(after->key)) : Unit{};
   // A page need's free pages first: the other forms' empty extents, then a
-  // windowed cache's trims for Full pages; then its evictions.
+  // windowed cache's trims for Full pages; then its evictions, which free
+  // the pages of its form the cache holds beyond the free ones, and the Full
+  // pages a state that goes lets trim: of a form it holds none of, a walk
+  // would weigh every unit for none.
   if (walk.pages) {
+    const auto evictions = [&](const engine::Victim *previous) -> std::optional<engine::Victim> {
+      if (!previous && !trims(walk) && reusablePages(walk.scope.upTo, walk.form) <= pool_.freePageCount(walk.form))
+        return std::nullopt;
+      return peekReclaim(walk, rates, previous);
+    };
     if (after && afterUnit != Unit::Extent)
-      return peekReclaim(walk, rates, afterUnit == Unit::Reclaim ? after : nullptr);
+      return evictions(afterUnit == Unit::Reclaim ? after : nullptr);
     if (!after && (spill_ || window_)) {
       // The empty extents of the other forms beyond the runway each keeps.
       std::array<uint32_t, 3> empty{};
@@ -2393,7 +2401,7 @@ std::optional<engine::Victim> Cache::peek(const VictimQuery &query, const engine
     }
     if (const auto pages = static_cast<uint32_t>(std::min<size_t>(trimmedBy(walk).size(), trimRoom())))
       return engine::Victim{.key = unitKey(static_cast<uint8_t>(Unit::Trim), 0), .pages = pages};
-    return peekReclaim(walk, rates, nullptr);
+    return evictions(nullptr);
   }
   // A state need's units, a state each.
   WalkCursor cursor;

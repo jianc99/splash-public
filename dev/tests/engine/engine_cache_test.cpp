@@ -4600,6 +4600,42 @@ void testIndexShortfallCompactsOnlyFullExtents() {
     spill.pool.releasePage(page, false);
 }
 
+// A page need's evictions free the pages of its form the cache holds beyond
+// the free ones. Of a form it holds none of, as the Index form before any
+// Spill request ran, the cache offers no eviction, rather than one that
+// frees none of its pages after weighing every unit it holds: the Index
+// runway's refill, which the host refuses, asks every tick until it stands.
+// Once spilled pages are cached, their evictions are offered.
+void testAPageNeedOfAFormTheCacheHoldsNoneOfWeighsNothing() {
+  Spilling spill;
+  for (uint64_t id = 1; id <= 3; ++id) {
+    spill.start(id, Spilling::prompt(1000 * static_cast<uint32_t>(id), 4), 4, KvMode::Resident);
+    spill.cache.endRequest(id);
+  }
+  require(spill.pool.reclaimEmptyExtents(false, 1, kv::PageForm::Index) && !spill.pool.allocatedExtents(kv::PageForm::Index),
+          "the Index runway stayed");
+  const ClaimSpec refill{.cls = ClaimClass::Optional, .timing = NeedTiming::Immediate, .benefitSeconds = 0.0};
+  const MemoryRates rates;
+  const VictimQuery query{.claim = &refill,
+                          .need = {.bytes = 40, .hostRefused = true, .pages = 4, .form = kv::PageForm::Index},
+                          .rates = &rates};
+  uint32_t evictions = 0;
+  for (std::optional<engine::Victim> victim = spill.cache.peek(query, nullptr); victim;
+       victim = spill.cache.peek(query, &*victim))
+    evictions += !victim->pages && !victim->bytes;
+  require(!evictions, "a page need of a form the cache holds no page of was offered " + std::to_string(evictions) +
+                          " units that free none, each weighed over every cached unit");
+  // A Spill request's pages spill into Index extents, and stay cached.
+  spill.start(4, Spilling::prompt(5000, 10), 10);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  spill.cache.endRequest(4);
+  bool freesIndexPages = false;
+  for (std::optional<engine::Victim> victim = spill.cache.peek(query, nullptr); victim && !freesIndexPages;
+       victim = spill.cache.peek(query, &*victim))
+    freesIndexPages = victim->pages != 0 && victim->form == kv::PageForm::Index;
+  require(freesIndexPages, "cached Index pages were not offered to a page need of their form");
+}
+
 // The idle pages a state in use restores through are out of an Ordinary
 // reclaim's reach, each counted against the reusable pages of its own form:
 // a spilled chain's Index pages never against the Full pages, of which the
@@ -6937,6 +6973,7 @@ int main() {
     testFullReclaimReachesAnIdleSpilledChain();
     testFullShortfallReleasesEmptyIndexExtents();
     testIndexShortfallCompactsOnlyFullExtents();
+    testAPageNeedOfAFormTheCacheHoldsNoneOfWeighsNothing();
     testReusablePagesCountTheirForm();
     testPendingPagesCountWritesThatSpill();
     testWritesThatFreeNothingHoldNothingBack();
