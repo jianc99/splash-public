@@ -1546,6 +1546,29 @@ void storeRegrowsByDisplacement(MemoryPressure pressure) {
 void testStoreRegrowsByDisplacementUnderPersistentWarning() { storeRegrowsByDisplacement(MemoryPressure::Warning); }
 void testStoreRegrowsByDisplacementInTheBand() { storeRegrowsByDisplacement(MemoryPressure::Normal); }
 
+// Under macOS's warning, while the host lacks nothing past its margin, the
+// store a unit short grows back before the host's pass, which may take only
+// cache then, takes the cache it displaces (amend/M.md B4: one unit of
+// copied cache is enough; the base's growExperts ran before the reclaim
+// under the warning alone): it takes the one unit of copied cache there is
+// for its own, the host's footprint unchanged.
+void testTheStoreRegrowsBeforeTheWarningPassTakesItsCache() {
+  // 1.5 GiB of headroom beside the engine's 7.5 GiB.
+  Fixture fixture(host(1536 * kMiB + 7680 * kMiB, MemoryPressure::Warning), 8 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
+  TestSource cache("cache", &fixture.memory);
+  fixture.memory.hold("cache", kGiB);
+  fixture.memory.hold("weights", 3584 * kMiB);
+  cache.units = {unit(1, kGiB, 0.05)};
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  serve(ledger, experts, 400.0, 0.0, 10.0);
+  static_cast<void>(fixture.pass(10.5));
+  require(experts.units() == 4 && cache.taken == std::vector<uint64_t>{1} && fixture.memory.total() == 7680 * kMiB,
+          "under the warning alone the host's pass took the cache the store grows back by");
+}
+
 // A pool's growth waits on nothing but its own victims (R3, amend/M.md B4):
 // neither on a landing a waiting lane is owed (V's M-P3: the landing pays
 // its owner first) nor on another lane's owed copies. A lane waits for its
@@ -2149,6 +2172,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testWarningAloneTakesNoPoolUnit", testWarningAloneTakesNoPoolUnit},
       {"testStoreRegrowsByDisplacementUnderPersistentWarning", testStoreRegrowsByDisplacementUnderPersistentWarning},
       {"testStoreRegrowsByDisplacementInTheBand", testStoreRegrowsByDisplacementInTheBand},
+      {"testTheStoreRegrowsBeforeTheWarningPassTakesItsCache", testTheStoreRegrowsBeforeTheWarningPassTakesItsCache},
       {"testGrowthPendsOnlyOnItsOwnVictims", testGrowthPendsOnlyOnItsOwnVictims},
       {"testDisplacementTakesNothingItCannotGrowInto", testDisplacementTakesNothingItCannotGrowInto},
       {"testAClaimLacksTheRoomHeldAboveIt", testAClaimLacksTheRoomHeldAboveIt},

@@ -271,12 +271,13 @@ public:
   [[nodiscard]] bool claimWaiting() const noexcept;
   // The control pass's decision, between commands: under macOS's critical
   // pressure every pool to its floor and the host claim takes all it may;
-  // otherwise, on a pass the host has settled from the last one that
-  // returned memory, under macOS's warning the host claim frees the margin
-  // (cache only while the host lacks nothing past it), and in the band it
-  // frees the deficit; then the pools grow (MemoryLedger::grow). True when
-  // the host claim waits for memory on its way back: the transport runs the
-  // pass again at the next command-free point.
+  // otherwise the pools grow (MemoryLedger::grow) and, on a pass the host
+  // has settled from the last one that returned memory, under macOS's
+  // warning the host claim frees the margin from cache alone while the host
+  // lacks nothing past it; with a deficit, under macOS's warning or in the
+  // band, the host claim frees the margin or the deficit first and the pools
+  // grow after it. True when the host claim waits for memory on its way
+  // back: the transport runs the pass again at the next command-free point.
   [[nodiscard]] bool controlPass(double nowMilliseconds);
   // At startup, before Ready: grows the pools into the free room.
   void growToTargets(double nowMilliseconds);
