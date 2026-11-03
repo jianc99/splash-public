@@ -1338,7 +1338,8 @@ std::vector<double> turnsTogether(Turns &turns, uint64_t firstId, uint32_t count
 // decoder, four 300-row turns 2 s apart past an 8K cached prefix. After
 // those five commands and more, the prefill estimate prices a 300-row turn
 // past the prefix and an 8192-row command from nothing within 15 % of the
-// profile's walls; every contended prefill unit within the run's unit bound
+// profile's walls, the latter in the passes the engine runs it in while u is
+// unidentified (below); every contended prefill unit within the run's unit bound
 // by its price's p95 error (G4a, A09: each unit, not their p95); the
 // decoder's gaps within that and one decode command, of its lane and the
 // turn's that decodes its first tokens beside it. The bound stays G until
@@ -1372,14 +1373,36 @@ void testTurnsSettleAndShareACommand() {
   checks.expect(scheduler.prefillEstimate.samples >= 5,
                 "only " + std::to_string(scheduler.prefillEstimate.samples) + " prefill units trained the estimate");
   test::TimedWork work(profile);
+  double turnaround = 0.0;
+  for (const engine::CostTermSnapshot &term : scheduler.prefillEstimate.terms)
+    if (term.quantity == "units")
+      turnaround = term.millisecondsPerUnit;
+  // The 8192-row command from nothing is priced as the engine runs it. Once
+  // the units term identifies u, as one command; until then (owner 11-03
+  // 00:10: the bound stays G until units of other pass counts identify u,
+  // the turnaround folded into the work rates) in the passes this run gave
+  // the 8192-row prefix, a lone prompt the bound holds (Scheduler::groups),
+  // whose turnarounds those rates hold: priced as one pass it carries the
+  // others' (47 x 60 ms on this profile, +23.7 %), a shape the engine does
+  // not run while u is unknown.
+  uint32_t prefixPasses = 1;
+  for (const test::EngineHarness::Command &command : turns.harness.commands())
+    if (command.kind == WorkKind::Prefill && command.lanes == std::vector<uint64_t>{1}) {
+      prefixPasses = command.passes;
+      break;
+    }
   for (const model::PrefillLane lane : {model::PrefillLane{8192, 300, 0}, model::PrefillLane{0, 8192, 0}}) {
-    const model::CommandWork shape = work.prefillWork({&lane, 1}, 0, 1);
-    const double predicted = estimatedPrice(scheduler.prefillEstimate, shape);
-    const double wall = test::prefillTimes(profile, shape).wallMilliseconds;
+    const uint32_t passes = lane.rows == 8192 && turnaround <= 0.0 ? prefixPasses : 1;
+    double predicted = 0.0, wall = 0.0;
+    for (uint32_t pass = 0; pass < passes; ++pass) {
+      const model::CommandWork shape = work.prefillWork({&lane, 1}, pass, passes);
+      predicted += estimatedPrice(scheduler.prefillEstimate, shape);
+      wall += test::prefillTimes(profile, shape).wallMilliseconds;
+    }
     checks.expect(std::abs(predicted - wall) <= 0.15 * wall,
                   "the prefill estimate priced " + std::to_string(lane.rows) + " rows from " +
-                      std::to_string(lane.position) + " at " + std::to_string(predicted) + " ms against the profile's " +
-                      std::to_string(wall) + " ms");
+                      std::to_string(lane.position) + " in " + std::to_string(passes) + " passes at " +
+                      std::to_string(predicted) + " ms against the profile's " + std::to_string(wall) + " ms");
   }
   const double bound = unitBound(scheduler);
   const double firstBound = std::max(bound, 1.25 * scheduler.decodeGapTargetMilliseconds);
@@ -1397,10 +1420,6 @@ void testTurnsSettleAndShareACommand() {
   double longestFirst = 0.0;
   for (size_t index = 0; index < first; ++index)
     longestFirst = std::max(longestFirst, contended[index].wallMilliseconds);
-  double turnaround = 0.0;
-  for (const engine::CostTermSnapshot &term : scheduler.prefillEstimate.terms)
-    if (term.quantity == "units")
-      turnaround = term.millisecondsPerUnit;
   const std::string terms = " (G " + std::to_string(scheduler.decodeGapTargetMilliseconds) + ", turnaround " +
                             std::to_string(turnaround) + " ms, p95 error " +
                             std::to_string(scheduler.prefillEstimate.relativeErrorP95) + ")";
