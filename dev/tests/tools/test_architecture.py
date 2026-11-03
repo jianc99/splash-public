@@ -160,7 +160,14 @@ class ArchitectureTests(unittest.TestCase):
                     for symbol in symbols:
                         with self.subTest(source=relative, symbol=symbol):
                             source.write_text(f"auto size = ops::{symbol};")
-                            errors = check_architecture.check()
+                            # Only this rule's findings: in an engine policy file a
+                            # symbol such as MoeExpertTile also trips R3, which
+                            # test_engine_policy_names_no_model_mechanism covers.
+                            errors = [
+                                error
+                                for error in check_architecture.check()
+                                if error.endswith("owns an operator workspace policy")
+                            ]
                             layer = relative.split("/")[1]
                             self.assertEqual(
                                 errors,
