@@ -41,6 +41,9 @@ public:
     if (units_ && units > *units_) {
       grownAt_ = nowMilliseconds;
       ++grows;
+      // A unit grew: the store is not stuck, whatever it lacks still.
+      since_.reset();
+      count_ = 0;
     } else if (units_ && units < *units_ && grownAt_ &&
                nowMilliseconds - *grownAt_ <= 1000.0 * engine::kValueHorizonSeconds) {
       ++retaken;
