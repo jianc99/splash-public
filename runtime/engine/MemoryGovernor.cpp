@@ -222,7 +222,8 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   // host admits it by its class.
   const ClaimState &claim = ledger_.claim(scope_);
   const bool fits = engineFits && ledger_.heldBytes(scope_, growing_) <= limitBytes_ - observed - requested;
-  const bool hostAdmits = hostRule_.admits(claim.spec.cls, bytes, claim.hostExempt, scopeCredit_);
+  const bool hostAdmits =
+      hostRule_.admits(claim.spec.cls, hostBytes(claim.spec.cls, bytes, scopeCredit_), claim.hostExempt, scopeCredit_);
   if (!fits || !hostAdmits) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
@@ -430,8 +431,19 @@ FreeResult MemoryGovernor::hostPass(uint64_t target, bool critical, bool deficit
   return result;
 }
 
+uint64_t MemoryGovernor::hostBytes(ClaimClass cls, uint64_t bytes, uint64_t creditBytes) const noexcept {
+  if (cls != ClaimClass::Growth || bytes <= creditBytes)
+    return bytes;
+  const uint64_t waiting = ledger_.hostRefusedWaitingBytes();
+  return bytes <= std::numeric_limits<uint64_t>::max() - waiting ? bytes + waiting
+                                                                 : std::numeric_limits<uint64_t>::max();
+}
+
 GrowthHost MemoryGovernor::growthHost(bool displaces) {
-  return {.admits = [this](uint64_t bytes) { return hostRule_.admits(ClaimClass::Growth, bytes, false, 0); },
+  return {.admits =
+              [this](uint64_t bytes) {
+                return hostRule_.admits(ClaimClass::Growth, hostBytes(ClaimClass::Growth, bytes, 0), false, 0);
+              },
           .displaces = displaces,
           .grow = [this](ClaimId claim, AccountId account, model::ElasticPool &pool, uint64_t credit) {
             const Scope scope(*this, claim, account, credit);

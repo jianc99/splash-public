@@ -909,6 +909,54 @@ void testAHostRefusedStartIsAdmittedWithinTwoPasses() {
   }
 }
 
+// A pool's growth beyond its credit leaves the host, besides the margin,
+// what the starts it refused wait for (design/M.md R4: the deficit pass
+// frees what a waiting start lacks): a pool whose next unit fits in the
+// headroom past the margin does not take the room freed for the start, which
+// is admitted at its retry. As on the M6 with the expert store one 117 MiB
+// remainder chunk below its cap and a start of 300 MiB: in the band (1124 MiB
+// of headroom, cache that frees once its copies land, the control pass the
+// first to see them land) and outside it within one pass (1224 MiB, cache
+// that frees at once). Once the start gives its memory back the store grows.
+void testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor() {
+  constexpr uint64_t kChunk = 117 * kMiB;
+  constexpr uint64_t kNeed = 300 * kMiB;
+  struct Case final {
+    uint64_t headroom;
+    bool later;
+    const char *what;
+  };
+  for (const Case &scenario :
+       {Case{1124 * kMiB, true, "the store grew in the band into what landed for a start the host refused"},
+        Case{1224 * kMiB, false, "the store grew into what a pass freed for a start the host refused"}}) {
+    Fixture fixture(host(scenario.headroom + kChunk + 2 * kGiB));
+    FakeElasticPool experts("experts", fixture.memory, kChunk, 1, 2, 3, 1, 0.2, 60.0);
+    fixture.ledger().addPool(experts);
+    TestSource cache("cache", &fixture.memory);
+    for (uint64_t key = 1; key <= 16; ++key)
+      cache.units.push_back(unit(key, 128 * kMiB, 0.1, scenario.later));
+    fixture.memory.hold("cache", 2 * kGiB);
+    fixture.ledger().addSource(cache);
+    static_cast<void>(fixture.governor->evaluate());
+    const ClaimId start = fixture.ledger().open(request(1, RequestPriority::Normal, ClaimClass::Start));
+    fixture.ledger().setHostRefusedWaiting(start, true);
+    require(fixture.allocate(start, kNeed).failure == metal::AllocationFailure::HostPressure,
+            "the start was not refused by the host");
+    static_cast<void>(fixture.governor->free(start, fixture.governor->need(start)));
+    static_cast<void>(fixture.pass(1.0));
+    if (scenario.later) {
+      cache.land();
+      static_cast<void>(fixture.pass(2.5));
+    }
+    const bool admitted = static_cast<bool>(fixture.allocate(start, kNeed));
+    require(admitted && experts.units() == 1, scenario.what);
+    fixture.ledger().close(start);
+    fixture.memory.release("kv", kNeed);
+    static_cast<void>(fixture.pass(4.0));
+    require(experts.units() == 2, "the store did not grow into what a start the host refused gave back");
+  }
+}
+
 // AMENDMENTS Borrowed 1: /status reports a pool's price at its edge beside
 // the uniform spread, and the rule keeps the uniform input. On a concave
 // miss curve the ghost hits within a unit of the newest ghosts, and the hits
@@ -2435,6 +2483,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testEveryHostPassGivesBackIdleBuffers", testEveryHostPassGivesBackIdleBuffers},
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
       {"testAHostRefusedStartIsAdmittedWithinTwoPasses", testAHostRefusedStartIsAdmittedWithinTwoPasses},
+      {"testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor", testGrowthLeavesTheHostWhatAStartItRefusedWaitsFor},
       {"testTheMarginalPriceIsReportedBesideTheUniform", testTheMarginalPriceIsReportedBesideTheUniform},
       {"testTheMarginalPriceIsTheUnitsShareOfItsCounts", testTheMarginalPriceIsTheUnitsShareOfItsCounts},
       {"testCheapestPerByteFirstAcrossSources", testCheapestPerByteFirstAcrossSources},

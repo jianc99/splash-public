@@ -345,6 +345,10 @@ private:
   [[nodiscard]] uint64_t roomBytes() const noexcept;
   // HostRule::sample at a fresh sample of the host.
   void sampleHostRule(const std::optional<HostMemory> &host) noexcept;
+  // The bytes the host's rule weighs an allocation of the class at: a pool's
+  // growth beyond its credit leaves the host what the claims it refused wait
+  // for (hostRefusedWaitingBytes) besides the margin.
+  [[nodiscard]] uint64_t hostBytes(ClaimClass cls, uint64_t bytes, uint64_t creditBytes) const noexcept;
   [[nodiscard]] GrowthHost growthHost(bool displaces);
   // The admission's reservation for the scope's claim, or nothing with the
   // cause of the refusal in failure.
