@@ -821,13 +821,16 @@ def ssd_counters(run: Run, work: float | None) -> dict:
 
 
 def store_churn(run: Run, horizon: float) -> dict:
-    """The experts' grows and shrinks over the run, and the units taken back
-    within `horizon` seconds of the regrow that brought them (amend/V.md
-    A30: must be none)."""
+    """The experts' grows and shrinks over the run, the units taken back
+    within `horizon` seconds of the regrow that brought them, and of those
+    the ones taken back within `horizon` of the take back before, where a
+    regrow and its take back repeat: an oscillation (amend/V.md A30,
+    coordinator 11-03 09:20: an isolated take back is counted, an
+    oscillation fails; engine-sim's RegrowthWatch judges it alike)."""
     series = [(s["t"], store_size(s["status"])) for s in run.samples]
     series = [(t, size) for t, size in series if size is not None]
-    grows = shrinks = retaken = 0
-    last_grow = None
+    grows = shrinks = retaken = oscillations = 0
+    last_grow = last_take_back = None
     for (_, before), (t, after) in zip(series, series[1:]):
         if after > before:
             grows += 1
@@ -836,7 +839,15 @@ def store_churn(run: Run, horizon: float) -> dict:
             shrinks += 1
             if last_grow is not None and t - last_grow <= horizon:
                 retaken += 1
-    return {"grows": grows, "shrinks": shrinks, "taken_back_within_horizon": retaken}
+                if last_take_back is not None and t - last_take_back <= horizon:
+                    oscillations += 1
+                last_take_back = t
+    return {
+        "grows": grows,
+        "shrinks": shrinks,
+        "taken_back_within_horizon": retaken,
+        "oscillations": oscillations,
+    }
 
 
 def queue_readouts(run: Run) -> dict:
@@ -1268,6 +1279,7 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
         "client_gap_p99_s": p99,
         "client_gap_p50_s": p50,
         "failures": [],
+        "notes": [],
     }
     if client_max >= machine["g4c_floor_s"]:
         facts["failures"].append(
@@ -1314,11 +1326,20 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
         facts["failures"].append(
             f"G9: {value(last, 'memory_governor.owed.bytes')} bytes owed at the idle end"
         )
-    store = store_churn(run, gates["value_horizon_seconds"])
-    if store["taken_back_within_horizon"]:
+    horizon = gates["value_horizon_seconds"]
+    store = store_churn(run, horizon)
+    if store["oscillations"]:
         facts["failures"].append(
-            f"store: {store['taken_back_within_horizon']} units taken back within "
-            f"{gates['value_horizon_seconds']} s of their regrow"
+            f"store: {store['oscillations']} regrown units taken back within "
+            f"{horizon} s of an earlier take back (oscillation; "
+            f"{store['taken_back_within_horizon']} taken back within {horizon} s "
+            "of their regrow)"
+        )
+    elif store["taken_back_within_horizon"]:
+        facts["notes"].append(
+            f"store: {store['taken_back_within_horizon']} regrown units taken back "
+            f"within {horizon} s of their regrow, none again within {horizon} s "
+            "(isolated take backs, counted)"
         )
     units = counter_delta(run, "scheduler.prefill_units")
     memory, facts["series"] = host_memory(run, gates["unbooked_growth_bytes"])
@@ -1482,6 +1503,9 @@ def churn_cell(
         unbooked = facts["readouts"]["unbooked"]
         if isinstance(unbooked, dict) and unbooked["past_bound"]:
             record(f"unbooked memory {run.label}", "report", unbooked)
+        store = facts["readouts"]["store"]
+        if store["taken_back_within_horizon"] and not store["oscillations"]:
+            record(f"store take backs {run.label}", "report", store)
         conflicts = facts["readouts"]["index_page_conflicts_per_15min"]
         if (
             conflicts is not None
@@ -2609,6 +2633,7 @@ def check_run(
     gates: dict,
     streamed: bool = False,
     spec: dict | None = None,
+    notes: list[str] | None = None,
 ) -> list[str]:
     """What is wrong with one run on its own, so that its job fails at once
     rather than at the batch's analyze: no DONE, the server's own failures
@@ -2618,7 +2643,8 @@ def check_run(
     its start, another model, an ample start below the cap). A churn run
     also: an end before its load window, a worker that completed nothing, a
     G4/G9 failure of its own status and gaps, or, with `streamed`, a model
-    that did not start with its routed experts streamed."""
+    that did not start with its routed experts streamed. What a churn run's
+    health only reports (isolated store take backs) goes to `notes`."""
     run = Run(directory, label)
     cell = next(
         (c for c in (spec or {}).get("cells", []) if c["name"] == run.meta.get("cell")),
@@ -2652,7 +2678,10 @@ def check_run(
     missing = [f"w{w}" for w in range(clients.CHURN_WORKERS) if f"w{w}" not in workers]
     if missing:
         problems.append(f"workers that completed no request: {missing}")
-    return problems + health(run, machine, gates)["failures"]
+    facts = health(run, machine, gates)
+    if notes is not None:
+        notes += facts["notes"]
+    return problems + facts["failures"]
 
 
 def free_bytes(directory: Path) -> int:
@@ -3065,6 +3094,7 @@ def main(argv=None) -> int:
                 print(f"LATE {line}")
             return 1 if late else 0
         spec = load_spec(args.spec or DEFAULT_SPEC)
+        notes = []
         problems = check_run(
             args.directory,
             args.label,
@@ -3073,7 +3103,10 @@ def main(argv=None) -> int:
             spec["gates"],
             args.streamed,
             spec,
+            notes,
         )
+        for note in notes:
+            print(f"NOTE {note}")
         for problem in problems:
             print(f"FAIL {problem}")
         print("check: " + ("FAIL" if problems else "PASS"))

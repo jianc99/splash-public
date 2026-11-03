@@ -1862,7 +1862,68 @@ class GateTests(unittest.TestCase):
         run_ = churn_run(self.directory, "store", [], samples)
         self.assertEqual(
             matrix.store_churn(run_, 60),
-            {"grows": 2, "shrinks": 2, "taken_back_within_horizon": 1},
+            {
+                "grows": 2,
+                "shrinks": 2,
+                "taken_back_within_horizon": 1,
+                "oscillations": 0,
+            },
+        )
+
+    def store_run(self, label, sizes):
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        samples = [
+            self.schema7(t, streamed_experts__chunks=size, memory_governor__accounts=[])
+            for t, size in sizes
+        ]
+        return churn_run(self.directory, label, done, samples)
+
+    def test_store_fails_only_when_its_take_backs_oscillate(self):
+        # Coordinator 11-03 09:20 (AMENDMENTS end): a regrown unit taken back
+        # within the horizon once is counted and reported, not failed; one
+        # taken back again within the horizon of that take back (a
+        # regrow/take cycle repeating, 12 s apart as in pressure-serving's
+        # two episodes) is an oscillation and fails the check.
+        isolated = self.store_run(
+            "isolated", [(0, 4), (10, 5), (40, 4), (200, 5), (230, 4), (900, 4)]
+        )
+        facts = matrix.health(isolated, self.machine, self.gates)
+        self.assertFalse(
+            [f for f in facts["failures"] if f.startswith("store")], facts["failures"]
+        )
+        self.assertEqual(facts["readouts"]["store"]["taken_back_within_horizon"], 2)
+        self.assertEqual(facts["readouts"]["store"]["oscillations"], 0)
+        self.assertIn(
+            "store: 2 regrown units taken back within 60 s of their regrow, "
+            "none again within 60 s (isolated take backs, counted)",
+            facts["notes"],
+        )
+        cycling = self.store_run(
+            "cycling", [(0, 4), (8, 5), (10, 4), (20, 5), (22, 4), (900, 4)]
+        )
+        facts = matrix.health(cycling, self.machine, self.gates)
+        self.assertIn(
+            "store: 1 regrown units taken back within 60 s of an earlier take back "
+            "(oscillation; 2 taken back within 60 s of their regrow)",
+            facts["failures"],
+        )
+
+    def test_check_reports_isolated_take_backs_without_failing(self):
+        self.store_run("noted", [(0, 4), (10, 5), (40, 4), (960, 4)])
+        notes = []
+        problems = matrix.check_run(
+            self.directory, "noted", 15, self.machine, self.gates, notes=notes
+        )
+        self.assertFalse([p for p in problems if p.startswith("store")], problems)
+        self.assertEqual(
+            notes,
+            [
+                "store: 1 regrown units taken back within 60 s of their regrow, "
+                "none again within 60 s (isolated take backs, counted)"
+            ],
         )
 
     def test_prefill_wall_follows_the_lanes_progress(self):
