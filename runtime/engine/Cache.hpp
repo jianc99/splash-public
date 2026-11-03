@@ -767,6 +767,10 @@ public:
   // complete beside every landing, which returning()'s landing bytes count
   // (amend/M.md B5).
   [[nodiscard]] Returning returningFor(std::span<const uint64_t> requestIds) const noexcept;
+  // The pages the demotions in flight free as they land, by form:
+  // returning()'s landing pages less the Full pages that spill once their
+  // copies land, which free only as spillWritten() moves them.
+  [[nodiscard]] std::array<uint32_t, 3> demotedPages() const noexcept;
   // The chains the requests waiting to start restore (their admission
   // probes): the KV of every block of each, and the state at its last, which
   // the request resumes from (CacheProbe::restoredChain), are of certain
@@ -1362,8 +1366,6 @@ private:
   // A demotion in flight frees its page as its copy lands: the page of a
   // leaf no state in RAM keeps (pollTierTransfers) and no request holds.
   [[nodiscard]] bool freesOnLanding(const Write &write) const noexcept;
-  // The pages the demotions in flight free as they land, by form.
-  [[nodiscard]] std::array<uint32_t, 3> demotedPages() const noexcept;
   // The bytes of the whole extents `pages` pages add to the free pages of
   // their form and `beside` more pages that free before them (Returning),
   // past the empty one a runway keeps with keepRunway.

@@ -168,7 +168,9 @@ public:
   // order, are at most those the pool releases and those take() says the
   // copies it started complete as they land (laterBytes), and their pages
   // at most the pages of the need's form that free, now or as demotions
-  // land, with what was started landed and the query's units taken again,
+  // land (Cache::demotedPages: a page that spills once its copy lands frees
+  // only as spillWritten() moves it, which no retry does), with what was
+  // started landed and the query's units taken again,
   // as a waiting claim's retries take a unit's later steps; an Immediate
   // claim, as free() does, passes over those that land later. Each unit of
   // a device need releases exactly what it was weighed
@@ -201,7 +203,7 @@ public:
       victims.push_back(*victim);
     }
     const auto pagesOf = [&] {
-      return pool_.freePageCount(form) + cache_.returning().landingPages[static_cast<size_t>(form)];
+      return pool_.freePageCount(form) + cache_.demotedPages()[static_cast<size_t>(form)];
     };
     const size_t writes = tier_.writes.size();
     const uint64_t offloads = cache_.snapshot().stateCache.offloads;
@@ -233,7 +235,7 @@ public:
     // the claim's retries take: what was started lands, the pages that frees
     // past the landing pages counted when it started count, and the query's
     // units are taken again until they free what was weighed or none goes.
-    const auto landingOf = [&] { return cache_.returning().landingPages[static_cast<size_t>(form)]; };
+    const auto landingOf = [&] { return cache_.demotedPages()[static_cast<size_t>(form)]; };
     for (uint32_t retry = 0; retry < 64 && (freed < predicted || freedPages < predictedPages); ++retry) {
       const uint64_t before = pool_.allocatedBytes();
       const uint32_t freeBefore = pool_.freePageCount(form), landingBefore = landingOf();
@@ -501,7 +503,9 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // the extent they empty leaves the next demotions out of reach. And windowed
 // seed 28462: in it a unit takes the state on a block whose demotion is in
 // flight and on which a request's chain ends, so its page frees as nothing
-// lands.
+// lands. Plain seeds 11208, 99256 and 229505: in them a page the walk
+// weighed frees at a landing that lets a poisoned subtree go, beside copies
+// whose pages spill as they land, which free nothing until spillWritten().
 void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
   uint64_t exact = 0, unsure = 0, landing = 0;
   const auto check = [&](uint32_t seed, bool windowed) {
@@ -526,8 +530,10 @@ void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
   check(9349, true);
   check(25949, true);
   check(28462, true);
+  for (const uint32_t seed : {11208u, 99256u, 229505u})
+    check(seed, false);
   std::cout << "cache peek runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
-            << " windowed and windowed seeds 2484, 9349, 25949 and 28462; " << exact
+            << " windowed and the fixed seeds; " << exact
             << " units released what they were weighed at, "
             << unsure << " after a copy or a write, " << landing
             << " freeing extents as their copies land, never more than taken\n";
