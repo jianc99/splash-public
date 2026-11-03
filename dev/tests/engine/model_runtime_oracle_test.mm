@@ -206,11 +206,28 @@ std::string mebibytes(uint64_t bytes) {
   std::exit(1);
 }
 
+// The last allocation of the oracle that was refused (governedFor): the
+// bytes it asked for, and the governor's limit and what it charged then.
+struct OracleRefusal final {
+  uint64_t requestedBytes = 0, limitBytes = 0, chargedBytes = 0;
+};
+OracleRefusal lastRefusal;
+
+// A refusal of `failure`'s cause, as a check it fails names it, with what
+// the governor said to the last refused allocation.
+std::string refused(metal::AllocationFailure failure) {
+  return std::string(" (") + metal::allocationFailureName(failure) + ": " +
+         std::to_string(lastRefusal.requestedBytes) + " bytes requested, the governor's limit " +
+         std::to_string(lastRefusal.limitBytes) + " bytes, " + std::to_string(lastRefusal.chargedBytes) +
+         " bytes charged)";
+}
+
 // The admission of what the oracle allocates for `need` through `governor`,
 // inside the oracle's Floor claim, so that only its limit and macOS's
 // critical pressure refuse it. It reads macOS's level before each allocation, as the
 // engine's control pass reads it between commands, and stops the run at
-// critical pressure or when it cannot read the level.
+// critical pressure or when it cannot read the level; any other refusal it
+// keeps in lastRefusal.
 metal::AllocationAdmission governedFor(MemoryGovernor &governor, std::string need) {
   return [admit = governor.allocationAdmission(), &governor, need = std::move(need)](
              uint64_t bytes, const std::function<void()> &allocate) {
@@ -222,6 +239,10 @@ metal::AllocationAdmission governedFor(MemoryGovernor &governor, std::string nee
     if (result.failure == metal::AllocationFailure::HostPressure)
       stopForHostMemory("the memory governor refused " + mebibytes(bytes) + " for " + need +
                         " under macOS's critical memory pressure; close other programs and retry");
+    if (!result) {
+      const MemoryGovernorSnapshot memory = governor.snapshot();
+      lastRefusal = {bytes, memory.limitBytes, memory.chargedBytes};
+    }
     return result;
   };
 }
@@ -3510,11 +3531,12 @@ public:
     const uint64_t arenaBytes = plan.sharedPrefillPlannedAllocatedBytes + plan.sharedDecodePlannedAllocatedBytes;
     // Every row verified: the two runs of one schedule that
     // requireSpilledKvMatchesResident compares must verify the same rows.
-    require(static_cast<bool>(admission(arenaBytes, [&] {
-              runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_,
-                                                     &stream_, model::VerifyRows::All});
-            })),
-            "the spill runtime's arenas exceed the oracle Metal budget");
+    const metal::AllocationResult arenas = admission(arenaBytes, [&] {
+      runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_, &stream_,
+                                             model::VerifyRows::All});
+    });
+    require(static_cast<bool>(arenas),
+            "the spill runtime's arenas exceed the oracle Metal budget" + refused(arenas.failure));
   }
 
   [[nodiscard]] model::Runtime &runtime() { return *runtime_; }
@@ -3522,6 +3544,24 @@ public:
   [[nodiscard]] const model::KvBlockCache &blockCache() const { return cache_; }
   [[nodiscard]] const model::KvHistoryStream &historyStream() const { return stream_; }
   [[nodiscard]] uint32_t densePages() const noexcept { return densePages_; }
+
+  // The most four requests of `tokens`-token prompts that decode
+  // `decodeTokens` more, two of them spilling, allocate beside what the
+  // runtime holds now: the lanes' states; the Full extents of the four
+  // lanes' pages past those the pool holds, which it keeps from run to run;
+  // the Index extents of the spilling lanes' pages; a prompt's history
+  // staging; and the hot block cache's floor for the two spilling lanes,
+  // required(2) slots in whole extents, which it keeps beside the next
+  // run's staging.
+  [[nodiscard]] uint64_t peakBytes(uint32_t tokens, uint32_t decodeTokens) const {
+    const uint64_t lanePages = pagesFor(uint64_t{tokens} + decodeTokens);
+    const auto extents = [&](uint64_t pages) { return (pages + extentPages_ - 1) / extentPages_; };
+    const uint64_t extentSlots = uint64_t{extentPages_} << SPLASH_ATTENTION_LOCATION_BLOCK_BITS;
+    return 4 * states_.layout().laneBytes() +
+           (extents(4 * lanePages) - pool_.allocatedExtents(kv::PageForm::Full)) * kv_.extentBytes() +
+           extents(2 * lanePages) * kv_.extentBytes(kv::PageForm::Index) + stream_.shortfallBytes(pagesFor(tokens)) +
+           (shape_.requiredSlots(2) + extentSlots - 1) / extentSlots * cache_.extentBytes();
+  }
 
   void begin(SpillRequest &request) {
     EngineRequest engineRequest = makeRequest(request.id, request.prompt, 4096);
@@ -3537,9 +3577,11 @@ public:
                     const std::function<void()> &afterPass = {}) {
     const uint32_t position = request.committed;
     ensure(request, end);
-    if (request.holdsIndexPages())
-      require(runtime_->reserveHistoryStaging(request.id, pagesFor(end)).granted(),
-              "the staging of a spilled history was refused");
+    if (request.holdsIndexPages()) {
+      const model::ModelMemoryAdmission staging = runtime_->reserveHistoryStaging(request.id, pagesFor(end));
+      require(staging.granted(),
+              "the staging of a spilled history was refused" + refused(staging.allocationFailure));
+    }
     const std::span<const uint32_t> input = std::span(request.prompt).subspan(position, end - position);
     const std::array items{item(request, position, end - position, input)};
     std::vector<ModelStepResult> results;
@@ -3579,8 +3621,11 @@ public:
     bool indexed = false;
     for (SpillRequest *request : requests) {
       ensure(*request, request->committed + model::ExecutionLimits::targetVerifyRows);
-      if (request->holdsIndexPages())
-        require(runtime_->reserveSpilledReads(request->id).granted(), "a lane's floor of the hot block cache was refused");
+      if (request->holdsIndexPages()) {
+        const model::ModelMemoryAdmission floor = runtime_->reserveSpilledReads(request->id);
+        require(floor.granted(),
+                "a lane's floor of the hot block cache was refused" + refused(floor.allocationFailure));
+      }
       indexed = indexed || request->holdsIndexPages();
       plan.items.push_back({request->id, 0});
       items.push_back(item(*request, request->committed, 0, {}));
@@ -3627,8 +3672,8 @@ public:
   // waited.
   void requireReadsRunAgain(SpillRequest &request, uint32_t end) {
     ensure(request, end);
-    require(runtime_->reserveHistoryStaging(request.id, pagesFor(end)).granted(),
-            "the staging of a spilled history was refused");
+    const model::ModelMemoryAdmission staging = runtime_->reserveHistoryStaging(request.id, pagesFor(end));
+    require(staging.granted(), "the staging of a spilled history was refused" + refused(staging.allocationFailure));
     size_t unreadable = request.pages.size() - 1;
     while (!request.copies[unreadable]) --unreadable;
     const uint32_t firstPage = request.committed / kv::kPageTokens, endPage = pagesFor(end);
@@ -3673,7 +3718,7 @@ public:
     }
     if (moving.empty()) return;
     const engine::KvPageMoveResult moved = pool_.movePages(moving, kv::PageForm::Index);
-    require(moved.granted(), "a spill run's pages did not move to the index form");
+    require(moved.granted(), "a spill run's pages did not move to the index form" + refused(moved.failure));
     for (size_t index = 0; index < places.size(); ++index) {
       for (uint32_t layer = 0; layer < layout_.attentionLayers; ++layer)
         for (const std::span<std::byte> tensor : kv_.layerSpans(moving[index], layer))
@@ -3699,7 +3744,7 @@ public:
       }
     if (moving.empty()) return;
     const engine::KvPageMoveResult moved = pool_.movePages(moving, kv::PageForm::Full);
-    require(moved.granted(), "a spill run's pages did not move back to the full form");
+    require(moved.granted(), "a spill run's pages did not move back to the full form" + refused(moved.failure));
     model::KvReadBuffer buffer;
     for (size_t index = 0; index < places.size(); ++index) {
       const uint32_t page = moved.moves.follow(moving[index]);
@@ -3743,7 +3788,7 @@ private:
     if (needed <= request.pages.size()) return;
     const engine::KvPageAcquisition acquired =
         pool_.acquirePages(needed - static_cast<uint32_t>(request.pages.size()));
-    require(acquired.granted(), "a spill run's pages were refused");
+    require(acquired.granted(), "a spill run's pages were refused" + refused(acquired.failure));
     for (const uint32_t page : acquired.pages) {
       pool_.clearPage(page);
       request.pages.push_back(page);
@@ -3876,7 +3921,8 @@ struct SpillRecord final {
 // prompt reserved between them; and a verify over Index pages without block
 // lists, of rows that read their page table, is refused.
 void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::LoadedModel &model,
-                                      const ops::ExecutionPlans &operators, const metal::AllocationAdmission &admission,
+                                      const std::filesystem::path &modelRoot, const ops::ExecutionPlans &operators,
+                                      const metal::AllocationAdmission &admission, const MemoryGovernor &governor,
                                       kv::Format format, ops::GdnStateFormat stateFormat, const SpillOptions &options) {
   constexpr uint32_t kCycles = 4;
   constexpr uint32_t kDecodeTokens = (1 + 4 * kCycles) * model::ExecutionLimits::targetVerifyRows;
@@ -3889,17 +3935,50 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   const uint32_t lanePages = (tokens + kDecodeTokens) / kv::kPageTokens + 2;
   SpillRuntime spill(backend, model, operators, admission, format, stateFormat, options, lanePages);
   model::Runtime &runtime = spill.runtime();
-  // Each prompt's commands: the first, then the runtime's groups, at least
-  // one of them past pages that spilled.
-  std::array<std::vector<uint32_t>, 4> ends;
-  for (uint32_t index = 0; index < ends.size(); ++index) {
-    std::vector<uint32_t> &commands = ends[index];
-    commands = {std::min(tokens, firstEnd + (index < 2 ? kIntoPage : 0))};
-    while (commands.back() < tokens)
-      commands.push_back(std::min(tokens, commands.back() + runtime.prefillGroupRows(true)));
-    require(commands.size() > 1 &&
-                commands[commands.size() - 2] / kv::kPageTokens > spill.densePages() + options.windowPages,
-            "--spill-tokens leaves no prefill command whose history spilled");
+  // Each prompt's commands for prompts of `count` tokens: the first, then
+  // the runtime's groups; and whether at least one of each prompt's is past
+  // pages that spilled.
+  const auto commandsOf = [&](uint32_t count) {
+    std::array<std::vector<uint32_t>, 4> result;
+    for (uint32_t index = 0; index < result.size(); ++index) {
+      std::vector<uint32_t> &commands = result[index];
+      commands = {std::min(count, firstEnd + (index < 2 ? kIntoPage : 0))};
+      while (commands.back() < count)
+        commands.push_back(std::min(count, commands.back() + runtime.prefillGroupRows(true)));
+    }
+    return result;
+  };
+  const auto streams = [&](const std::array<std::vector<uint32_t>, 4> &lists) {
+    return std::ranges::all_of(lists, [&](const std::vector<uint32_t> &commands) {
+      return commands.size() > 1 &&
+             commands[commands.size() - 2] / kv::kPageTokens > spill.densePages() + options.windowPages;
+    });
+  };
+  const std::array<std::vector<uint32_t>, 4> ends = commandsOf(tokens);
+  require(streams(ends), "--spill-tokens leaves no prefill command whose history spilled");
+  // The check can neither wait for memory nor yield it, so it stops before
+  // its first prompt where its peak exceeds the room the governor's limit
+  // leaves, naming what fits: the routed experts' store smaller by what the
+  // room lacks, in whole MiB, where that store still loads (no smaller than
+  // the smallest store, model::StreamableWeights::expertMinimumBytes), or
+  // the longest prompts of whole prefill chunks whose peak it holds and whose
+  // commands still stream.
+  const uint64_t room = governor.snapshot().headroomBytes;
+  if (const uint64_t need = spill.peakBytes(tokens, kDecodeTokens); need > room) {
+    std::string fits;
+    if (const model::ExpertStore *store = model.expertStore()) {
+      const uint64_t live = store->stats().liveBytes;
+      const uint64_t size = live > need - room ? (live - (need - room)) >> 20 << 20 : 0;
+      if (size >= model::streamableWeights(modelRoot, model.descriptor, {.streamExperts = true}).expertMinimumBytes)
+        fits = "--expert-memory " + std::to_string(size >> 20) + "M";
+    }
+    constexpr uint32_t kChunk = model::ExecutionLimits::prefillTokenBudget;
+    uint32_t fitting = tokens / kChunk * kChunk;
+    while (fitting && spill.peakBytes(fitting, kDecodeTokens) > room) fitting -= kChunk;
+    if (fitting && streams(commandsOf(fitting)))
+      fits += (fits.empty() ? "--spill-tokens " : " or --spill-tokens ") + std::to_string(fitting);
+    fail("the spill check needs " + mebibytes(need) + " beside what the oracle holds, and the memory plan's limit "
+         "leaves " + mebibytes(room) + (fits.empty() ? std::string() : "; it fits with " + fits));
   }
   std::array<std::vector<uint32_t>, 4> prompts;
   for (uint32_t index = 0; index < prompts.size(); ++index) {
@@ -4078,9 +4157,11 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     spill.begin(leaving);
     for (size_t command = 0; command < ends[0].size() - suspends; ++command)
       static_cast<void>(spill.prefill(leaving, ends[0][command]));
-    if (suspends)
-      require(runtime.reserveHistoryStaging(leaving.id, (tokens + kv::kPageTokens - 1) / kv::kPageTokens).granted(),
-              "the staging of a spilled history was refused");
+    if (suspends) {
+      const model::ModelMemoryAdmission reserved =
+          runtime.reserveHistoryStaging(leaving.id, (tokens + kv::kPageTokens - 1) / kv::kPageTokens);
+      require(reserved.granted(), "the staging of a spilled history was refused" + refused(reserved.allocationFailure));
+    }
     require(leaving.holdsIndexPages() && spill.historyStream().stats().stagingBytes,
             "a prompt that streams its history held no staging");
     if (suspends) runtime.suspend(leaving.id);
@@ -4100,8 +4181,9 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   static_cast<void>(spill.prefill(beside, static_cast<uint32_t>(beside.prompt.size())));
   for (size_t command = 0; command + 1 < ends[0].size(); ++command)
     static_cast<void>(spill.prefill(leaving, ends[0][command]));
-  require(runtime.reserveHistoryStaging(leaving.id, (tokens + kv::kPageTokens - 1) / kv::kPageTokens).granted(),
-          "the staging of a spilled history was refused");
+  const model::ModelMemoryAdmission reserved =
+      runtime.reserveHistoryStaging(leaving.id, (tokens + kv::kPageTokens - 1) / kv::kPageTokens);
+  require(reserved.granted(), "the staging of a spilled history was refused" + refused(reserved.allocationFailure));
   const uint64_t leftStaging = spill.historyStream().stats().stagingBytes;
   static_cast<void>(spill.decode(std::array{&beside}, [&] { spill.end(leaving); }));
   require(leftStaging && spill.historyStream().stats().stagingBytes == leftStaging,
@@ -4380,7 +4462,8 @@ int main(int argc, char **argv) {
     // a pool and a runtime of its own that the context the oracle asks the
     // split to leave does not count.
     if (model.descriptor.capabilities.sparseKv && (spillOnly || !(imagesOnly || warmupEosOnly || prefillGroupsOnly)))
-      requireSpilledKvMatchesResident(backend, model, operators, governed, format, stateFormat, spill);
+      requireSpilledKvMatchesResident(backend, model, modelRoot, operators, governed, governor, format, stateFormat,
+                                      spill);
     if (spillOnly) {
       require(model.descriptor.capabilities.sparseKv.has_value(), "--spill-only needs a block-sparse target");
       std::cout << "PASS model-runtime-oracle scope=spill-only model=" << model.name()
