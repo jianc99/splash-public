@@ -220,17 +220,22 @@ std::vector<uint64_t> Scheduler::admissionOrder() const {
 
 std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAdmission> candidates,
                                                        const PlanInputs &in) const {
-  std::vector<Lane> pending;
-  pending.reserve(candidates.size());
-  for (const auto &candidate : candidates) {
-    const Request &value = get(candidate.requestId);
+  // A request admission has not started, from the tokens it starts at.
+  const auto unstarted = [&](const PrefillAdmission &entry) {
+    const Request &value = get(entry.requestId);
     if (value.suspended ||
         (value.phase != Phase::Queued && value.phase != Phase::WaitingResources &&
          value.phase != Phase::WaitingPrefix) ||
-        candidate.cachedTokens >= value.spec.prefillTokens)
+        entry.cachedTokens >= value.spec.prefillTokens)
       throw std::logic_error("invalid pending prefill admission");
-    pending.push_back(lane(value, candidate.cachedTokens, in));
-  }
+    return lane(value, entry.cachedTokens, in);
+  };
+  std::vector<Lane> pending;
+  pending.reserve(candidates.size());
+  for (const auto &candidate : candidates)
+    pending.push_back(unstarted(candidate));
+  // The lanes ahead of the candidates: the resident prefill lanes, and the
+  // requests restoring their prefix, which prefill once it lands.
   std::vector<Lane> lanes;
   lanes.reserve(requests_.size());
   std::vector<uint64_t> result;
@@ -238,13 +243,18 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
     if (request.phase == Phase::Prefill)
       lanes.push_back(lane(request, request.promptProcessed, in));
   }
+  for (const auto &restoring : in.restoring)
+    lanes.push_back(unstarted(restoring));
   // Admission starts only lanes the next command serves and leaves waiting
-  // for no other prompt: one whose prompt its rows end, one it leads or that
-  // leads next, every lane ordered before it ending its prompt there, or an
-  // overdue one (amend/S.md A103). A start holds its memory from its first
-  // command to its last, so a prompt that would join with the rows that
-  // spare it a command and then wait out another's stays queued until it
-  // leads. Admission plans again without the candidates a plan does not
+  // for no other prompt (amend/S.md A103): one whose prompt the command
+  // ends, an overdue one, or one it leads or that leads next, every lane
+  // ordered before it ending its prompt there. A start holds its memory from
+  // its first command to its last, so a prompt that would join with the rows
+  // that spare it a command and then wait out another's prompt stays queued
+  // until it leads. One that leads next starts beside no Spill lane, as two
+  // Spill lanes prefill together only as the later one leads or one is
+  // overdue (A100 (3)): beside the last command of a Spill lane it stays
+  // queued too. Admission plans again without the candidates a plan does not
   // serve until it serves all it plans, as without them the plan can take
   // another leader.
   std::optional<Planned> planned;
@@ -264,7 +274,8 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
     std::erase_if(pending, [&](const Lane &view) {
       return !holds(items, view.request->spec.id) ||
              (!view.overdue && !ends(view) && std::ranges::any_of(ready, [&](const Lane &other) {
-                return other.request != view.request && leadsBefore(other, view) && !ends(other);
+                return other.request != view.request && leadsBefore(other, view) &&
+                       (!ends(other) || other.shape.spill);
               }));
     });
   } while (pending.size() != count);
@@ -275,7 +286,7 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
                     get(planned->plan.items.front().requestId).spec.priority)
     return result;
   for (const auto &item : planned->plan.items)
-    if (get(item.requestId).phase != Phase::Prefill)
+    if (std::ranges::any_of(pending, [&](const Lane &view) { return view.request->spec.id == item.requestId; }))
       result.push_back(item.requestId);
   return result;
 }

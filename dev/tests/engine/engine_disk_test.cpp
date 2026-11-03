@@ -1697,6 +1697,55 @@ void testCancelledRestoringProducerReleasesItsWaiter() {
           "the sibling did not restore the prefix itself");
 }
 
+// A start restoring its prefix from disk is a lane ahead of every later
+// candidate (amend/S.md A103): a later prompt that would neither lead it
+// nor end in the next command waits for scheduling while the restore is in
+// flight, and starts no sooner than beside the restored prompt's last
+// command.
+void testALaterPromptWaitsForARestoringPromptThatLeadsIt() {
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  // 64 tokens whose state is on disk and 3000 more: 3000 rows once
+  // restored, against the later prompt's 3100.
+  std::vector<uint32_t> prompt(3064);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  publishDiskState(cache, prompt);
+  executor.restoreControl->ready = false;
+  engine.submit(request(1, prompt));
+  std::vector<uint32_t> later(3100);
+  std::iota(later.begin(), later.end(), 1u << 20);
+  engine.submit(request(2, later));
+  double now = 1;
+  for (; now <= 3; ++now)
+    static_cast<void>(engine.tick(now));
+  require(executor.diskReads == 1 && events.startIds.empty(),
+          "a later prompt started while a prompt that leads it restored its prefix");
+  executor.restoreControl->ready = true;
+  // Whether the later prompt started while the restored one had more than
+  // its last command left.
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  bool early = false;
+  tickUntil(
+      engine, now,
+      [&] {
+        if (std::ranges::count(events.startIds, 2u) == 0)
+          return false;
+        for (const ActiveRequestSnapshot &active : engine.snapshot().activeRequests)
+          early = early || (active.id == 1 && active.phase == Phase::Prefill &&
+                            active.promptTokens - active.promptProcessed > chunk);
+        return true;
+      },
+      "the later prompt did not start");
+  runUntilIdle(engine);
+  require(!early && events.startIds.front() == 1 && events.completedCount == 2 && events.failedCount == 0,
+          "the later prompt started before the restored one's last command, which it waited for");
+}
+
 // A request whose restore could not fit ignores the cache until it starts:
 // it uses no producer's state, so it does not wait for one, even for one
 // restoring the same prefix with a boundary planned inside it, and no
@@ -1751,16 +1800,17 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   std::vector<uint32_t> sibling = producer;
   std::fill(sibling.begin() + 160, sibling.end(), 9);
   engine.submit(request(3, sibling));
+  // While the producer restores, the request that skips the cache waits for
+  // scheduling only, behind the Foreground prompt it would wait out
+  // (amend/S.md A103), not for the producer's prefix.
   double now = 101;
-  tickUntil(engine, now,
-            [&] {
-              return std::find(events.startIds.begin(), events.startIds.end(), 1) !=
-                     events.startIds.end();
-            },
-            "the request that skips the cache did not start");
-  require(events.starts.front() == 0 &&
-              executor.diskReads == 1 && executor.restored == 0,
-          "the request that skips the cache waited for the restoring producer");
+  for (; now < 111; ++now)
+    static_cast<void>(engine.tick(now));
+  const EngineSnapshot counts = engine.snapshot();
+  const auto skipping = std::ranges::find(counts.activeRequests, 1u, &ActiveRequestSnapshot::id);
+  require(executor.diskReads == 1 && events.startIds.empty() && skipping != counts.activeRequests.end() &&
+              skipping->phase != Phase::WaitingPrefix,
+          "the request that skips the cache waited for the restoring producer's prefix, or started below it");
   executor.restoreControl->ready = true;
   for (; now < 300 && !idle(engine); ++now) {
     static_cast<void>(engine.tick(now));
@@ -1768,8 +1818,12 @@ void testSkipCacheRequestDoesNotWaitForAProducer() {
   }
   require(idle(engine) && events.completedCount == 3 && events.failedCount == 0,
           "the requests did not finish");
+  const auto startOf = [&](uint64_t id) {
+    return events.starts.at(static_cast<size_t>(std::ranges::find(events.startIds, id) - events.startIds.begin()));
+  };
+  require(startOf(1) == 0, "the request that skips the cache did not start cold");
   const auto &boundaries = executor.plans.at(2).boundaries;
-  require(events.starts.back() == 160 &&
+  require(startOf(3) == 160 &&
               std::none_of(boundaries.begin(), boundaries.end(),
                            [](const DraftBoundaryPlan &boundary) {
                              return boundary.boundary == 192;
@@ -1980,6 +2034,7 @@ std::span<const test::TestCase> diskTests() {
       {"testRestoringRequestIsNotWaitingForMemory", testRestoringRequestIsNotWaitingForMemory},
       {"testSharedPrefillWaitsForARestoringProducer", testSharedPrefillWaitsForARestoringProducer},
       {"testCancelledRestoringProducerReleasesItsWaiter", testCancelledRestoringProducerReleasesItsWaiter},
+      {"testALaterPromptWaitsForARestoringPromptThatLeadsIt", testALaterPromptWaitsForARestoringPromptThatLeadsIt},
       {"testSkipCacheRequestDoesNotWaitForAProducer", testSkipCacheRequestDoesNotWaitForAProducer},
       {"testCancelledDiskPrefixStopsQueuedReads", testCancelledDiskPrefixStopsQueuedReads},
       {"testFailedDiskRestoreKeepsShallowerState", testFailedDiskRestoreKeepsShallowerState},

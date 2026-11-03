@@ -1557,7 +1557,14 @@ decode they owe, not for every decode above the command's own priority. Its
 later passes come before any other
 prefill, whose rows would take the prefill memory its work is in, but admission
 waits for no pass: a request that arrives meanwhile starts at the next command's
-boundary, in ordinary admission and during recovery alike. A command between
+boundary, in ordinary admission and during recovery alike. Admission starts a
+prompt only where the next command serves it and leaves it waiting for no other
+prompt: the command ends the prompt, the prompt leads it or is overdue, or every
+lane ahead of it ends its prompt there and none is a Spill lane, so two Spill
+lanes prefill together only as the later one leads. A start still restoring its
+prefix from the SSD cache counts as a lane ahead. A prompt that would join with
+the rows that spare it a command and then wait out another's waits for
+scheduling, and takes no lower resident's lane, until it leads. A command between
 its passes is abandoned, nothing of it committed, for work that supersedes it:
 work that leaves no lane of it overdue behind and shortens the summed
 completion of the lanes concerned, the command's, the work's and the other

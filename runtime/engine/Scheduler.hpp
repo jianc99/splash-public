@@ -54,12 +54,14 @@ struct PrefillAdmission final {
 // A prefill lane as the engine knows it when the scheduler plans: the pages
 // of its history only the SSD cache holds now, whether it may gain such pages
 // between a command's passes (a Spill lane past its dense history and
-// window), and the most rows a state capture prepare cut this tick leaves it.
+// window), the most rows a state capture prepare cut this tick leaves it,
+// and whether it is a Spill lane.
 struct LaneShape final {
   uint64_t requestId = 0;
   uint32_t indexPages = 0;
   bool gainsIndexPages = false;
   uint32_t rowCap = std::numeric_limits<uint32_t>::max();
+  bool spill = false;
 };
 
 // The command between its passes as planning reads it: its plan at its next
@@ -76,11 +78,14 @@ struct PassProgress final {
 // What a plan is made from, rebuilt before each: the lanes that cannot run
 // in it (they wait for memory on its way back, or prepare refused or held
 // them back this tick), the shapes of the resident prefill lanes and, for
-// admission, of the candidates, and the command between its passes, if any.
+// admission, of the candidates, the command between its passes, if any,
+// and, for admission, the admitted requests that restore their prefix from
+// the SSD cache before they run, each from the boundary it restores to.
 struct PlanInputs final {
   std::span<const uint64_t> excluded;
   std::span<const LaneShape> shapes;
   const PassProgress *passes = nullptr;
+  std::span<const PrefillAdmission> restoring;
 };
 
 // One rate a command estimate learned: the quantity of a command's work it
@@ -192,10 +197,11 @@ public:
 
   [[nodiscard]] std::vector<uint64_t> admissionOrder() const;
   // The candidates the next command would serve and leave waiting for no
-  // other prompt: running them to their prompt's end, leading them now or
-  // next, or as they are overdue. Admission starts only those, planning again
-  // without the others until it serves all it plans, with the candidates'
-  // shapes in `in`.
+  // other prompt: running them to their prompt's end, leading them now or,
+  // beside no Spill lane, next, or as they are overdue, beside the resident
+  // prefill lanes and the requests restoring in `in`. Admission starts only
+  // those, planning again without the others until it serves all it plans,
+  // with the candidates' shapes in `in`.
   [[nodiscard]] std::vector<uint64_t>
   prefillAdmissionOrder(std::span<const PrefillAdmission> candidates, const PlanInputs &in) const;
   // The highest priority among requests that prefill or decode. A waiting

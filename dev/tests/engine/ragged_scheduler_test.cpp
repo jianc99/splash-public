@@ -100,7 +100,7 @@ public:
     scheduler.seedCost(warmups, rate ? model::SsdReads{10'000'000'000, 1e10 / rate} : model::SsdReads{});
     return *this;
   }
-  [[nodiscard]] PlanInputs in() const { return {excluded, shapes, passes ? &*passes : nullptr}; }
+  [[nodiscard]] PlanInputs in() const { return {excluded, shapes, passes ? &*passes : nullptr, {}}; }
   [[nodiscard]] std::optional<BatchPlan> next() const { return scheduler.next(in()); }
   [[nodiscard]] BatchPlan plan() const {
     const std::optional<BatchPlan> result = next();
@@ -1516,40 +1516,54 @@ void testNearEqualLongPromptsDoNotInterleave() {
 }
 
 // A queued prompt starts only when the next command serves it and leaves it
-// waiting for no other prompt: it ends the prompt, leads it now or next, or
-// runs it overdue (amend/S.md A103). The churn's first round on the Studio
-// at 18G (SIM-churn-order): after its first prompt, 59,043 tokens, now
-// decoding, the second, 59,020, leads, and the third, 59,054, would join its
-// commands of 6144 rows with the 1710 rows past its whole ones and then wait
-// out the second's prompt holding its memory: it stays queued until it
-// leads. Beside a prompt of 6144 rows, which its command ends, a prompt of
-// three commands and 1710 rows starts with those and leads next; one of
-// 1048 rows beside a leader of 1000 in one chunk starts, the command ending
-// it.
+// waiting for no other prompt: the command ends its prompt, it leads, it is
+// overdue, or every lane ordered before it ends its prompt there and none
+// is a Spill lane, two of which prefill together only as the later one
+// leads or one is overdue (amend/S.md A100 (3), A103). Of a round's
+// near-equal prompts on the Studio at 18G (SIM-churn-order), after the
+// first, 59,043 tokens, now decoding, the second, a Spill lane, leads, and
+// the third, which would join its commands with the rows past its whole
+// ones, stays queued until it leads: the churn's 59,020 and 59,054, whose
+// 1710 such rows would join commands of 6144 rows, and 57,644 and 57,664,
+// whose 320 fit beside the second's last command, of 4396 rows, in the chunk
+// it ends in. Beside a Resident prompt of 6144 rows, which its command ends,
+// a prompt of three commands and 1710 rows starts with those and leads next;
+// beside a Spill one it stays queued. One of 1048 rows beside a leader of
+// 1000 in one chunk starts, the command ending it.
 void testALongPromptStartsOnlyToLead() {
+  const auto spill = [](Sim &sim, uint64_t id) { sim.shapes.push_back({.requestId = id, .spill = true}); };
+  const auto round = [&](Sim &sim, uint32_t second, uint32_t third) {
+    sim.seed();
+    sim.lane(3, 0, 59'043);
+    while (sim.scheduler.phase(3) == Phase::Prefill)
+      sim.step();
+    sim.lane(1, 0, second);
+    spill(sim, 1);
+    sim.scheduler.submit(request(2, third));
+    const std::array later{PrefillAdmission{2, 0}};
+    while (sim.scheduler.phase(1) == Phase::Prefill) {
+      require(sim.scheduler.prefillAdmissionOrder(later, sim.in()).empty(),
+              "the third prompt, " + std::to_string(third) + " tokens, started to join the second's command at " +
+                  std::to_string(sim.scheduler.promptProcessed(1)) + " of its rows");
+      sim.step();
+    }
+    require(sim.scheduler.prefillAdmissionOrder(later, sim.in()) == std::vector<uint64_t>{2},
+            "the third prompt, " + std::to_string(third) + " tokens, did not start once it led");
+  };
+  Sim fits(test::kStudio18GFlashNextQ2, limits(8192, 48));
+  round(fits, 57'644, 57'664);
   Sim sim(test::kStudio18GFlashNextQ2, limits(8192, 48));
-  sim.seed();
-  sim.lane(3, 0, 59'043);
-  while (sim.scheduler.phase(3) == Phase::Prefill)
-    sim.step();
-  sim.lane(1, 0, 59'020);
-  sim.scheduler.submit(request(2, 59'054));
-  const std::array later{PrefillAdmission{2, 0}};
-  while (sim.scheduler.phase(1) == Phase::Prefill) {
-    require(sim.scheduler.prefillAdmissionOrder(later, sim.in()).empty(),
-            "the third prompt started to join the second's command at " +
-                std::to_string(sim.scheduler.promptProcessed(1)) + " of its rows");
-    sim.step();
-  }
-  require(sim.scheduler.prefillAdmissionOrder(later, sim.in()) == std::vector<uint64_t>{2},
-          "the third prompt did not start once it led");
+  round(sim, 59'020, 59'054);
   sim.scheduler.cancel(2);
   sim.scheduler.remove(2);
   sim.lane(4, 0, 6144);
   sim.scheduler.submit(request(5, 3 * 8192 + 1710));
   const std::array next{PrefillAdmission{5, 0}};
   require(sim.scheduler.prefillAdmissionOrder(next, sim.in()) == std::vector<uint64_t>{5},
-          "a prompt that leads once the command ends the one ahead of it did not start beside it");
+          "a prompt that leads once the command ends the Resident one ahead of it did not start beside it");
+  spill(sim, 4);
+  require(sim.scheduler.prefillAdmissionOrder(next, sim.in()).empty(),
+          "a prompt that leads once the command ends the Spill one ahead of it started beside it");
   Sim chunk(test::kStudio18GFlashNextQ2, limits(8192, 48));
   chunk.seed();
   chunk.lane(1, 0, 1000);

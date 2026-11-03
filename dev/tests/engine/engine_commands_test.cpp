@@ -1236,9 +1236,10 @@ void testACommandAnyLaneConvertsInReplans() {
 // each command that streams its history. Refused it, the lane leaves the
 // command, and the peer planned beside it runs there: nothing yields.
 void testALaneThatConvertsAtItsPrefillReplans() {
-  // The model's passes; the rows of a peer whose prompt has run a chunk,
-  // beside which the lane's command is planned: none, more than the lane's,
-  // or fewer; and whether the model refuses the lane its staging there.
+  // The model's passes; the rows of a peer that arrives as the lane's restore
+  // lands, beside which the lane's command is planned: none, more than the
+  // lane's, or fewer; and whether the model refuses the lane its staging
+  // there.
   for (const auto &[passes, peerRows, refused] :
        {std::tuple{4u, 0u, false}, {1u, 300u, false}, {1u, 40u, false}, {1u, 300u, true}}) {
     Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(model::ExecutionLimits::prefillTokenBudget, passes));
@@ -1286,20 +1287,19 @@ void testALaneThatConvertsAtItsPrefillReplans() {
     history.insert(history.end(), 192, 5);
     spill.engine.submit(request(3, history));
     static_cast<void>(spill.engine.tick(spill.now++));
-    if (peerRows) {
-      // A peer runs its first chunk while the restore is in flight, which
-      // lands before the peer's next command.
-      spill.engine.submit(
-          request(4, std::vector<uint32_t>(model::ExecutionLimits::prefillTokenBudget + peerRows, 7)));
-      static_cast<void>(spill.engine.tick(spill.now++));
-      spill.tier.complete();
-      static_cast<void>(spill.engine.tick(spill.now++));
-    }
     // The host refuses growth until the chain spills again: the lane's
     // command converts it, and its pages move into free Index pages.
     spill.storage.growthAllowed = [&](uint32_t) { return spill.cache.spillSnapshot().spilledPages != 0; };
-    if (refused) {
+    if (refused)
       spill.model.refusedStaging = {3};
+    // A peer arrives as the restore lands, and the lane's command is planned
+    // beside it (a peer that would wait out the lane's prompt does not start
+    // while the lane restores, amend/S.md A103).
+    if (peerRows) {
+      spill.tier.complete();
+      spill.engine.submit(request(4, std::vector<uint32_t>(peerRows, 7)));
+    }
+    if (refused) {
       spill.runUntil([&] { return spill.engine.snapshot().spill.converted == 2; },
                      "the lane did not convert at its prefill");
       // The command in flight, beside which no lane decodes, is the one the
@@ -1536,6 +1536,56 @@ void testReplansPerTickAreBounded() {
   require(replanned > 0, "no refusal sent a plan back");
 }
 
+// A start of a higher priority takes a lower resident's lane only as the
+// scheduler admits it (amend/S.md A103), and in the recovery that follows
+// as in ordinary admission: with every lane resident, a Foreground prompt
+// suspends a Normal lane and leads; a longer one after it, which would
+// neither lead nor end in the next command, suspends no lane and does not
+// start before the first's last command.
+void testAPreemptingStartWaitsUntilItLeads() {
+  test::TestKvStorage storage(1024, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor executor;
+  executor.decodeFinishes = false;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  const auto submit = [&](uint64_t id, uint32_t tokens, RequestPriority priority, uint32_t output) {
+    EngineRequest value = request(id, std::vector<uint32_t>(tokens, static_cast<uint32_t>(id)));
+    value.priority = priority;
+    value.maxNewTokens = output;
+    value.deadlineMilliseconds = 1e9;
+    engine.submit(std::move(value));
+  };
+  double now = 1;
+  for (uint64_t id = 1; id <= 4; ++id)
+    submit(id, 300, RequestPriority::Normal, 100'000);
+  tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == 4; },
+            "the Normal requests did not decode");
+  constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
+  submit(5, 3 * chunk + 100, RequestPriority::Foreground, 1);
+  tickUntil(engine, now, [&] { return std::ranges::count(events.startIds, 5u) == 1; },
+            "the first Foreground prompt did not start");
+  submit(6, 3 * chunk + 400, RequestPriority::Foreground, 1);
+  std::string early;
+  tickUntil(
+      engine, now,
+      [&] {
+        const EngineSnapshot counts = engine.snapshot();
+        const bool started = std::ranges::count(events.startIds, 6u) != 0;
+        if (early.empty() && std::ranges::any_of(counts.activeRequests, [&](const ActiveRequestSnapshot &active) {
+              return active.id == 5 && active.phase == Phase::Prefill &&
+                     active.promptTokens - active.promptProcessed > chunk;
+            }) && (started || counts.prioritySuspensions > 1))
+          early = std::to_string(counts.prioritySuspensions) + " lanes suspended, the second " +
+                  (started ? "started" : "not started");
+        return started;
+      },
+      "the second Foreground prompt did not start");
+  require(early.empty(), "before the first Foreground prompt's last command: " + early);
+}
+
 } // namespace
 
 std::span<const test::TestCase> commandsTests() {
@@ -1580,6 +1630,7 @@ std::span<const test::TestCase> commandsTests() {
       {"testARowCapEndsWithItsTick", testARowCapEndsWithItsTick},
       {"testAPartialAdmissionReplansWithoutTheDeniedLane", testAPartialAdmissionReplansWithoutTheDeniedLane},
       {"testReplansPerTickAreBounded", testReplansPerTickAreBounded},
+      {"testAPreemptingStartWaitsUntilItLeads", testAPreemptingStartWaitsUntilItLeads},
   };
   return kTests;
 }
