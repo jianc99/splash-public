@@ -66,8 +66,8 @@ Command prefill(const std::vector<uint32_t> &rows, uint32_t indexed = 0) {
   return command(WorkKind::Prefill, rows, indexed);
 }
 
-Command inPasses(uint32_t pass, uint32_t passes, uint32_t rows = kChunk) {
-  Command result = prefill({rows});
+Command inPasses(uint32_t pass, uint32_t passes) {
+  Command result = prefill({kChunk});
   result.plan.pass = pass;
   result.plan.passes = passes;
   return result;
@@ -214,11 +214,9 @@ void testABlockSparseLayerSaturatesAtTheSelectionAndTail() {
 }
 
 // A model of the defaults alone (Model::prefillWork, Model::commandLimits)
-// whose commands hold a streamed target's group of four chunks and run in
-// up to its 48 layers' passes.
+// whose commands run in up to 48 passes.
 class DefaultModel final : public model::Model {
 public:
-  uint32_t prefillGroupRows(bool) const noexcept override { return 4 * kChunk; }
   uint32_t prefillPasses() const noexcept override { return 48; }
   StateAdmission begin(const ModelRequest &) override { return {}; }
   void suspend(uint64_t) override {}
@@ -242,28 +240,21 @@ public:
   void end(uint64_t) override {}
 };
 
-// A target of 48 layers, every fourth attention, and a native window of
-// 262144 tokens (Qwen3.5-122B-A10B): a group of 8192 rows at position
-// 70,000 computes in each attention layer more pairs than one layer may.
-// Every pass of 19 reports those of the heaviest layer of the target, the
-// passes that run no attention layer (layers 3, 7, ..., 47 attend) too, as
-// a pass does not split a layer; half the rows fit.
-void testLayerPairsIgnorePasses() {
+// The default work has no layers: its one layer's pairs are every lane's
+// dense pairs, summed, whatever the pass. (A runtime's per-layer rule, the
+// heaviest attention layer of the target in every pass, is
+// command_limits_test's testLayerPairsIgnorePasses.)
+void testTheDefaultLayerPairsIgnoreThePass() {
   DefaultModel target;
-  constexpr uint32_t position = 70'000, rows = 4 * kChunk;
-  const uint64_t layerBound = model::denseAttentionPairs(262144 - kChunk, kChunk);
-  const std::array<model::PrefillLane, 1> group{{{.position = position, .rows = rows}}};
-  const uint64_t whole = target.prefillWork(group, 0, 1).layerAttentionPairs;
-  require(whole == model::denseAttentionPairs(position, rows) && whole > layerBound,
-          "a group at position 70,000 did not compute its dense pairs in a layer");
+  const std::array<model::PrefillLane, 2> lanes{{{.position = 70'000, .rows = 1000}, {.position = 300, .rows = 1048}}};
+  const uint64_t whole = target.prefillWork(lanes, 0, 1).layerAttentionPairs;
+  require(whole == model::denseAttentionPairs(70'000, 1000) + model::denseAttentionPairs(300, 1048),
+          "the default's pairs of a layer are not its lanes' dense pairs, summed");
   for (uint32_t pass = 0; pass < 19; ++pass) {
-    requireKeeps(inPasses(pass, 19, rows), "a pass of 19 broke a rule of a 48-layer target", target.commandLimits());
-    require(target.prefillWork(group, pass, 19).layerAttentionPairs == whole,
-            "pass " + std::to_string(pass) + " of 19 did not report the heaviest attention layer's pairs");
+    requireKeeps(inPasses(pass, 19), "a pass of 19 broke a rule of a model of 48 passes", target.commandLimits());
+    require(target.prefillWork(lanes, pass, 19).layerAttentionPairs == whole,
+            "pass " + std::to_string(pass) + " of 19 changed the default's pairs of a layer");
   }
-  const std::array<model::PrefillLane, 1> half{{{.position = position, .rows = rows / 2}}};
-  require(target.prefillWork(half, 0, 1).layerAttentionPairs <= layerBound,
-          "half a group at position 70,000 computed more pairs than one layer may");
 }
 
 void testALoadRoutesFromTopKToEveryExpert() {
@@ -312,7 +303,7 @@ int main() {
     testDenseAttentionPairsAreEveryRowsKeys();
     testAWindowedLayerSaturatesAtItsWindow();
     testABlockSparseLayerSaturatesAtTheSelectionAndTail();
-    testLayerPairsIgnorePasses();
+    testTheDefaultLayerPairsIgnoreThePass();
     testALoadRoutesFromTopKToEveryExpert();
     testTheDefaultSampleIsTheTicketsTimes();
     std::cout << "model boundary tests passed\n";
