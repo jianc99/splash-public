@@ -308,6 +308,7 @@ public:
   // The lanes in service: their projected growth, which pools' growth leaves
   // free, and the highest priority among them.
   void setLanes(uint64_t demandBytes, std::optional<RequestPriority> highest) noexcept;
+  [[nodiscard]] uint64_t laneDemandBytes() const noexcept { return laneDemandBytes_; }
   // Where the ledger writes one line per decision: the claimant, what it
   // took, the price, the bytes and the outcome.
   void setDecisionLog(std::function<void(std::string_view)> log);

@@ -2535,6 +2535,25 @@ void testGrowthCountsWhatTheHostDoesNotShowYet() {
               std::to_string(experts.shrinks) + " given back");
 }
 
+// Growth leaves the host what the lanes in service are projected to grow
+// into, as it leaves them that room under the limit (smoke a: on the 122B a
+// long prompt's KV grew into the host's margin after each unit the store
+// grew back, and the host's pass took the unit back seconds later): with
+// M + 1.5 GiB of headroom beside the store and lanes that project 1 GiB
+// more, no 1 GiB unit grows; once they project nothing, one does.
+void testGrowthLeavesTheHostWhatTheLanesGrowInto() {
+  Fixture fixture(host(2 * kGiB + kGiB + 1536 * kMiB));
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 6, 7, 2, 0.25, 60.0);
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addPool(experts);
+  ledger.setLanes(kGiB, RequestPriority::Normal);
+  static_cast<void>(fixture.pass(1.0));
+  require(experts.units() == 2, "the store grew into the host's margin the lanes are projected to grow into");
+  ledger.setLanes(0, std::nullopt);
+  static_cast<void>(fixture.pass(2.0));
+  require(experts.units() == 3, "the store did not grow once the lanes projected nothing");
+}
+
 // A claim pays the release a pool's unit takes of the engine thread (the
 // store's compaction, amend/M.md D4): an optional claim worth one state's
 // read, 5 ms, takes the copied state that costs that, not a store chunk
@@ -2683,6 +2702,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testTheLedgerValuesTheStoreByItsScans", testTheLedgerValuesTheStoreByItsScans},
       {"testDisplacementPaysForItsExpectedRetake", testDisplacementPaysForItsExpectedRetake},
       {"testGrowthCountsWhatTheHostDoesNotShowYet", testGrowthCountsWhatTheHostDoesNotShowYet},
+      {"testGrowthLeavesTheHostWhatTheLanesGrowInto", testGrowthLeavesTheHostWhatTheLanesGrowInto},
       {"testAClaimPaysForAPoolUnitsRelease", testAClaimPaysForAPoolUnitsRelease},
       {"testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes",
        testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes},

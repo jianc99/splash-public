@@ -450,9 +450,11 @@ FreeResult MemoryGovernor::hostPass(uint64_t target, bool critical, bool deficit
 uint64_t MemoryGovernor::hostBytes(ClaimClass cls, uint64_t bytes, uint64_t creditBytes) const noexcept {
   if (cls != ClaimClass::Growth || bytes <= creditBytes)
     return bytes;
-  const uint64_t waiting = ledger_.hostRefusedWaitingBytes();
-  return bytes <= std::numeric_limits<uint64_t>::max() - waiting ? bytes + waiting
-                                                                 : std::numeric_limits<uint64_t>::max();
+  const uint64_t limit = std::numeric_limits<uint64_t>::max();
+  uint64_t held = bytes;
+  for (const uint64_t more : {ledger_.hostRefusedWaitingBytes(), ledger_.laneDemandBytes()})
+    held = held <= limit - more ? held + more : limit;
+  return held;
 }
 
 GrowthHost MemoryGovernor::growthHost(bool displaces) {
