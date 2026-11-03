@@ -5,7 +5,8 @@
         --tools ~/dev/vr16/cand --out ~/bench/1.6.0 --jobs ~/gpuq/pending --first 20
     python3 -m dev.benchmarks.serving.matrix check RUN_DIR LABEL [--minutes 15]
     python3 -m dev.benchmarks.serving.matrix check --running ~/gpuq
-    python3 -m dev.benchmarks.serving.matrix analyze --spec SPEC --results DIR... --out DIR
+    python3 -m dev.benchmarks.serving.matrix analyze --spec SPEC --results DIR... \\
+        --build cand=<build id> --out DIR
 
 plan writes one job script per run, each holding the machine's GPU lock
 around run.py, interleaved so that no tree owns the start or end of a
@@ -13,11 +14,13 @@ machine's queue (--references plans the reference runs a cell still lacks).
 check judges one run on its own (completion, structural minimum, health,
 bounded gaps), or lists the queued jobs running past twice their expected
 time. analyze applies the spec's gates (DESIGN-1.6.0 §8.3 as amended by
-amend/V.md §5 and the owner's rulings) to every cell with results and writes
-verdict.json and verdict.md: PASS, FAIL or INCONCLUSIVE with the numbers, the
-trades for the owner, the runs it did not use and why (a planned run that
-left no record as not run), and per fixed-order set of each churn cell the
-numbers of bin/cmp.py and pertag.py.
+amend/V.md §5 and the owner's rulings) to every cell with results, on the
+runs of each tree's build under test (--build; a rerun takes the next repeat
+number, and one copy of a label counts), and writes verdict.json and
+verdict.md: PASS, FAIL or INCONCLUSIVE with the numbers, the trades for the
+owner, the runs it did not use and why (a planned run that left no record as
+not run), and per fixed-order set of each churn cell the numbers of
+bin/cmp.py and pertag.py.
 """
 
 from __future__ import annotations
@@ -41,7 +44,16 @@ from dev.benchmarks.serving.stats import FAIL, INCONCLUSIVE, PASS
 # forensics' yardstick, bin/cmp.py): run.py polls /status through the drain,
 # the references churn_ord.py recorded stopped 5 s after the window.
 WORK_SECONDS = 900
+# Content chunks closer than this are one token event's: the server sends
+# each token of an event as its own chunk, back to back (server/backend.py
+# CallbackStreamer.put_tokens), DFlash2 committing about eight a lane per
+# command, while a lane's next event comes a decode command later, at least
+# 17.3 ms (Flint at width 1, the shortest measured: dev/tests/engine/
+# TimingProfile.cpp). Half of that is the split farthest from both.
+TOKEN_EVENT_MS = 17.3 / 2
 THERMAL_VOID = ("serious", "critical")
+# The suffix of a single cell's backend regression result beside its label.
+SINGLE_RESULTS = ".backend-regression.json"
 HIGHER_IS_BETTER = {"work": True, "decode": True, "latency": False, "ttft": False}
 
 
@@ -104,12 +116,12 @@ def run_label(cell: str, tree: str, order: str, repeat: int) -> str:
     )
 
 
-def abba_runs(cell: dict) -> list[tuple[str, str, int]]:
-    """The runs of an in-session ABBA cell, set by set: reference, cand,
-    cand, reference."""
+def abba_runs(cell: dict, sets: int) -> list[tuple[str, str, int]]:
+    """The runs of `sets` sets of an in-session ABBA cell, set by set:
+    reference, cand, cand, reference."""
     reference = cell["abba"]["reference"]
     runs = []
-    for index in range(cell["abba"].get("sets", 1)):
+    for index in range(sets):
         first, second = 2 * index + 1, 2 * index + 2
         runs += [
             (reference, "-", first),
@@ -120,19 +132,21 @@ def abba_runs(cell: dict) -> list[tuple[str, str, int]]:
     return runs
 
 
-def locate(results: list[Path], label: str) -> Path | None:
-    """The results directory holding a run: its run.py meta.json, written
-    also for a run that did not reach its scenario, or its client's
+def holds(directory: Path, label: str) -> bool:
+    """Whether a results directory holds a run: its run.py meta.json,
+    written also for a run that did not reach its scenario, or its client's
     records."""
-    for directory in results:
-        if (
-            (directory / f"{label}.meta.json").exists()
-            or (directory / f"{label}.events.jsonl").exists()
-            or (directory / f"{label}.jsonl").exists()
-            or any(directory.glob(f"{label}-n*.events.jsonl"))
-        ):
-            return directory
-    return None
+    return (
+        (directory / f"{label}.meta.json").exists()
+        or (directory / f"{label}.events.jsonl").exists()
+        or (directory / f"{label}.jsonl").exists()
+        or any(directory.glob(f"{label}-n*.events.jsonl"))
+    )
+
+
+def locate(results: list[Path], label: str) -> Path | None:
+    """The first results directory holding a run."""
+    return next((directory for directory in results if holds(directory, label)), None)
 
 
 # ------------------------------------------------------------------ runs
@@ -177,7 +191,19 @@ class Run:
         self.invalid: list[str] = []
         self.voided: list[str] = []
         out = directory / f"{label}.out"
-        self.complete = out.exists() and out.read_text().rstrip().endswith("DONE")
+        text = out.read_text() if out.exists() else ""
+        self.complete = text.rstrip().endswith("DONE")
+        # The build run.py measured: its meta.json's, or for a run killed
+        # before it wrote one, the build its .out named before the server
+        # started ("root ... build ID").
+        self.build = self.meta.get("build_id") or next(
+            (
+                line.rsplit(" build ", 1)[1]
+                for line in text.splitlines()
+                if line.startswith("root ") and " build " in line
+            ),
+            None,
+        )
         events = [
             e
             for path in run_files(directory, label, "events")
@@ -225,12 +251,18 @@ class Run:
         return self.done[tag]["t"] - self.done[tag]["start"]
 
     def client_gaps(self) -> tuple[list[float], float]:
-        """Every gap after each request's first token, in seconds, and the
-        largest, counting the open gaps the end record lists."""
+        """Every gap between token events after each request's first, in
+        seconds, as metrics.decode_gap_ms counts them (chunks less than
+        TOKEN_EVENT_MS apart are one event's), and the largest, counting
+        the open gaps the end record lists."""
         gaps = []
         for record in self.done.values():
             chunks = record.get("chunks_ms") or []
-            gaps += [(b - a) / 1000 for a, b in zip(chunks, chunks[1:])]
+            gaps += [
+                (b - a) / 1000
+                for a, b in zip(chunks, chunks[1:])
+                if b - a >= TOKEN_EVENT_MS
+            ]
         opened = list(((self.end or {}).get("open_gaps") or {}).values())
         return gaps, max(gaps + opened, default=0.0)
 
@@ -278,10 +310,11 @@ class Run:
 
 
 def load_runs(spec: dict, results: list[Path]) -> list[Run]:
-    """The churn runs of the spec's cells found in the results: new runs by
-    their meta.json, the runs each cell plans also by their client's records
-    (a run killed before it wrote its meta.json), and recorded ones by the
-    labels each cell lists."""
+    """The churn runs of the spec's cells found in the results, every copy
+    of a label (analyze keeps one: usable): new runs by their meta.json, the
+    runs each cell plans also by their client's records (a run killed before
+    it wrote its meta.json), and recorded ones by the labels each cell
+    lists."""
     cells = {cell["name"]: cell for cell in spec["cells"]}
     runs, found = [], set()
 
@@ -323,6 +356,62 @@ def not_run(cell: dict, runs: list[Run]) -> list[tuple[str, str]]:
         for tree, order, repeat in planned_runs(cell, False)
         if (label := run_label(cell["name"], tree, order, repeat)) not in labels
     ]
+
+
+def cell_metas(results: list[Path], cell: dict) -> list[dict]:
+    """The meta.json of every run.py run of a cell in the results, planned
+    or not (a rerun takes the next repeat number)."""
+    metas = [
+        json.loads(path.read_text())
+        for directory in results
+        for path in sorted(directory.glob("*.meta.json"))
+    ]
+    return [meta for meta in metas if meta.get("cell") == cell["name"]]
+
+
+def runs_of(
+    cell: dict, labels: list[tuple[str, str]], results: list[Path]
+) -> list[Run]:
+    """Every copy in the results of each (tree, label), label by label, a
+    label taking the tree it is first listed with."""
+    trees: dict[str, str] = {}
+    for tree, label in labels:
+        trees.setdefault(label, tree)
+    return [
+        Run(directory, label, cell["name"], tree)
+        for label, tree in trees.items()
+        for directory in results
+        if holds(directory, label)
+    ]
+
+
+def other_build(spec: dict, tree: str | None, build: str | None) -> str | None:
+    """Why a run of a tree that measured `build` (Run.build, or the build a
+    comparison's rounds name) did not measure the tree's build under test,
+    analyze --build's, or None: cand-floorcap and cand-27b-q4 are cand's,
+    and a tree without one takes any."""
+    expected = spec["trees"].get((tree or "").split("-")[0], {}).get("build_id")
+    if expected is None or build == expected:
+        return None
+    return f"build {build or 'not recorded'}, not the build under test {expected}"
+
+
+def usable(spec: dict, cell: dict, runs: list[Run]) -> tuple[list[Run], list[dict]]:
+    """Of a cell's runs found in the results, one per label, the first of
+    its tree's build under test, and every other listed with why: one of
+    another build, or one more copy of a label (metric_values keys runs by
+    label)."""
+    kept: dict[str, Run] = {}
+    unused = []
+    for run in runs:
+        reason = other_build(spec, run.tree, run.build)
+        if reason is None and run.label in kept:
+            reason = f"also in {kept[run.label].directory}, whose run is used"
+        if reason:
+            unused.append(unused_entry(cell, run.label, run.tree, [reason]))
+        else:
+            kept[run.label] = run
+    return list(kept.values()), unused
 
 
 def assertion_pid(holder: str) -> int | None:
@@ -425,9 +514,18 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
             else value(first, "streamed_experts.chunks")
             == value(first, "streamed_experts.cap_chunks")
         )
-        if not at_cap or first.get("memory_pressure") != "normal":
+        if not at_cap:
+            void("ample start: the experts were not at their cap at Ready")
+        # amend/V.md A10's pressure is the host's own before the run, macOS's
+        # level as run.py takes it before it starts the server. /status at
+        # Ready does not show it: memory_pressure is the engine's band state
+        # (AMENDMENTS X9), warning in 33-95 % of the recorded ample runs'
+        # samples, and right after the load macOS's own level read warning
+        # for the first 42-44 s of sNFb and sNFa, then normal to their end.
+        level = value(meta, "host_at_start.pressure_level")
+        if level not in (None, 1):
             void(
-                "ample start: the experts were not at their cap with pressure normal at Ready"
+                f"ample start: macOS's memory pressure level was {level} before the run"
             )
 
 
@@ -1473,50 +1571,56 @@ def g8_verdict(cell: dict, spec: dict, run: Run) -> list[dict]:
 
 
 def ttft_rounds(cell: dict, spec: dict, results: list[Path]) -> tuple[dict, list, list]:
-    """{tree: {n: [(directory, label, round)]}} of a TTFT cell's recorded and
-    planned runs that are valid, over the concurrencies whose every round
-    completed its N requests (A104's structural minimum), the runs and
-    concurrencies left out, with why, and the candidate runs' G8."""
-    labels = {tree: list(found) for tree, found in (cell.get("recorded") or {}).items()}
+    """{tree: {n: [(directory, label, round)]}} of a TTFT cell's recorded,
+    planned and rerun runs that are valid and of their tree's build under
+    test, over the concurrencies whose every round completed its N requests
+    (A104's structural minimum), the runs and concurrencies left out, with
+    why, and the candidate runs' G8."""
+    labels = [
+        (tree, label)
+        for tree, found in (cell.get("recorded") or {}).items()
+        for label in found
+    ]
     for tree, orders in (cell.get("runs") or {}).items():
         for order, count in orders.items():
-            labels.setdefault(tree, []).extend(
-                run_label(cell["name"], tree, order, r) for r in range(1, count + 1)
-            )
+            labels += [
+                (tree, run_label(cell["name"], tree, order, r))
+                for r in range(1, count + 1)
+            ]
+    labels += [
+        (meta.get("tree_name"), meta["label"]) for meta in cell_metas(results, cell)
+    ]
+    runs, unused = usable(spec, cell, runs_of(cell, labels, results))
     found: dict = {}
-    unused, health_verdicts = [], []
-    for tree, names in labels.items():
-        for label in names:
-            directory = locate(results, label)
-            if directory is None:
-                continue
-            run = Run(directory, label, cell["name"], tree)
-            validate(run, spec, cell)
-            health_verdicts += g8_verdict(cell, spec, run)
-            if run.invalid:
-                unused.append(unused_entry(cell, label, tree, run.invalid))
-                continue
-            levels = load_ttft_rounds(directory, label, cell.get("rounds", 3))
-            for n, level in sorted(levels.items()):
-                rounds = level["rounds"]
-                if len(rounds) < level["expected"] or any(
-                    len(r["ttft_ms"]) != n for r in rounds
-                ):
-                    unused.append(
-                        unused_entry(
-                            cell,
-                            label,
-                            tree,
-                            [
-                                f"N={n}: {len(rounds)} of {level['expected']} rounds "
-                                f"completed their {n} requests"
-                            ],
-                        )
+    health_verdicts = []
+    for run in runs:
+        directory, label, tree = run.directory, run.label, run.tree
+        validate(run, spec, cell)
+        health_verdicts += g8_verdict(cell, spec, run)
+        if run.invalid:
+            unused.append(unused_entry(cell, label, tree, run.invalid))
+            continue
+        levels = load_ttft_rounds(directory, label, cell.get("rounds", 3))
+        for n, level in sorted(levels.items()):
+            rounds = level["rounds"]
+            if len(rounds) < level["expected"] or any(
+                len(r["ttft_ms"]) != n for r in rounds
+            ):
+                unused.append(
+                    unused_entry(
+                        cell,
+                        label,
+                        tree,
+                        [
+                            f"N={n}: {len(rounds)} of {level['expected']} rounds "
+                            f"completed their {n} requests"
+                        ],
                     )
-                    continue
-                found.setdefault(tree, {}).setdefault(n, []).extend(
-                    (directory, label, r) for r in rounds
                 )
+                continue
+            found.setdefault(tree, {}).setdefault(n, []).extend(
+                (directory, label, r) for r in rounds
+            )
     return found, unused, health_verdicts
 
 
@@ -1621,39 +1725,62 @@ def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
     """G7 on in-session ABBA runs (reference, cand, cand, reference, per set):
     every metric must PASS abba.compare; G8 of each cand run; and G8's warm
     start (amend/V.md A16): cand's warm spawn-to-ready at most the
-    reference's plus the 256-row warm-up's cost. A set with a run that is
-    not valid is not judged; its invalid runs are returned with why."""
-    runs = abba_runs(cell)
+    reference's plus the 256-row warm-up's cost. The planned sets and those
+    a rerun began (a rerun takes the next repeat numbers) are judged; one
+    whose cand runs are all of another build than the build under test is
+    passed over, its runs listed, and one with a run that is not valid or
+    not of its tree's build is not judged; the runs not used are returned
+    with why."""
+    planned = cell["abba"].get("sets", 1)
+    begun = [((meta.get("repeat") or 0) + 1) // 2 for meta in cell_metas(results, cell)]
+    runs = abba_runs(cell, max([planned, *begun]))
     verdicts, unused = [], []
     for index in range(0, len(runs), 4):
+        members = runs[index : index + 4]
         labels = [
             run_label(cell["name"], tree, order, repeat)
-            for tree, order, repeat in runs[index : index + 4]
+            for tree, order, repeat in members
         ]
-        directories = [locate(results, label) for label in labels]
-        invalid = []
-        for (tree, _, _), d, label in zip(runs[index : index + 4], directories, labels):
-            if d is None:
-                continue
-            run = Run(d, label, cell["name"], tree)
+        trees = [tree for tree, _, _ in members]
+        found, copies = usable(
+            spec, cell, runs_of(cell, list(zip(trees, labels)), results)
+        )
+        kept = {run.label for run in found}
+        cand = [label for tree, label in zip(trees, labels) if tree == "cand"]
+        if not kept & set(cand) and {entry["label"] for entry in copies} & set(cand):
+            unused += copies + [
+                unused_entry(
+                    cell,
+                    run.label,
+                    run.tree,
+                    ["its set's cand runs are of another build"],
+                )
+                for run in found
+            ]
+            continue
+        if not found and not copies and index // 4 >= planned:
+            continue
+        invalid = list(copies)
+        for run in found:
             validate(run, spec, cell)
             verdicts += g8_verdict(cell, spec, run)
             if run.invalid:
-                invalid.append(unused_entry(cell, label, tree, run.invalid))
+                invalid.append(unused_entry(cell, run.label, run.tree, run.invalid))
         unused += invalid
-        if None in directories or invalid:
+        if len(found) < 4 or invalid:
             verdicts.append(
                 {
                     "cell": cell["name"],
                     "rule": f"G7 set {index // 4 + 1}",
                     "verdict": INCONCLUSIVE,
-                    "numbers": "not run"
-                    if None in directories
-                    else "runs not used: "
-                    + ", ".join(entry["label"] for entry in invalid),
+                    "numbers": "runs not used: "
+                    + ", ".join(entry["label"] for entry in invalid)
+                    if invalid
+                    else "not run",
                 }
             )
             continue
+        directories = [run.directory for run in found]
         rounds = [abba_metrics(d, label) for d, label in zip(directories, labels)]
         for metric in sorted(rounds[0]):
             samples = [r.get(metric, []) for r in rounds]
@@ -1668,14 +1795,11 @@ def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
                     }
                 )
         starts = {}
-        for (tree, _, _), d, label in zip(runs[index : index + 4], directories, labels):
-            meta = d / f"{label}.meta.json"
-            if meta.exists():
-                found = json.loads(meta.read_text())
-                if not found.get("first_start") and found.get("parts"):
-                    starts.setdefault(tree, []).append(
-                        found["parts"][0]["spawn_to_ready_s"]
-                    )
+        for run in found:
+            if not run.meta.get("first_start") and run.meta.get("parts"):
+                starts.setdefault(run.tree, []).append(
+                    run.meta["parts"][0]["spawn_to_ready_s"]
+                )
         warmup = spec["machines"][cell["machine"]].get("warmup_256_s")
         reference = cell["abba"]["reference"]
         if starts.get("cand") and starts.get(reference) and warmup is not None:
@@ -1692,45 +1816,99 @@ def abba_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
                     },
                 }
             )
+    if not any(v["rule"].startswith("G7") for v in verdicts):
+        verdicts.append(
+            {
+                "cell": cell["name"],
+                "rule": "G7",
+                "verdict": INCONCLUSIVE,
+                "numbers": "no set of the build under test judged",
+            }
+        )
     return verdicts, unused
 
 
-def single_cell(cell: dict, results: list[Path]) -> list[dict]:
+def round_build(document: dict, version: str) -> str | None:
+    """The build a backend regression comparison's rounds of one version
+    (candidate, baseline) ran, None unless they name one."""
+    builds = {
+        (record.get("identity") or {}).get("build_id")
+        for record in document.get("rounds") or []
+        if record.get("version") == version
+    }
+    return builds.pop() if len(builds) == 1 else None
+
+
+def single_cell(cell: dict, spec: dict, results: list[Path]) -> tuple[list, list]:
     """G7 of the backend benchmark comparisons (make test-performance-real
-    BASELINE=pass), one per model, each copied beside the run's records as
-    LABEL.backend-regression.json."""
-    verdicts = []
+    BASELINE=pass), each copied beside the run's records as
+    LABEL.backend-regression.json: every repeat of each model's (a rerun
+    takes the next repeat number) whose candidate rounds ran the cand build
+    under test, and whose baseline rounds the baseline's where analyze is
+    given it. The others are returned with why."""
+    verdicts, unused = [], []
     for model in cell["models"]:
-        label = run_label(cell["name"], f"cand-{model}", "-", 1)
-        directory = next(
-            (d for d in results if (d / f"{label}.backend-regression.json").exists()),
-            None,
+        tree = f"cand-{model}"
+        stem = f"{cell['name']}-{tree}-"
+        repeats = sorted(
+            int(repeat)
+            for repeat in {
+                path.name[len(stem) : -len(SINGLE_RESULTS)]
+                for directory in results
+                for path in directory.glob(f"{stem}*{SINGLE_RESULTS}")
+            }
+            if repeat.isdigit()
         )
-        if directory is None:
+        judged: dict[str, Path] = {}
+        for repeat in repeats:
+            label = run_label(cell["name"], tree, "-", repeat)
+            for directory in results:
+                path = directory / f"{label}{SINGLE_RESULTS}"
+                if not path.exists():
+                    continue
+                document = json.loads(path.read_text())
+                reason = other_build(
+                    spec, tree, round_build(document, "candidate")
+                ) or other_build(
+                    spec, cell["baseline"], round_build(document, "baseline")
+                )
+                if reason is None and label in judged:
+                    reason = f"also in {judged[label]}, whose run is used"
+                if reason:
+                    error = document.get("error")
+                    unused.append(
+                        unused_entry(
+                            cell,
+                            label,
+                            tree,
+                            [reason + (f": {error}" if error else "")],
+                        )
+                    )
+                    continue
+                judged[label] = directory
+                failures = (document.get("comparison") or {}).get(
+                    "failures", [document.get("error")]
+                )
+                verdicts.append(
+                    {
+                        "cell": cell["name"],
+                        "rule": f"G7 {label}",
+                        "verdict": PASS if document.get("pass") else FAIL,
+                        "numbers": failures,
+                    }
+                )
+        if not judged:
             verdicts.append(
                 {
                     "cell": cell["name"],
                     "rule": f"G7 {model}",
                     "verdict": INCONCLUSIVE,
-                    "numbers": "not run",
+                    "numbers": "no run of the build under test"
+                    if repeats
+                    else "not run",
                 }
             )
-            continue
-        document = json.loads(
-            (directory / f"{label}.backend-regression.json").read_text()
-        )
-        failures = (document.get("comparison") or {}).get(
-            "failures", [document.get("error")]
-        )
-        verdicts.append(
-            {
-                "cell": cell["name"],
-                "rule": f"G7 {model}",
-                "verdict": PASS if document.get("pass") else FAIL,
-                "numbers": failures,
-            }
-        )
-    return verdicts
+    return verdicts, unused
 
 
 def serve1_prices(label: str, results: list[Path]) -> dict | None:
@@ -1766,9 +1944,16 @@ def serve1_prices(label: str, results: list[Path]) -> dict | None:
 
 
 def analyze(spec: dict, results: list[Path]) -> dict:
-    runs = load_runs(spec, results)
+    """The verdicts on the runs in the results of each tree's build under
+    test (spec trees' build_id, analyze --build), the runs not used and the
+    legacy numbers."""
+    loaded = load_runs(spec, results)
     cells = {cell["name"]: cell for cell in spec["cells"]}
-    verdicts, invalid, gains, legacy = [], [], {}, []
+    verdicts, invalid, gains, legacy, runs = [], [], {}, [], []
+    for cell in spec["cells"]:
+        kept, copies = usable(spec, cell, [r for r in loaded if r.cell == cell["name"]])
+        runs += kept
+        invalid += copies
     for run in runs:
         validate(run, spec, cells[run.cell])
         if run.invalid:
@@ -1787,7 +1972,9 @@ def analyze(spec: dict, results: list[Path]) -> dict:
             cell_runs = [r for r in runs if r.cell == cell["name"]]
             invalid += [
                 unused_entry(cell, label, tree, ["not run"])
-                for tree, label in not_run(cell, cell_runs)
+                for tree, label in not_run(
+                    cell, [r for r in loaded if r.cell == cell["name"]]
+                )
             ]
             prices = cell.get("prices") or (
                 serve1_prices(cell["prices_from"], results)
@@ -1821,9 +2008,16 @@ def analyze(spec: dict, results: list[Path]) -> dict:
             verdicts.extend(found)
             invalid.extend(unused)
         elif scenario == "single":
-            verdicts.extend(single_cell(cell, results))
+            found, unused = single_cell(cell, spec, results)
+            verdicts.extend(found)
+            invalid.extend(unused)
     return {
         "spec": spec["path"],
+        "builds": {
+            name: tree["build_id"]
+            for name, tree in spec["trees"].items()
+            if tree.get("build_id")
+        },
         "verdicts": verdicts,
         "invalid": invalid,
         "legacy": legacy,
@@ -1834,6 +2028,9 @@ def analyze(spec: dict, results: list[Path]) -> dict:
 def verdict_markdown(document: dict) -> str:
     lines = [
         "# 1.6.0 matrix verdict",
+        "",
+        "Builds under test: "
+        + ", ".join(f"{name} {build}" for name, build in document["builds"].items()),
         "",
         "| cell | rule | verdict | numbers |",
         "| --- | --- | --- | --- |",
@@ -1982,7 +2179,7 @@ def planned_runs(cell: dict, references: bool) -> list[tuple[str, str, int]]:
     if references:
         return interleave(cell.get("reference_runs") or {})
     if cell.get("abba"):
-        return abba_runs(cell)
+        return abba_runs(cell, cell["abba"].get("sets", 1))
     return interleave(cell.get("runs") or {})
 
 
@@ -2024,15 +2221,18 @@ def job_script(spec: dict, cell: dict, tree: str, order: str, repeat: int, args)
         if draft:
             variables.append(f'DRAFT_MODEL="{draft}"')
         results = f"build/release/{model['model'].replace('/', '--').replace(':', '--')}/backend-regression.json"
+        # The comparison is copied only as this make wrote it: an earlier
+        # run's, left when make fails before backend_regression.py writes
+        # one, is removed first. (status is read-only in zsh.)
         return (
             "#!/bin/zsh\n"
             f"# {label}: cell {cell['name']}, {model['model']} against {cell['baseline']} ({spec['path']})\n"
-            f"cd {shlex.quote(args.trees[base])} || exit 1\n"
+            f"cd {shlex.quote(args.trees[base])} && rm -f {results} || exit 1\n"
             f"/usr/bin/lockf -k {machine['lock']} env {machine_prefix(machine)}make install "
             f"test-performance-real {' '.join(variables)}\n"
-            "status=$?\n"
-            f"cp {results} {shlex.quote(args.out)}/{label}.backend-regression.json\n"
-            "echo EXIT=$status\n"
+            "code=$?\n"
+            f"test -f {results} && cp {results} {shlex.quote(args.out)}/{label}{SINGLE_RESULTS}\n"
+            "echo EXIT=$code\n"
         )
     model = spec["models"][cell["model"]]
     server_args = " ".join(
@@ -2201,7 +2401,18 @@ def parse_args(argv=None):
     a.add_argument("--spec", required=True, type=Path)
     a.add_argument("--results", required=True, type=Path, nargs="+")
     a.add_argument("--out", required=True, type=Path)
+    a.add_argument(
+        "--build",
+        action="append",
+        default=[],
+        help="NAME=BUILD_ID: the build under test of a tree (cand's at least: "
+        "its build/engine/build-identity.json); runs of another build are not used",
+    )
     args = parser.parse_args(argv)
+    if args.command == "analyze":
+        args.builds = dict(item.split("=", 1) for item in args.build)
+        if "cand" not in args.builds:
+            parser.error("analyze judges one cand build: give --build cand=BUILD_ID")
     if args.command == "plan":
         # Job scripts name absolute paths of the machine that runs plan.
         args.trees = {
@@ -2253,7 +2464,12 @@ def main(argv=None) -> int:
         return 1 if problems else 0
     out = refuse_protected(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    document = analyze(load_spec(args.spec), args.results)
+    spec = load_spec(args.spec)
+    for name, build in args.builds.items():
+        if name not in spec["trees"]:
+            raise SystemExit(f"--build {name}: {args.spec} has no tree {name}")
+        spec["trees"][name]["build_id"] = build
+    document = analyze(spec, args.results)
     (out / "verdict.json").write_text(
         json.dumps(document, indent=1, default=str) + "\n"
     )

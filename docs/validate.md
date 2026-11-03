@@ -398,8 +398,15 @@ runs per tree and order, recorded reference runs, gates).
   the load window, every client served, health and gaps); `check --running
   GPUQ` lists queued jobs running past twice the time the first finished job
   of their type took on that Mac (20 minutes per churn run without one).
-- `analyze --results DIR... --out DIR` applies the gates to every cell with
-  results and writes `verdict.json` and `verdict.md`: PASS, FAIL or
+- `analyze --results DIR... --build cand=BUILD_ID --out DIR` applies the
+  gates to every cell with results, on the runs of each tree's build under
+  test (`--build NAME=BUILD_ID`, cand's at least, as its
+  `build/engine/build-identity.json` names it): a run whose `run.py` build id
+  is another, a single cell's comparison whose candidate rounds ran another,
+  or a second copy of a label in another results directory is not used. It
+  reads every run of a cell, planned or a rerun (a rerun takes the next
+  repeat number); an ABBA set whose cand runs are all of another build is
+  passed over. It writes `verdict.json` and `verdict.md`: PASS, FAIL or
   INCONCLUSIVE with the numbers (a candidate none of whose runs is usable
   gets its gates INCONCLUSIVE, naming its runs), the trades for the owner,
   every run it did not use and why, a run a cell plans that left no record
@@ -416,7 +423,10 @@ whose note gives its source), and, on the M5 Pro, its owner neither touched
 it (HIDIdleTime under 10 s) nor had a process the run did not start hold a
 display or system sleep assertion. A TTFT run's concurrency counts only where
 every round it was to run completed its N requests. An ample-memory run counts
-only if the experts were at their cap with pressure normal at Ready. G8 is
+only if the experts were at their cap at Ready and macOS's memory pressure
+level was normal before `run.py` started the server, where it recorded one
+(the engine's `memory_pressure` is its band state, and right after the load
+macOS's own level can read warning for tens of seconds). G8 is
 judged on every candidate run of every scenario: a run whose server
 restarted, failed a request, had a Metal failure, or exited, was not ready in
 time or, once ready, did not let its scenario end (a request or `/status` it
@@ -449,10 +459,10 @@ resolve it.
 | --- | --- |
 | G1, G2 | work and decode rate against 1.5.0: within 5 % only with a clear gain on TTFT, completion latency, freezes (1.5.0's own runs with a decode gap at or past the machine's G4 floor while the candidate holds G4) or concurrent TTFT, else no loss at all; completion latency: no loss at all |
 | G3 | TTFT against main within 2 %, failing once surely worse; under a memory cap also when G2 passes, no decode froze, and the TTFT is not surely worse than the cell's best tree that kept decoding |
-| G4 | per candidate run: contended prefill p95 and client gap p99 within the run's own bound (`max(decode_gap_target_ms, u/0.1)` with its estimate's p95 error), every client gap under the smallest stall rejected on that machine |
+| G4 | per candidate run: contended prefill p95 and the p99 of the client gaps between token events (chunks less than half the shortest decode command apart are one event's) within the run's own bound (`max(decode_gap_target_ms, u/0.1)` with its estimate's p95 error), every client gap under the smallest stall rejected on that machine |
 | G5 | concurrent TTFT: per N the median of each round's worst, at most the reference's times one plus its own spread |
 | G6 | ample memory: work, latency and TTFT within 2 % of the best measured tree, failing once surely worse |
-| G7 | single requests (`test-performance-real` against the base, `serve1`, `warm`): `abba.compare` on every metric, in session |
+| G7 | single requests (`test-performance-real` against the base, `serve1`, `warm`): `abba.compare` on every metric, in session; a single cell's job removes an earlier comparison before its make and copies only the one its make wrote |
 | G8, G9 | no restart, failed request, Metal failure or tick past 5 s; warm start within the base's plus the warm-up; memory accounts summing to the charged bytes, nothing owed at the end, no claim waiting past the resource wait |
 | SSD | disk and expert bytes per unit of work not surely above both release references |
 | Tags | no tag whose every candidate run is past the references' worst by their own spread |

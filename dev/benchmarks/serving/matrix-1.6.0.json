@@ -8,7 +8,7 @@
     "pass": {"commit": "0bd50301c6402c8d5f48e4e4a88ebda2ab792c2d", "role": "base of the refactor: G7, G10 and diagnostic references"},
     "ntie": {"commit": "87382087fdd28532b26f5ef5c56aeae9819a5325", "role": "best measured: ample memory, M5 18G (trades only)"},
     "intp": {"commit": "1da46c67ecb1c37c7eb509c50b62c3409805f5d2", "role": "best measured at 18G on the Studio and on the M6 (trades only)"},
-    "cand": {"commit": null, "role": "the integration head, given to plan with --commit"}
+    "cand": {"commit": null, "role": "the integration head, given to plan with --commit and to analyze with --build (its build id)"}
   },
   "models": {
     "fn-q2": {"model": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0", "revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09", "draft": "incoai/Qwen3.8-Flash-Next-DFlash2", "draft_revision": "a22a1744e85c17364dcc54a6a420af7135d4c7f6"},
