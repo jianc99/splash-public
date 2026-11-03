@@ -191,6 +191,23 @@ std::string at(const Machine &machine) { return std::string(machine.name) + ": "
 // A scenario's numbers, beside its verdict.
 void note(const std::string &line) { std::printf("engine-sim: %s\n", line.c_str()); }
 
+// A scenario's checks, each judged on its own so that one that fails leaves
+// the others' verdicts known: the scenario fails at its end with every check
+// that failed, one a line.
+struct Checks final {
+  void expect(bool holds, const std::string &message) {
+    if (!holds)
+      failures.push_back(message);
+  }
+  void verdict() const {
+    std::string message;
+    for (const std::string &failure : failures)
+      message += (message.empty() ? "" : "\n  ") + failure;
+    require(failures.empty(), message);
+  }
+  std::vector<std::string> failures;
+};
+
 // --- Requests -----------------------------------------------------------------------------------------------
 
 // A prompt of `tokens` tokens no other prompt shares a block of.
@@ -672,7 +689,7 @@ void testChurnRegrowsAfterTheHostEpisode() {
 // it already). Run as the plan places the prompts, and with every request
 // spilling (--kv-spill always), which makes the prompts Spill lanes whatever
 // the placement decides.
-void churnOrder(const Machine &machine) {
+void churnOrder(const Machine &machine, Checks &checks) {
   const test::TimingProfile &profile = *machine.profile;
   constexpr double aging = model::ExecutionLimits::maximumBatchWidth - 1;
   // The pages a Spill lane keeps Full (kv_spill's dense and window pages).
@@ -796,11 +813,12 @@ void churnOrder(const Machine &machine) {
         if (word != "cache" && !std::isdigit(static_cast<unsigned char>(word.front())))
           startTook = line;
     }
-    require(startTook.empty(), where + "a start claim took more than the cache's Ordinary units: " + startTook);
-    require(broken.empty(), where + broken);
-    require(serving.errors.empty(), where + "a request failed: " + (serving.errors.empty() ? "" : serving.errors[0]));
-    require(churn.finished.size() >= 3, where + "the churn finished " + std::to_string(churn.finished.size()) +
-                                            " requests in 8 minutes");
+    checks.expect(startTook.empty(), where + "a start claim took more than the cache's Ordinary units: " + startTook);
+    checks.expect(broken.empty(), where + broken);
+    checks.expect(serving.errors.empty(),
+                  where + "a request failed: " + (serving.errors.empty() ? "" : serving.errors[0]));
+    checks.expect(churn.finished.size() >= 3, where + "the churn finished " + std::to_string(churn.finished.size()) +
+                                                  " requests in 8 minutes");
     const engine::EngineSnapshot counts = serving.fixture.loop.statusSnapshot();
     note(where + std::to_string(churn.finished.size()) + " requests, " + std::to_string(counts.spill.spill) +
          " started Spill, " + std::to_string(counts.spill.converted) + " converted, " +
@@ -809,15 +827,18 @@ void churnOrder(const Machine &machine) {
          std::to_string(counts.scheduler.boundCuts) + " bound cuts, " + std::to_string(startClaims) +
          " start claims decided");
     if (machine.spillAlways)
-      require(counts.spill.spill >= 4, where + "only " + std::to_string(counts.spill.spill) + " requests ran Spill");
+      checks.expect(counts.spill.spill >= 4,
+                    where + "only " + std::to_string(counts.spill.spill) + " requests ran Spill");
   }
 }
 void testChurnOrderKeepsLeadersAndSpillLanes() {
   Machine always = kStudio18G;
   always.name = "studio-18g-spill-always";
   always.spillAlways = true;
-  churnOrder(kStudio18G);
-  churnOrder(always);
+  Checks checks;
+  churnOrder(kStudio18G, checks);
+  churnOrder(always, checks);
+  checks.verdict();
 }
 
 // --- SIM-warning-M6 -------------------------------------------------------------------------------------------
@@ -895,7 +916,11 @@ void testStoreRegrowsUnderPersistentWarning() {
 // request's prefill units is set against the same unit at the cap's
 // residency on the profile, and what they took beyond it is held within the
 // refill. The bound tells regrowth apart: with the store held at its floor
-// through the prompt, the request's units pass it.
+// through the prompt, the request's units pass it. A guard: the store starts
+// at its floor by construction, so a base that regrows from there passes it
+// (the tree before M3 does) and the boot sample's sizing never reaches it;
+// A109's base failure is pressure-serving's. It fails when the store does not
+// regrow once the host frees, or regrows too late for the first request.
 void testShortStartRegrowsWhenTheHostFrees() {
   const Machine &machine = kStudio18G;
   constexpr double release = 60'000.0;
@@ -1070,6 +1095,7 @@ void testValueChoiceFollowsTheCalibratedCost() {
     const Machine *machine;
     std::array<double, 2> spill;
   };
+  Checks checks;
   for (const Point &point : {Point{&kM6, {1.0, 2.7}}, Point{&kStudio36, {1.7, 3.8}}}) {
     const Machine &machine = *point.machine;
     for (const uint32_t context : {8192u, 45'056u, 131'072u}) {
@@ -1081,8 +1107,11 @@ void testValueChoiceFollowsTheCalibratedCost() {
           const ValueRun noSpill = runValue(machine, spill, context, output, Counterfactual::NoSpill, setup);
           const std::string where = at(machine) + std::to_string(context) + " tokens, " + std::to_string(output) +
                                     " left, Spill +" + std::to_string(spill) + " ms a token: ";
-          require(!free.failure, where + "a decoder failed: " + free.failure.value_or(""));
-          require(free.action != ValueRun::Action::None, where + "the decoders' growth took nothing");
+          if (free.failure || free.action == ValueRun::Action::None) {
+            checks.expect(false, where + (free.failure ? "a decoder failed: " + *free.failure
+                                                       : std::string("the decoders' growth took nothing")));
+            continue;
+          }
           const double token =
               decodeCommand(*machine.profile, 2, double(machine.store.cap) / machine.store.whole, 0) /
               kTokensPerCommand;
@@ -1095,14 +1124,16 @@ void testValueChoiceFollowsTheCalibratedCost() {
           const ValueRun::Action better = pinned.endMilliseconds < noSpill.endMilliseconds
                                               ? ValueRun::Action::Conversion
                                               : ValueRun::Action::StoreUnit;
-          require(free.action == better,
-                  where + "memory took " +
-                      (free.action == ValueRun::Action::Conversion ? "a conversion" : "a store chunk") +
-                      " where the other ends first (converted " + std::to_string(pinned.endMilliseconds / 1000.0) +
-                      " s, store chunk " + std::to_string(noSpill.endMilliseconds / 1000.0) + " s)");
+          checks.expect(free.action == better,
+                        where + "memory took " +
+                            (free.action == ValueRun::Action::Conversion ? "a conversion" : "a store chunk") +
+                            " where the other ends first (converted " +
+                            std::to_string(pinned.endMilliseconds / 1000.0) + " s, store chunk " +
+                            std::to_string(noSpill.endMilliseconds / 1000.0) + " s)");
         }
     }
   }
+  checks.verdict();
 }
 
 // --- SIM-35b-churn --------------------------------------------------------------------------------------------
@@ -1260,6 +1291,7 @@ std::vector<double> turnsTogether(Turns &turns, uint64_t firstId, uint32_t count
 // within its own command, the one in flight and one of all of them.
 void testTurnsSettleAndShareACommand() {
   const test::TimingProfile &profile = test::kM6FlashNextQ2;
+  Checks checks;
   Turns turns(profile, 8192, profile.layers);
   const std::vector<uint32_t> prefix = prompt(1, 8192);
   turns.submit(1, prefix, kTokensPerCommand);
@@ -1274,36 +1306,39 @@ void testTurnsSettleAndShareACommand() {
                            "the turns' spacing did not pass");
   }
   const engine::SchedulerSnapshot scheduler = turns.harness.engine.snapshot().scheduler;
-  require(scheduler.prefillEstimate.samples >= 5,
-          "only " + std::to_string(scheduler.prefillEstimate.samples) + " prefill units trained the estimate");
+  checks.expect(scheduler.prefillEstimate.samples >= 5,
+                "only " + std::to_string(scheduler.prefillEstimate.samples) + " prefill units trained the estimate");
   test::TimedWork work(profile);
   for (const model::PrefillLane lane : {model::PrefillLane{8192, 300, 0}, model::PrefillLane{0, 8192, 0}}) {
     const model::CommandWork shape = work.prefillWork({&lane, 1}, 0, 1);
     const double predicted = estimatedPrice(scheduler.prefillEstimate, shape);
     const double wall = test::prefillTimes(profile, shape).wallMilliseconds;
-    require(std::abs(predicted - wall) <= 0.15 * wall,
-            "the prefill estimate priced " + std::to_string(lane.rows) + " rows from " + std::to_string(lane.position) +
-                " at " + std::to_string(predicted) + " ms against the profile's " + std::to_string(wall) + " ms");
+    checks.expect(std::abs(predicted - wall) <= 0.15 * wall,
+                  "the prefill estimate priced " + std::to_string(lane.rows) + " rows from " +
+                      std::to_string(lane.position) + " at " + std::to_string(predicted) + " ms against the profile's " +
+                      std::to_string(wall) + " ms");
   }
   const double bound = unitBound(scheduler);
   std::vector<double> units = turns.contendedUnits(2);
   std::ranges::sort(units);
-  require(units.size() >= 20, "only " + std::to_string(units.size()) + " prefill units ran beside the decoder");
-  const double p95 = units[(units.size() * 95 + 99) / 100 - 1];
-  double turnaround = 0.0;
-  for (const engine::CostTermSnapshot &term : scheduler.prefillEstimate.terms)
-    if (term.quantity == "units")
-      turnaround = term.millisecondsPerUnit;
-  require(units.back() <= bound, "the longest of " + std::to_string(units.size()) + " contended prefill units, " +
-                                     std::to_string(units.back()) + " ms (p95 " + std::to_string(p95) +
-                                     "), passed the bound's " + std::to_string(bound) + " ms (G " +
-                                     std::to_string(scheduler.decodeGapTargetMilliseconds) + ", turnaround " +
-                                     std::to_string(turnaround) + " ms, p95 error " +
-                                     std::to_string(scheduler.prefillEstimate.relativeErrorP95) + ")");
+  checks.expect(units.size() >= 20, "only " + std::to_string(units.size()) + " prefill units ran beside the decoder");
+  if (!units.empty()) {
+    const double p95 = units[(units.size() * 95 + 99) / 100 - 1];
+    double turnaround = 0.0;
+    for (const engine::CostTermSnapshot &term : scheduler.prefillEstimate.terms)
+      if (term.quantity == "units")
+        turnaround = term.millisecondsPerUnit;
+    checks.expect(units.back() <= bound,
+                  "the longest of " + std::to_string(units.size()) + " contended prefill units, " +
+                      std::to_string(units.back()) + " ms (p95 " + std::to_string(p95) + "), passed the bound's " +
+                      std::to_string(bound) + " ms (G " + std::to_string(scheduler.decodeGapTargetMilliseconds) +
+                      ", turnaround " + std::to_string(turnaround) + " ms, p95 error " +
+                      std::to_string(scheduler.prefillEstimate.relativeErrorP95) + ")");
+  }
   const double command = decodeCommand(profile, 1, profile.measuredResidentShare, 0);
-  require(turns.harness.longestDecodeGap(2) <= bound + command,
-          "the decoder's longest gap, " + std::to_string(turns.harness.longestDecodeGap(2)) + " ms, passed " +
-              std::to_string(bound + command) + " ms");
+  checks.expect(turns.harness.longestDecodeGap(2) <= bound + command,
+                "the decoder's longest gap, " + std::to_string(turns.harness.longestDecodeGap(2)) + " ms, passed " +
+                    std::to_string(bound + command) + " ms");
   turns.harness.engine.cancel(2);
   turns.harness.runUntilIdle();
   const double alone = turnsTogether(turns, id, 1, 0.0, prefix)[0];
@@ -1312,8 +1347,8 @@ void testTurnsSettleAndShareACommand() {
   const std::vector<double> two = turnsTogether(turns, id, 2, 0.0, prefix);
   id += 2;
   const double worstTwo = *std::ranges::max_element(two);
-  require(worstTwo <= 4622.0 / 3065.0 * alone, "two turns together: worst TTFT " + std::to_string(worstTwo) +
-                                                   " ms against one turn's " + std::to_string(alone) + " ms");
+  checks.expect(worstTwo <= 4622.0 / 3065.0 * alone, "two turns together: worst TTFT " + std::to_string(worstTwo) +
+                                                         " ms against one turn's " + std::to_string(alone) + " ms");
   turns.harness.runUntilIdle();
   const size_t before = turns.harness.commands().size();
   const std::vector<double> four = turnsTogether(turns, id, 4, 0.0, prefix);
@@ -1327,13 +1362,13 @@ void testTurnsSettleAndShareACommand() {
              std::to_string(unit.pass) + "/" + std::to_string(unit.passes) + ":" +
              std::to_string(int(unit.wallMilliseconds));
   }
-  require(worstFour <= 5247.0 / 3065.0 * alone, "four turns together: worst TTFT " + std::to_string(worstFour) +
-                                                    " ms against one turn's " + std::to_string(alone) +
-                                                    " ms; prefill units (lanes x rows @ pass/passes: ms):" + ran);
+  checks.expect(worstFour <= 5247.0 / 3065.0 * alone,
+                "four turns together: worst TTFT " + std::to_string(worstFour) + " ms against one turn's " +
+                    std::to_string(alone) + " ms; prefill units (lanes x rows @ pass/passes: ms):" + ran);
   const double bestFour = *std::ranges::min_element(four);
-  require(worstFour <= 1.2 * bestFour, "four turns together: TTFTs from " + std::to_string(bestFour) + " to " +
-                                           std::to_string(worstFour) +
-                                           " ms; prefill units (lanes x rows @ pass/passes: ms):" + ran);
+  checks.expect(worstFour <= 1.2 * bestFour, "four turns together: TTFTs from " + std::to_string(bestFour) + " to " +
+                                                 std::to_string(worstFour) +
+                                                 " ms; prefill units (lanes x rows @ pass/passes: ms):" + ran);
   for (const uint32_t count : {2u, 4u})
     for (const double gap : {500.0, 1000.0, 1500.0}) {
       turns.harness.runUntilIdle();
@@ -1342,11 +1377,12 @@ void testTurnsSettleAndShareACommand() {
       const std::vector<double> apart = turnsTogether(turns, id, count, gap, prefix);
       id += count;
       for (size_t index = 0; index < apart.size(); ++index)
-        require(apart[index] <= 1.25 * (alone + whole),
-                std::to_string(count) + " turns " + std::to_string(int(gap)) + " ms apart: turn " +
-                    std::to_string(index + 1) + " took " + std::to_string(apart[index]) + " ms against " +
-                    std::to_string(1.25 * (alone + whole)));
+        checks.expect(apart[index] <= 1.25 * (alone + whole),
+                      std::to_string(count) + " turns " + std::to_string(int(gap)) + " ms apart: turn " +
+                          std::to_string(index + 1) + " took " + std::to_string(apart[index]) + " ms against " +
+                          std::to_string(1.25 * (alone + whole)));
     }
+  checks.verdict();
 }
 
 // --- SIM-turns-dense and SIM-long-prompt ----------------------------------------------------------------------
@@ -1448,17 +1484,22 @@ void testLongPromptBesideTwoDecoders() {
 // --- Placement once a candidate a state ------------------------------------------------------------------------
 
 // DESIGN §4.4, §6.11: each candidate's placement is found once per admission
-// state (Request::placement): over the Studio's churn, no candidate asks the
-// model's spilled-read shortfall of one kind (a prefill's or a decode's
-// need) more than once in one admission state, and Spill-capable candidates
-// were placed by it. The governor's available() is not counted: it gives no
-// hook to count its calls by.
+// state (Request::placement): over the Studio's churn, no candidate (a
+// request that holds no lane: the conversions the ledger prices ask about
+// lanes in service, Executor::spilledReadShortfall) asks the model's
+// spilled-read shortfall of one kind (a prefill's or a decode's need) more
+// than once in one admission state, and Spill-capable candidates were placed
+// by it. The state changes with what memory allocated or gave back, every
+// refusal the governor counts (EngineHarness::admissionState) and every
+// control pass, whose landings change what a placement reads. A take the
+// ledger makes for a refusal outside the governor's count, which the engine
+// counts too, is not visible here; nor are the governor's available() calls:
+// it gives no hook to count them by.
 void testPlacementOncePerCandidatePerState() {
   Serving serving(kStudio18G);
-  // The admission state changes with every admission or refusal, as the
-  // harness counts it (EngineHarness::admissionState).
   serving.fixture.executor.admissionState = [&] {
-    return serving.fixture.memory->changes().size() + serving.memory().deniedReservations;
+    return serving.fixture.memory->changes().size() + serving.memory().deniedReservations +
+           serving.fixture.controlPasses;
   };
   Churn churn(serving, {2, 0, 1});
   churn.run(240'000.0, {});
