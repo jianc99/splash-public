@@ -438,10 +438,7 @@ double Scheduler::supersedeGain(std::span<const BatchItem> lanes, uint32_t start
     if (!holds(lanes, item.requestId))
       dropped.push_back(item);
   const bool keepsSome = dropped.size() != kept.items.size();
-  const double redone =
-      dropped.empty() ? 0.0
-      : keepsSome     ? passesMilliseconds(prefillLanes(dropped, in), 0, kept.passes)
-                      : done + rest;
+  const double redone = keepsSome ? passesMilliseconds(prefillLanes(dropped, in), 0, kept.passes) : done + rest;
   const auto lower = [&](RequestPriority of) { return of > priority; };
   double gain = 0.0;
   for (const BatchItem &item : dropped) {
@@ -465,7 +462,7 @@ double Scheduler::supersedeGain(std::span<const BatchItem> lanes, uint32_t start
           (request.phase == Phase::WaitingResources && listed(command.heldStarts, id))))
       continue;
     double keep = rest + joinersMilliseconds;
-    double abandon = planMilliseconds + (!dropped.empty() && request.spec.priority >= commandPriority ? redone : 0.0);
+    double abandon = planMilliseconds + (request.spec.priority >= commandPriority ? redone : 0.0);
     if (lower(request.spec.priority)) {
       keep -= joinersMilliseconds;
       abandon -= planMilliseconds;
@@ -506,6 +503,9 @@ double Scheduler::commandMilliseconds(std::span<const model::PrefillLane> lanes)
 
 double Scheduler::passesMilliseconds(std::span<const model::PrefillLane> lanes, uint32_t first,
                                      uint32_t passes) const {
+  // No lanes run no command: no pass, no turnaround.
+  if (lanes.empty())
+    return 0.0;
   double total = 0.0;
   for (uint32_t pass = first; pass < passes; ++pass)
     total += cost_.price(work_.prefillWork(lanes, pass, passes));
