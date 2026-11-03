@@ -2,6 +2,7 @@
 #include "ops/PageStorage.hpp"
 #include "engine/KvPool.hpp"
 #include "engine/MemoryGovernor.hpp"
+#include "tests/engine/ClaimScope.hpp"
 #include "tests/engine/HostKvExtents.hpp"
 #include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestMethodReplacement.hpp"
@@ -174,6 +175,7 @@ void cachedPagesReachedAgainAreResident(const std::string &metallib) {
     metal::MetalBackend backend(metallib);
     MemoryGovernor governor(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory, 0);
+    const test::ClaimScope start(governor, ClaimClass::Floor);
     kv::PageStorage storage(backend, governor.allocationAdmission(), kvLayout, 256, 128);
     // Extent 0 holds pages 0 to 127, extent 1 pages 128 to 255.
     KvPool pool(storage, 256);
@@ -477,6 +479,10 @@ void run(const std::string &metallib) {
         128ULL * 1024 * 1024, 128ULL * 1024 * 1024, [&elasticHostAvailable] {
           return std::optional<HostMemory>(HostMemory{*elasticHostAvailable, *elasticHostAvailable});
         }, 0);
+    // What a case's storage allocates through a governor is a claim's
+    // (design/M.md L7): here a lane's KV growth, which the host gates, and
+    // below a start's, in its Floor claim.
+    const test::ClaimScope growth(hostGated, ClaimClass::InService);
     kv::PageStorage hostGatedStorage(
         backend, hostGated.allocationAdmission(), kvLayout, 256, 128);
     require(hostGatedStorage.allocateExtent(0) &&
@@ -518,6 +524,7 @@ void run(const std::string &metallib) {
 
     MemoryGovernor governor(
         backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1, queryHostMemory, 0);
+    const test::ClaimScope start(governor, ClaimClass::Floor);
     rejects([&] { kv::PageStorage(backend, governor.allocationAdmission(), kvLayout, 192, 128); },
             "KV page pool is not a whole number of extents",
             "a pool of a part of an extent was accepted");

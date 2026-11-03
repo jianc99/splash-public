@@ -1,5 +1,6 @@
 #include "engine/KvPageTier.hpp"
 #include "tests/engine/AllocationFailure.hpp"
+#include "tests/engine/ClaimScope.hpp"
 #include "tests/engine/TestBuffers.hpp"
 #include "tests/engine/TestChecks.hpp"
 #include "tests/engine/TestDrafts.hpp"
@@ -129,9 +130,14 @@ void roundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
                         extent);
   const uint32_t pageA = extent - 1;
   const uint32_t pageB = extent;
-  require(pages.allocateExtent(0) && pages.allocateExtent(1) && pages.isAllocated(pageA) &&
-              pages.isAllocated(pageB),
-          "test pages were not allocated");
+  {
+    // A case's extents are a start's, allocated in its Floor claim
+    // (design/M.md L7); what the tier does with them allocates nothing.
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(pages.allocateExtent(0) && pages.allocateExtent(1) && pages.isAllocated(pageA) &&
+                pages.isAllocated(pageB),
+            "test pages were not allocated");
+  }
   const kv::SlotFormat format(layout);
   const uint64_t slotBytes = SlotFile::slotBytesFor(format.payloadBytes());
   auto file = slotFile(format, 2);
@@ -192,8 +198,11 @@ void blockRecords(metal::MetalBackend &backend, engine::MemoryGovernor &governor
                   const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   const uint32_t extent = layout.minimumExtentPages();
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout, 2 * extent, extent);
-  require(pages.allocateExtent(0) && pages.allocateExtent(1, kv::PageForm::Index),
-          "the test extents were not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(pages.allocateExtent(0) && pages.allocateExtent(1, kv::PageForm::Index),
+            "the test extents were not allocated");
+  }
   const kv::SlotFormat format(layout);
   KvPageTier tier(pages, format, slotFile(format, 2), readers);
   static_cast<void>(fill(pages, 3, 0x7e57u));
@@ -240,7 +249,10 @@ void limits(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const kv::SlotFormat slots(layout);
   auto file = slotFile(slots, 16);
   rejects([&] { KvPageTier refused(pages, slots, file, readers, 0); }, "room for a write",
@@ -287,7 +299,10 @@ void allocationFailure(metal::MetalBackend &backend, engine::MemoryGovernor &gov
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t bytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   for (bool restoring : {false, true}) {
     bool completed = false;
@@ -341,7 +356,10 @@ void demotionsPassTheWriteBudget(metal::MetalBackend &backend, engine::MemoryGov
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   // The clock stands still: what the budget gives out does not come back.
   auto budget = std::make_shared<DiskBudget>(4 * slotBytes, [] { return 0.0; });
@@ -375,7 +393,10 @@ void closedFileRefusesDemotion(metal::MetalBackend &backend, engine::MemoryGover
   const kv::Layout layout{2, 2, 256, format};
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(4 * slotBytes));
   KvPageTier tier(pages, kv::SlotFormat(layout), file, readers);
@@ -416,7 +437,10 @@ void besideACommand(metal::MetalBackend &backend, engine::MemoryGovernor &govern
   const kv::Layout layout{10, 2, 256, format}; // Qwen3.6-35B
   const uint32_t extent = layout.minimumExtentPages();
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout, extent, extent);
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto file = std::make_shared<SlotFile>(slotBytes, std::make_shared<DiskBudget>(2 * slotBytes));
   KvPageTier tier(pages, kv::SlotFormat(layout), file, readers);
@@ -528,7 +552,10 @@ void teardown(metal::MetalBackend &backend, engine::MemoryGovernor &governor,
   const kv::Layout layout{16, 4, 256, format}; // Qwen3.8-27B
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout,
                         layout.minimumExtentPages(), layout.minimumExtentPages());
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const uint64_t slotBytes = SlotFile::slotBytesFor(pages.bytesPerPage());
   auto budget = std::make_shared<DiskBudget>(16 * slotBytes);
   auto file = std::make_shared<SlotFile>(slotBytes, budget);
@@ -559,7 +586,10 @@ void persistentRoundTrip(metal::MetalBackend &backend, engine::MemoryGovernor &g
                          const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
   const uint32_t extent = layout.minimumExtentPages();
   kv::PageStorage pages(backend, governor.allocationAdmission(), layout, extent, extent);
-  require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  {
+    const test::ClaimScope start(governor, engine::ClaimClass::Floor);
+    require(static_cast<bool>(pages.allocateExtent(0)), "the test extent was not allocated");
+  }
   const kv::SlotFormat format(layout);
   const uint64_t slotBytes = SlotFile::slotBytesFor(format.payloadBytes());
   const SlotFile::Options options{.segments = format.segments()};
