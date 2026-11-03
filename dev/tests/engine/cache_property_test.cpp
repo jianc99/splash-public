@@ -509,7 +509,11 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // Windowed seed 1836083 and plain seed 396221: in them a leaf that goes
 // passes its recency to its parent as the cache does, with what an Erase of
 // its disk-only subtree gave it (1836083), and to a parent whose demotion
-// then lands, which passes it on (396221).
+// then lands, which passes it on (396221). Plain seeds 10248, 15837, 24025,
+// 105144, 386046, 470525, 482345, 247559 and 364835: in them the resume
+// point lies below a poisoned block whose subtree goes as the first
+// transfers land, and the retries keep the newest state left, most often
+// one the walk left waiting for the write slot.
 void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
   uint64_t exact = 0, unsure = 0, landing = 0;
   const auto check = [&](uint32_t seed, bool windowed) {
@@ -538,6 +542,8 @@ void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
     check(seed, false);
   check(1836083, true);
   check(396221, false);
+  for (const uint32_t seed : {10248u, 15837u, 24025u, 105144u, 386046u, 470525u, 482345u, 247559u, 364835u})
+    check(seed, false);
   std::cout << "cache peek runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
             << " windowed and the fixed seeds; " << exact
             << " units released what they were weighed at, "

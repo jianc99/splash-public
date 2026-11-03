@@ -1116,6 +1116,8 @@ private:
   [[nodiscard]] uint32_t leafGeneration(uint64_t block) const;
   void joinSelf(uint64_t block);
   [[nodiscard]] bool ramState(uint64_t block) const;
+  [[nodiscard]] bool keptPoint(uint64_t block, uint32_t generation) const;
+  [[nodiscard]] uint64_t laterPoint() const;
   [[nodiscard]] bool keptState(uint64_t block) const;
   [[nodiscard]] bool keptLeaf(uint64_t block) const;
   [[nodiscard]] bool writes(uint64_t block) const;
@@ -1182,6 +1184,9 @@ private:
   uint32_t slimRoom_ = 0;
   std::unordered_set<uint64_t> leftRam_, demoting_, diskParents_, statesOut_, statesDropped_, copyingAhead_,
       restoring_, heldDemotions_;
+  // The states dropPoisoned erases once the transfers in flight land, for a
+  // walk that keeps the resume point.
+  std::unordered_set<uint64_t> dropped_;
   std::unordered_map<uint64_t, uint64_t> recency_;
   // The unit being weighed: what it costs, whether it holds a victim of
   // certain reuse or in use, and a state written as it goes; where it
@@ -1253,6 +1258,29 @@ Cache::ReclaimPlan::ReclaimPlan(const Cache &owner, const Walk &plan, const Memo
   for (const auto &[block, _] : cache.restores_)
     if (leaf(block, true))
       joinLater(block);
+  // Once the transfers in flight land, dropPoisoned erases the subtrees below
+  // poisoned blocks that no request or lease holds or uses, with their
+  // states, among which may be the resume point the walk keeps (keptPoint).
+  if (walk.keepResumePoint) {
+    const KvCache &kv = cache.kv_;
+    for (const uint64_t poisoned : cache.poisoned_) {
+      if (!kv.contains(poisoned))
+        continue;
+      std::vector<uint64_t> below = kv.children(poisoned), states;
+      bool held = false;
+      for (size_t index = 0; index < below.size() && !held; ++index) {
+        const uint64_t block = below[index];
+        held = kv.held(block) || cache.states_.pinned(block) ||
+               (kv.page(block) != KvCache::noPage && cache.pool_.pageActive(kv.page(block)));
+        if (cache.states_.contains(block))
+          states.push_back(block);
+        const std::vector<uint64_t> children = kv.children(block);
+        below.insert(below.end(), children.begin(), children.end());
+      }
+      if (!held)
+        dropped_.insert(states.begin(), states.end());
+    }
+  }
 }
 
 bool Cache::ReclaimPlan::weighs(const Walk &other, const MemoryRates &otherRates) const noexcept {
@@ -1445,11 +1473,12 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::evictPhase(bool inUse) {
       if (keptState(state->id))
         continue;
       // One that needs a write and waits for the write slot frees its memory
-      // as a unit that lands later, once that write and its own have landed;
-      // the newer states of its phase follow it.
+      // as a unit that lands later, once that write and its own have landed,
+      // unless it is the resume point by then; the newer states of its phase
+      // follow it.
       const StateEviction goes = stateGoes(state->id);
       held = goes.pending;
-      if (goes.evicted || (goes.pending && writes(state->id))) {
+      if (goes.evicted || (goes.pending && writes(state->id) && !keptPoint(state->id, generation_ + 1))) {
         if (goes.evicted)
           took();
         return {.progress = true, .pages = takeState(state->id, inUse), .state = true};
@@ -1459,7 +1488,7 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::evictPhase(bool inUse) {
     if (ramState(leaf->id)) {
       // A page scan's state on the leaf (LeafState), kept with the leaf's
       // chain or as the resume point; its leaf joins the leaves once it went.
-      if (keptLeaf(leaf->id) || (walk.keepResumePoint && leaf->id == cache.states_.resumePoint())) {
+      if (keptLeaf(leaf->id) || keptPoint(leaf->id, generation_)) {
         visit(leaves);
         continue;
       }
@@ -1502,7 +1531,7 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::takeLater(bool inUse) {
     const uint64_t block = next.block;
     if (!leaf(block) && !leaf(block, true))
       continue;
-    if (keptLeaf(block) || (ramState(block) && walk.keepResumePoint && block == cache.states_.resumePoint()))
+    if (keptLeaf(block) || (ramState(block) && keptPoint(block, std::max(generation_, next.generation))))
       continue;
     const LeafGoes goes = leafGoes(block, ReclaimTiming::CanWait, true);
     if (goes == LeafGoes::Stays || goes == LeafGoes::Pending || (ramState(block) && !stateGoes(block).evicted))
@@ -1909,8 +1938,38 @@ bool Cache::ReclaimPlan::ramState(uint64_t block) const {
   return cache.states_.stateResident(block) && !statesOut_.contains(block);
 }
 
+// The resume point a walk that keeps it keeps at a step of the generation:
+// the cache's (StateCache::resumePoint), and from the first landing on,
+// once dropPoisoned has erased it with the states below poisoned blocks,
+// the one the cache has then (laterPoint).
+bool Cache::ReclaimPlan::keptPoint(uint64_t block, uint32_t generation) const {
+  if (!walk.keepResumePoint)
+    return false;
+  const uint64_t point = cache.states_.resumePoint();
+  return block == point || (generation != 0 && dropped_.contains(point) && block == laterPoint());
+}
+
+// StateCache::resumePoint once dropPoisoned has erased what it will
+// (dropped_): the newest ordinary state left in RAM, else such a
+// checkpoint, those the reclaims took gone.
+uint64_t Cache::ReclaimPlan::laterPoint() const {
+  const StateCache &states = cache.states_;
+  const auto left = [&](const CacheEvictionCandidate &state) {
+    return !dropped_.contains(state.id) && !statesOut_.contains(state.id);
+  };
+  std::optional<CacheEvictionCandidate> newest;
+  for (auto state = states.ordinaryCandidate(false); state; state = states.ordinaryCandidate(false, {}, state))
+    if (left(*state))
+      newest = state;
+  if (!newest)
+    for (auto state = states.checkpointCandidate(false); state; state = states.checkpointCandidate(false, {}, state))
+      if (left(*state))
+        newest = state;
+  return newest ? newest->id : 0;
+}
+
 bool Cache::ReclaimPlan::keptState(uint64_t block) const {
-  return (walk.keepResumePoint && block == cache.states_.resumePoint()) ||
+  return keptPoint(block, generation_) ||
          (walk.restored && std::ranges::find(walk.restored->states(), block) != walk.restored->states().end());
 }
 
