@@ -212,11 +212,13 @@ void testABlockSparseLayerSaturatesAtTheSelectionAndTail() {
               "block-sparse attention pairs are not each row's selection");
 }
 
-// A model of the defaults alone (Model::prefillWork, Model::commandLimits)
-// whose commands run in up to 48 passes.
+// A model of the default work (Model::prefillWork) whose commands run in up
+// to 48 passes.
 class DefaultModel final : public model::Model {
 public:
-  uint32_t prefillPasses() const noexcept override { return 48; }
+  model::CommandLimits commandLimits() const noexcept override {
+    return {.commandRows = kChunk, .maximumPasses = 48, .lanesPastChunk = 1, .indexPageLanes = 1};
+  }
   StateAdmission begin(const ModelRequest &) override { return {}; }
   void suspend(uint64_t) override {}
   StateAdmission resume(const ModelRequest &) override { return {}; }

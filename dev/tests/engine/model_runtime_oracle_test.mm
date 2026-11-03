@@ -1523,7 +1523,7 @@ void requirePrefillGroupMatchesItsChunks(model::Runtime &executor, const kv::Pag
                                          const model::QwenStateStorage &states, std::span<const uint32_t> chat,
                                          bool vision) {
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  if (executor.prefillGroupRows(true) <= chunk) {
+  if (executor.commandLimits().commandRows <= chunk) {
     std::cout << "prefill_group=SKIP (the target runs no prefill groups)\n";
     return;
   }
@@ -3598,7 +3598,8 @@ public:
     const uint32_t position = request.committed;
     ensure(request, end);
     if (request.holdsIndexPages()) {
-      const model::ModelMemoryAdmission staging = runtime_->reserveHistoryStaging(request.id, pagesFor(end));
+      const model::ModelMemoryAdmission staging =
+          runtime_->reserveSpilledReads(request.id, {.kind = WorkKind::Prefill, .pages = pagesFor(end)});
       require(staging.granted(),
               "the staging of a spilled history was refused" + refused(staging.allocationFailure));
     }
@@ -3642,7 +3643,8 @@ public:
     for (SpillRequest *request : requests) {
       ensure(*request, request->committed + model::ExecutionLimits::targetVerifyRows);
       if (request->holdsIndexPages()) {
-        const model::ModelMemoryAdmission floor = runtime_->reserveSpilledReads(request->id);
+        const model::ModelMemoryAdmission floor =
+            runtime_->reserveSpilledReads(request->id, {.kind = WorkKind::Decode});
         require(floor.granted(),
                 "a lane's floor of the hot block cache was refused" + refused(floor.allocationFailure));
       }
@@ -3691,7 +3693,8 @@ public:
   // ended, and keep what the first run could not read.
   void requireReadsRunAgain(SpillRequest &request, uint32_t end) {
     ensure(request, end);
-    const model::ModelMemoryAdmission staging = runtime_->reserveHistoryStaging(request.id, pagesFor(end));
+    const model::ModelMemoryAdmission staging =
+        runtime_->reserveSpilledReads(request.id, {.kind = WorkKind::Prefill, .pages = pagesFor(end)});
     require(staging.granted(), "the staging of a spilled history was refused" + refused(staging.allocationFailure));
     size_t unreadable = request.pages.size() - 1;
     while (!request.copies[unreadable]) --unreadable;
@@ -3960,7 +3963,7 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
       std::vector<uint32_t> &commands = result[index];
       commands = {std::min(count, firstEnd + (index < 2 ? kIntoPage : 0))};
       while (commands.back() < count)
-        commands.push_back(std::min(count, commands.back() + runtime.prefillGroupRows(true)));
+        commands.push_back(std::min(count, commands.back() + runtime.commandLimits().commandRows));
     }
     return result;
   };
@@ -4174,8 +4177,8 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     for (size_t command = 0; command < ends[0].size() - suspends; ++command)
       static_cast<void>(spill.prefill(leaving, ends[0][command]));
     if (suspends) {
-      const model::ModelMemoryAdmission reserved =
-          runtime.reserveHistoryStaging(leaving.id, (tokens + kv::kPageTokens - 1) / kv::kPageTokens);
+      const model::ModelMemoryAdmission reserved = runtime.reserveSpilledReads(
+          leaving.id, {.kind = WorkKind::Prefill, .pages = (tokens + kv::kPageTokens - 1) / kv::kPageTokens});
       require(reserved.granted(), "the staging of a spilled history was refused" + refused(reserved.allocationFailure));
     }
     require(leaving.holdsIndexPages() && spill.historyStream().stats().stagingBytes,
@@ -4197,8 +4200,8 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   static_cast<void>(spill.prefill(beside, static_cast<uint32_t>(beside.prompt.size())));
   for (size_t command = 0; command + 1 < ends[0].size(); ++command)
     static_cast<void>(spill.prefill(leaving, ends[0][command]));
-  const model::ModelMemoryAdmission reserved =
-      runtime.reserveHistoryStaging(leaving.id, (tokens + kv::kPageTokens - 1) / kv::kPageTokens);
+  const model::ModelMemoryAdmission reserved = runtime.reserveSpilledReads(
+      leaving.id, {.kind = WorkKind::Prefill, .pages = (tokens + kv::kPageTokens - 1) / kv::kPageTokens});
   require(reserved.granted(), "the staging of a spilled history was refused" + refused(reserved.allocationFailure));
   const uint64_t leftStaging = spill.historyStream().stats().stagingBytes;
   static_cast<void>(spill.decode(std::array{&beside}, [&] { spill.end(leaving); }));
@@ -4222,7 +4225,8 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
     size_t command = 0;
     while (!streaming.holdsIndexPages()) static_cast<void>(spill.prefill(streaming, ends[0][command++]));
     const SpillStep step = spill.prefill(streaming, ends[0][command], 2, [&] {
-      require(runtime.reserveHistoryStaging(other.id, 1).granted(), "a prompt's staging was refused");
+      require(runtime.reserveSpilledReads(other.id, {.kind = WorkKind::Prefill, .pages = 1}).granted(),
+              "a prompt's staging was refused");
       if (suspends) runtime.suspend(other.id);
       else spill.end(other);
     });

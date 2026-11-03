@@ -1687,13 +1687,14 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
             "a prompt's staging within what the staging holds was refused");
     if (suspends) runtime->suspend(other.id);
     else runtime->end(other.id);
-    require(staging.state().currentBytes == held && reads.holdsSpilledReads(request.id, 128),
+    require(staging.state().currentBytes == held &&
+                !reads.spilledReadShortfall(request.id, {.kind = WorkKind::Prefill, .pages = 128}),
             std::string("a prompt's staging went with another prompt that reserved it and ") +
                 (suspends ? "was suspended" : "ended"));
   }
   while (runtime->reclaimIdleState(true, model::IdleMemory::BuffersThenCaches)) {
   }
-  require(!staging.release(UINT64_MAX) && reads.reserveSpilledReads(request.id).granted() &&
+  require(!staging.release(UINT64_MAX) && reads.reserveSpilledReads(request.id, {.kind = WorkKind::Decode}).granted() &&
               staging.state().currentBytes == held,
           "an idle reclaim, a release of the pool or a decode's floor took the staging of a prompt that goes on");
   runtime->end(request.id);
