@@ -226,6 +226,9 @@ class Engine final {
 public:
   Engine(EngineConfig config, Cache &cache, model::Model &model,
          EngineEventSink &events);
+  // Takes its own lanes back from the governor's ledger; the cache, which
+  // outlives it and another engine may share, stays.
+  ~Engine();
 
   // The request passed protocol::validateRequest; submit checks only what
   // the engine knows: vocabulary, context window, and vision with the

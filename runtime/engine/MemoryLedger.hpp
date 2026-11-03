@@ -275,7 +275,10 @@ public:
   // the source registered first and then to the pools.
   AccountId addAccount(std::string name, AccountRole role, std::function<uint64_t()> currentBytes);
   AccountId addPool(model::ElasticPool &pool);   // account + victim source; name = PoolState::name
-  void addSource(VictimSource &source);          // the cache, the engine's lane victims
+  // The cache, the engine's lane victims: each source once, whoever
+  // registers it again (two engines over one cache), until it is removed.
+  void addSource(VictimSource &source);
+  void removeSource(VictimSource &source) noexcept;
   // What transfers return when they land: all of them (Cache::returning),
   // and those of one request's own pages (Cache::returningFor).
   void setReturning(std::function<Returning()> all, std::function<Returning(uint64_t requestId)> ofRequest);

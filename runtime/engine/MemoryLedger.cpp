@@ -141,7 +141,12 @@ AccountId MemoryLedger::addPool(model::ElasticPool &pool) {
   return {static_cast<uint8_t>(accounts_.size() - 1)};
 }
 
-void MemoryLedger::addSource(VictimSource &source) { sources_.push_back(&source); }
+void MemoryLedger::addSource(VictimSource &source) {
+  if (std::ranges::find(sources_, &source) == sources_.end())
+    sources_.push_back(&source);
+}
+
+void MemoryLedger::removeSource(VictimSource &source) noexcept { std::erase(sources_, &source); }
 
 void MemoryLedger::setReturning(std::function<Returning()> all, std::function<Returning(uint64_t)> ofRequest) {
   returning_ = std::move(all);

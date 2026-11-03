@@ -534,6 +534,36 @@ void testAReplayPointBesideACheckpointIsReservedInAClaim() {
               std::to_string(passes.model.heldStateBytes));
 }
 
+// Each engine built on a governor gives its ledger the cache once, and its
+// own lanes only while it lives: a second engine over the same cache, as
+// backend_benchmark builds one beside the bootstrap's, leaves the cache's
+// units counted once, and an engine that ended leaves nothing of its own.
+void testEnginesOnOneGovernorOfferTheCacheOnce() {
+  test::GovernedHost host;
+  test::TestKvStorage storage{64, 100, 4};
+  KvPool pool{storage, 0};
+  engine::Cache cache{pool, nullptr, nullptr};
+  Executor model;
+  Events events;
+  // A cached chain of two extents, one of which the host's claim may take.
+  const std::vector<uint32_t> prompt(8 * KvCache::pageTokens, 9);
+  cache.beginRequest(900);
+  require(cache.ensureTokens(900, prompt.size()).granted(), "the cached chain's KV was not allocated");
+  static_cast<void>(test::publishBlocks(cache, 900, prompt, static_cast<uint32_t>(prompt.size())));
+  cache.endRequest(900);
+  const ClaimSpec spec{.cls = ClaimClass::Host, .holdSeconds = kValueHorizonSeconds};
+  const auto found = [&] { return host.governor.available(spec, std::numeric_limits<uint64_t>::max()); };
+  engine::Engine first{host.connect({}), cache, model, events};
+  const uint64_t once = found();
+  require(once != 0, "the cache offered the host nothing");
+  {
+    engine::Engine second{host.connect({}), cache, model, events};
+    require(found() == once, "a second engine over the cache made its units count twice: " + std::to_string(found()) +
+                                 " bytes for " + std::to_string(once));
+  }
+  require(found() == once, "an engine that ended left what it registered with the ledger");
+}
+
 // A junction is worth the prefill it saves a later request that branches
 // there, the rows since the state boundary before it, as a checkpoint is
 // worth what a recovery computes again without it: refused its buffers at
@@ -657,6 +687,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testPlacementOncePerCandidatePerState", testPlacementOncePerCandidatePerState},
       {"testARestoredStateIsPromotedInAClaim", testARestoredStateIsPromotedInAClaim},
       {"testAReplayPointBesideACheckpointIsReservedInAClaim", testAReplayPointBesideACheckpointIsReservedInAClaim},
+      {"testEnginesOnOneGovernorOfferTheCacheOnce", testEnginesOnOneGovernorOfferTheCacheOnce},
       {"testAJunctionTakesNothingWorthMoreThanItSaves", testAJunctionTakesNothingWorthMoreThanItSaves},
       {"testCacheReuseFollowsTheRecentProbes", testCacheReuseFollowsTheRecentProbes},
   };

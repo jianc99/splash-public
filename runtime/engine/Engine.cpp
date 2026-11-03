@@ -63,16 +63,21 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
   // What the engine holds is the ledger's to take, cache before the
   // engine's own victims (the tie order of the sources), the cache tells it
   // what transfers return and what its pages hold, and the model what the
-  // state buffers its units free release once they leave the pool.
+  // state buffers its units free release once they leave the pool: the
+  // cache's and the model's, which outlive the engine, as another engine
+  // over them (backend_benchmark's) finds them.
   MemoryLedger &ledger = config_.governor->ledger();
   ledger.addSource(cache_);
   ledger.addSource(victims_);
-  ledger.setReturning([this] { return cache_.returning(); },
-                      [this](uint64_t requestId) { return cache_.returningFor(requestId); });
-  ledger.setBufferBytes([this](uint32_t states) { return model_.idleBufferBytes(states) - model_.idleBufferBytes(0); });
+  ledger.setReturning([&cache = cache_] { return cache.returning(); },
+                      [&cache = cache_](uint64_t requestId) { return cache.returningFor(requestId); });
+  ledger.setBufferBytes(
+      [&model = model_](uint32_t states) { return model.idleBufferBytes(states) - model.idleBufferBytes(0); });
   ledger.setPageBytes({cache_.bytesPerPage(kv::PageForm::Full), cache_.bytesPerPage(kv::PageForm::Index),
                        cache_.bytesPerPage(kv::PageForm::Slim)});
 }
+
+Engine::~Engine() { config_.governor->ledger().removeSource(victims_); }
 
 void Engine::submit(EngineRequest value) {
   const auto outOfVocabulary = [&](uint32_t token) {
