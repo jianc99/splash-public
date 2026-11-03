@@ -86,7 +86,7 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
   }
   ledger.setLanes(laneDemandBytes(), highestLanePriority());
   // Each attempt runs in the claim's scope, from a need the scope's refusal
-  // records afresh.
+  // records afresh; what a waiting claim holds stays held.
   const auto tryOnce = [&] {
     ledger.refused(claim.id, {});
     const MemoryGovernor::Scope scope(governor, claim.id);
@@ -150,9 +150,10 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
     // for later.
     if (memoryDenied(admission) && !denial.pending && spec.cls != ClaimClass::Optional)
       allocationFailed_ = true;
-  } else if (ledger.claim(claim.id).waiting) {
-    ledger.setWaiting(claim.id, false);
   }
+  // A grant leaves a request's wait as it was: it ends once the request is
+  // admitted or its lane runs (admit, prepare), or its free() finds it
+  // short.
   return result;
 }
 

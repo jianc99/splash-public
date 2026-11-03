@@ -221,8 +221,14 @@ struct Returning final {
 // What the ledger knows of an open claim.
 struct ClaimState final {
   ClaimSpec spec;
-  // Its latest need: the refusal its scope recorded (refused), with the
-  // in-place part free() was given. A waiting claim holds it.
+  // What the latest refusal in its scope recorded (refused): the need of
+  // the allocation it attempts now.
+  Need refusal;
+  // What its latest free() that left it waiting was given, the in-place
+  // part with it: a waiting claim holds it until its wait ends, once the
+  // request is admitted or its lane runs, a free() finds it short, or its
+  // resource wait ends (Engine::syncClaims). A need met for one of the
+  // request's allocations does not end its wait for another.
   Need need;
   bool waiting = false;
   double waitingSinceSeconds = 0.0;
@@ -271,6 +277,9 @@ public:
   // (Model::idleBufferBytes beyond its value at none): what the buffers a
   // unit frees give a need of bytes once they leave the pool.
   void setBufferBytes(std::function<uint64_t(uint32_t states)> bytes);
+  // The bytes of a KV page of each kv::PageForm (Cache::bytesPerPage), in
+  // which the bytes waiting claims hold are held as pages (heldPages).
+  void setPageBytes(const std::array<uint64_t, 3> &bytes) noexcept;
   void setRates(const MemoryRates &rates) noexcept;
   // Differentiates each pool's counters, and the units claims took from it,
   // over the control clock, only across intervals in which the engine ran a
@@ -298,6 +307,10 @@ public:
   // accounts' pending growth, waiting claims ranked above it, and for a
   // Growth claim the lanes' projected growth.
   [[nodiscard]] uint64_t heldBytes(ClaimId claim, std::optional<AccountId> growing) const;
+  // The free KV pages of each form held against a page handed out in
+  // `claim`'s scope: the pages waiting claims ranked above it lack, and the
+  // bytes they lack in that form's pages, the room a hand-out from free
+  // pages in kept extents would take from what they wait for.
   [[nodiscard]] std::array<uint32_t, 3> heldPages(ClaimId claim) const;
   // The waiting claims, and the bytes those the host refused lack.
   [[nodiscard]] bool claimWaiting() const noexcept;
@@ -357,6 +370,7 @@ private:
   std::function<Returning()> returning_;
   std::function<Returning(uint64_t)> returningFor_;
   std::function<uint64_t(uint32_t)> bufferBytes_;
+  std::array<uint64_t, 3> pageBytes_{};
   MemoryRates rates_;
   uint64_t laneDemandBytes_ = 0;
   std::optional<RequestPriority> lanePriority_;

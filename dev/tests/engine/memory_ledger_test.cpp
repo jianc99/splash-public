@@ -212,6 +212,17 @@ ClaimSpec request(uint64_t id, RequestPriority priority, ClaimClass cls = ClaimC
           .priority = priority};
 }
 
+// Leaves a request's claim waiting for `need`, which its own lane's owed
+// copies meet and no other claim counts: the free() it waits on holds it.
+void waitForItsCopies(MemoryLedger &ledger, ClaimId claim, const Need &need) {
+  const uint64_t id = ledger.claim(claim).spec.requestId;
+  Returning own{.owedBytes = need.bytes};
+  own.owedPages[static_cast<size_t>(need.form)] = need.pages;
+  ledger.setReturning([] { return Returning{}; }, [=](uint64_t lane) { return lane == id ? own : Returning{}; });
+  require(ledger.free(claim, need, 0, false, false).outcome == FreeOutcome::Pending && ledger.claim(claim).waiting,
+          "a claim its lane's owed copies cover did not wait");
+}
+
 // A pool's decode value: `ghostsPerSecond` ghost hits for `seconds`, the
 // pool observed every 500 ms with commands running.
 void serve(MemoryLedger &ledger, FakeElasticPool &pool, double ghostsPerSecond, double from, double seconds) {
@@ -292,8 +303,8 @@ void testSnapshotRendersEveryAccount() {
                       [](uint64_t) { return Returning{}; });
   serve(ledger, experts, 400.0, 0.0, 10.0);
   const ClaimId waiting = ledger.open(request(7, RequestPriority::Normal));
-  ledger.refused(waiting, {.bytes = 2 * kMiB});
-  ledger.setWaiting(waiting, true);
+  require(ledger.free(waiting, {.bytes = 2 * kMiB}, 0, false, false).outcome == FreeOutcome::Pending,
+          "a claim the landings cover did not wait");
   ledger.observePools(14.0, false);
   const MemoryGovernorSnapshot snapshot = fixture.governor->snapshot();
   require(snapshot.accounts.size() == 3 && snapshot.accounts[0].name == "fixed" && snapshot.accounts[1].name == "kv" &&
@@ -314,15 +325,20 @@ void testSnapshotRendersEveryAccount() {
 }
 
 // A waiting claim holds what it lacks against every claim ranked below it:
-// a lower priority, or at its priority a later submission.
+// a lower priority, or at its priority a later submission. Each waits for
+// what lands.
 void testWaitingClaimHoldsRoomForItsRank() {
   Fixture fixture(host(32 * kGiB), 10 * kGiB);
   fixture.memory.hold("weights", 9 * kGiB);
   MemoryLedger &ledger = fixture.ledger();
+  ledger.setReturning([] { return Returning{.landingBytes = 2 * kGiB}; }, [](uint64_t) { return Returning{}; });
+  const auto waits = [&](ClaimId claim) {
+    return fixture.governor->free(claim, fixture.governor->need(claim)).outcome == FreeOutcome::Pending;
+  };
   const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
   const ClaimId low = ledger.open(request(2, RequestPriority::Background));
   require(!fixture.allocate(high, 2 * kGiB), "2 GiB fit in 1 GiB of room");
-  ledger.setWaiting(high, true);
+  require(waits(high), "a claim the landings cover did not wait");
   require(fixture.allocate(low, 512 * kMiB).failure == metal::AllocationFailure::EngineBudget,
           "a lower-ranked claim took room a waiting claim lacks");
   require(fixture.allocate(high, 512 * kMiB), "the waiting claim was refused its own room");
@@ -330,7 +346,7 @@ void testWaitingClaimHoldsRoomForItsRank() {
   const ClaimId later = ledger.open(request(4, RequestPriority::Normal));
   ledger.setWaiting(high, false);
   require(!fixture.allocate(earlier, 2 * kGiB), "2 GiB fit in the room left");
-  ledger.setWaiting(earlier, true);
+  require(waits(earlier), "a claim the landings cover did not wait");
   require(!fixture.allocate(later, 256 * kMiB), "a later submission took room an earlier one waits for");
   require(fixture.allocate(earlier, 256 * kMiB), "the earlier submission was refused room");
 }
@@ -361,11 +377,14 @@ void testNestedScopesRestore() {
     }
     require(!fixture.memory.allocate(fixture.governor->allocationAdmission(), "kv", 3 * kGiB), "3 GiB fit");
   }
-  require(ledger.claim(inner).need.bytes == 2 * kGiB && ledger.claim(outer).need.bytes == 3 * kGiB,
+  require(ledger.claim(inner).refusal.bytes == 2 * kGiB && ledger.claim(outer).refusal.bytes == 3 * kGiB,
           "a refusal was recorded on the wrong claim");
   // Once they end, an admission is for the claim whose scope is open then: a
-  // claim ranked above the one that waits is not held back by it.
-  ledger.setWaiting(outer, true);
+  // claim ranked above the one that waits, for what lands, is not held back
+  // by it.
+  ledger.setReturning([] { return Returning{.landingBytes = 3 * kGiB}; }, [](uint64_t) { return Returning{}; });
+  require(fixture.governor->free(outer, fixture.governor->need(outer)).outcome == FreeOutcome::Pending,
+          "a claim the landings cover did not wait");
   const ClaimId above = ledger.open(request(3, RequestPriority::Foreground));
   {
     const MemoryGovernor::Scope scope(*fixture.governor, above);
@@ -384,16 +403,60 @@ void testHeldPagesFollowRank() {
   const ClaimId low = ledger.open(request(3, RequestPriority::Background));
   TestSource none("cache");
   ledger.addSource(none);
-  static_cast<void>(ledger.free(high, {.pages = 6, .form = kv::PageForm::Index}, 0, false, false));
-  static_cast<void>(ledger.free(mid, {.pages = 4}, 0, false, false));
-  ledger.setWaiting(high, true);
-  ledger.setWaiting(mid, true);
+  waitForItsCopies(ledger, high, {.pages = 6, .form = kv::PageForm::Index});
+  waitForItsCopies(ledger, mid, {.pages = 4});
   const std::array<uint32_t, 3> forLow = ledger.heldPages(low);
   const std::array<uint32_t, 3> forMid = ledger.heldPages(mid);
   require(forLow[static_cast<size_t>(kv::PageForm::Index)] == 6 && forLow[static_cast<size_t>(kv::PageForm::Full)] == 4,
           "a lower-ranked claim is not held the pages of both claims above it");
   require(forMid[static_cast<size_t>(kv::PageForm::Index)] == 6 && forMid[static_cast<size_t>(kv::PageForm::Full)] == 0,
           "a claim is held its own pages or a lower claim's");
+}
+
+// The bytes a waiting claim lacks are held, in each form's pages, against
+// the free pages a claim ranked below it is handed: 10,000 bytes are three
+// Full pages of 4096 bytes and four Slim pages of 3000; a form without pages
+// holds none. A claim of its rank or above it is held nothing, nor is any
+// claim by one that free() found short.
+void testWaitingBytesHoldPagesOfEachForm() {
+  MemoryLedger ledger;
+  ledger.setPageBytes({4096, 0, 3000});
+  const ClaimId waiting = ledger.open(request(5, RequestPriority::Normal));
+  const ClaimId shortClaim = ledger.open(request(4, RequestPriority::Normal));
+  const ClaimId same = ledger.open(request(5, RequestPriority::Normal));
+  const ClaimId above = ledger.open(request(6, RequestPriority::Foreground));
+  const ClaimId below = ledger.open(request(7, RequestPriority::Background));
+  require(ledger.free(shortClaim, {.bytes = 20'000}, 0, false, false).outcome == FreeOutcome::Short,
+          "a claim nothing covers did not find free() short");
+  waitForItsCopies(ledger, waiting, {.bytes = 10'000});
+  require(ledger.heldPages(below) == std::array<uint32_t, 3>{3, 0, 4},
+          "a lower-ranked claim was not held the pages of the bytes a claim above it waits for");
+  require(ledger.heldPages(same) == std::array<uint32_t, 3>{} && ledger.heldPages(above) == std::array<uint32_t, 3>{},
+          "a claim of the waiting claim's rank or above it was held its pages");
+}
+
+// A request's wait spans its allocations: a waiting claim whose free() for
+// another of them is met keeps waiting and holds the need it waits for;
+// one free() finds short waits for nothing.
+void testAMetNeedKeepsTheWaitAShortOneEndsIt() {
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  Victim leaf = unit(1, 0, 0.2);
+  leaf.pages = 4;
+  cache.units = {leaf};
+  ledger.addSource(cache);
+  const ClaimId waiting = ledger.open(request(1, RequestPriority::Foreground));
+  const ClaimId below = ledger.open(request(2, RequestPriority::Background));
+  waitForItsCopies(ledger, waiting, {.bytes = kGiB});
+  require(ledger.free(waiting, {.pages = 4}, 0, false, false).outcome == FreeOutcome::Met &&
+              cache.taken == std::vector<uint64_t>{1},
+          "the leaf did not meet the claim's need of pages");
+  require(ledger.claim(waiting).waiting && ledger.claim(waiting).need.bytes == kGiB &&
+              ledger.heldBytes(below, std::nullopt) == kGiB,
+          "a claim whose free() for another need was met stopped waiting for its copies");
+  require(ledger.free(waiting, {.bytes = 2 * kGiB}, 0, false, false).outcome == FreeOutcome::Short &&
+              !ledger.claim(waiting).waiting && ledger.heldBytes(below, std::nullopt) == 0,
+          "a claim free() found short still waits");
 }
 
 // A pool whose displacement waits for landings holds the unit as pending
@@ -782,8 +845,7 @@ void testRoomHeldForHigherRanksMakesAWait() {
   cache.units = {unit(1, kGiB, 0.1)};
   ledger.addSource(cache);
   const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
-  ledger.refused(high, {.bytes = kGiB});
-  ledger.setWaiting(high, true);
+  waitForItsCopies(ledger, high, {.bytes = kGiB});
   const ClaimId low = ledger.open(request(2, RequestPriority::Background));
   require(ledger.free(low, {.bytes = 512 * kMiB}, kGiB, false, false).outcome == FreeOutcome::Pending &&
               cache.taken.empty(),
@@ -1403,8 +1465,7 @@ void testAClaimLacksTheRoomHeldAboveIt() {
   cache.units = {unit(1, kGiB, 0.1)};
   ledger.addSource(cache);
   const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
-  ledger.refused(high, {.bytes = kGiB});
-  ledger.setWaiting(high, true);
+  waitForItsCopies(ledger, high, {.bytes = kGiB});
   const ClaimSpec spec = request(2, RequestPriority::Background);
   const ClaimId low = ledger.open(spec);
   require(ledger.available(spec, kGiB, 512 * kMiB, false, false) == 512 * kMiB,
@@ -1431,8 +1492,7 @@ void testANeedMetInPlaceLacksNoHeldBytes() {
   cache.units = {leaf};
   ledger.addSource(cache);
   const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
-  ledger.refused(high, {.bytes = kGiB});
-  ledger.setWaiting(high, true);
+  waitForItsCopies(ledger, high, {.bytes = kGiB});
   const ClaimId low = ledger.open(request(2, RequestPriority::Background));
   require(ledger.free(low, {.pages = 8}, 0, false, false).outcome == FreeOutcome::Met &&
               cache.taken == std::vector<uint64_t>{1} && !ledger.claim(low).waiting,
@@ -1859,6 +1919,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testShortClaimHoldsNothing", testShortClaimHoldsNothing},
       {"testNestedScopesRestore", testNestedScopesRestore},
       {"testHeldPagesFollowRank", testHeldPagesFollowRank},
+      {"testWaitingBytesHoldPagesOfEachForm", testWaitingBytesHoldPagesOfEachForm},
+      {"testAMetNeedKeepsTheWaitAShortOneEndsIt", testAMetNeedKeepsTheWaitAShortOneEndsIt},
       {"testPendingGrowthIsReservedAgainstOthers", testPendingGrowthIsReservedAgainstOthers},
       {"testPendingGrowthGrowsOnItsLandedVictims", testPendingGrowthGrowsOnItsLandedVictims},
       {"testTakenPendingGrowthIsCancelled", testTakenPendingGrowthIsCancelled},

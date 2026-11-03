@@ -377,7 +377,7 @@ uint64_t MemoryGovernor::roomBytes() const noexcept {
 }
 
 Need MemoryGovernor::need(ClaimId claim, const std::optional<Need> &inPlace) const {
-  Need need = ledger_.claim(claim).need;
+  Need need = ledger_.claim(claim).refusal;
   if (inPlace) {
     need.pages = inPlace->pages;
     need.form = inPlace->form;

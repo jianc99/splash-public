@@ -62,14 +62,16 @@ Engine::Engine(EngineConfig config, Cache &cache, model::Model &model,
     weights_.emplace(*config_.weights);
   // What the engine holds is the ledger's to take, cache before the
   // engine's own victims (the tie order of the sources), the cache tells it
-  // what transfers return, and the model what the state buffers its units
-  // free release once they leave the pool.
+  // what transfers return and what its pages hold, and the model what the
+  // state buffers its units free release once they leave the pool.
   MemoryLedger &ledger = config_.governor->ledger();
   ledger.addSource(cache_);
   ledger.addSource(victims_);
   ledger.setReturning([this] { return cache_.returning(); },
                       [this](uint64_t requestId) { return cache_.returningFor(requestId); });
   ledger.setBufferBytes([this](uint32_t states) { return model_.idleBufferBytes(states) - model_.idleBufferBytes(0); });
+  ledger.setPageBytes({cache_.bytesPerPage(kv::PageForm::Full), cache_.bytesPerPage(kv::PageForm::Index),
+                       cache_.bytesPerPage(kv::PageForm::Slim)});
 }
 
 void Engine::submit(EngineRequest value) {
@@ -923,7 +925,9 @@ bool Engine::admit(Request &active, double now) {
       static_cast<void>(preemptBelow(active.request.priority, requestId, now));
     return false;
   }
+  // Admitted, it waits for nothing.
   active.resourceWait = {};
+  governor().ledger().setWaiting(active.claim.id, false);
   DraftContextPlan draft = configureDraftStatePlan(
       active, resumeBoundary, lookup.junctionBoundary);
   std::unique_ptr<StateRestore> transfer;
@@ -1464,12 +1468,16 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     }
     admitted = std::move(kept);
   }
-  // A lane that runs is waiting for nothing; one refused waits for what
+  // A lane that runs is waiting for nothing, its claim either, once every
+  // lane's memory for the command is decided; one refused waits for what
   // refused it, beside the lanes that run or alone: memory on its way back,
   // which its claim holds against the claims ranked below it (syncClaims),
   // or memory nothing returns, for which it holds nothing.
-  for (const BatchItem &scheduled : admitted)
-    request(scheduled.requestId).resourceWait = {};
+  for (const BatchItem &scheduled : admitted) {
+    Request &runs = request(scheduled.requestId);
+    runs.resourceWait = {};
+    governor().ledger().setWaiting(runs.claim.id, false);
+  }
   for (const Denied &entry : denied)
     noteRefusal(request(entry.requestId), now, entry.denial);
   // A lane refused the model's memory for its reads of spilled KV, which no

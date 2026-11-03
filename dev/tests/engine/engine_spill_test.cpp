@@ -1328,16 +1328,18 @@ void testAWaitThatNeverLandsHoldsLanesUpToItsLimit() {
   spill.runUntil([&] { return spill.model.prefillChunks[3] != 0; }, "the prompt did not run");
   spill.tier.writableFile = true;
   // From the Spill lane's second decode command on, its floor, six extents'
-  // bytes, finds four extents' room, which the lanes beside it grow into:
-  // it fits only once two extents have left memory, which only the cached
-  // chain's writes, which never land, would give back.
+  // bytes, finds five extents' room, which the lanes beside it grow into:
+  // it fits only once an extent has left memory, which only the cached
+  // chain's writes, which never land, would give back. Their landings cover
+  // its lack with an extent to spare for the decoding lane, ranked above
+  // it and so not held, to grow into over the wait.
   uint32_t asks = 0;
   std::optional<double> refusedAt;
   spill.model.spilledReadsRoom = [&](uint64_t id) {
     if (id != 2 || ++asks == 1)
       return true;
     if (!refusedAt) {
-      spill.limit(spill.held() + 4 * 16 * 100);
+      spill.limit(spill.held() + 5 * 16 * 100);
       refusedAt = spill.now;
     }
     return static_cast<bool>(spill.host.reserve(6 * 16 * 100));

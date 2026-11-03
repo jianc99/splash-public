@@ -149,6 +149,8 @@ void MemoryLedger::setReturning(std::function<Returning()> all, std::function<Re
 
 void MemoryLedger::setBufferBytes(std::function<uint64_t(uint32_t)> bytes) { bufferBytes_ = std::move(bytes); }
 
+void MemoryLedger::setPageBytes(const std::array<uint64_t, 3> &bytes) noexcept { pageBytes_ = bytes; }
+
 void MemoryLedger::setRates(const MemoryRates &rates) noexcept { rates_ = rates; }
 
 void MemoryLedger::observePools(double nowSeconds, bool commandsRan) {
@@ -178,7 +180,7 @@ ClaimId MemoryLedger::open(const ClaimSpec &spec) {
 void MemoryLedger::update(ClaimId claim, const ClaimSpec &spec) { claims_.at(claim.value).spec = spec; }
 
 void MemoryLedger::refused(ClaimId claim, const Need &need) {
-  claims_.at(claim.value).need = {.bytes = need.bytes, .hostRefused = need.hostRefused};
+  claims_.at(claim.value).refusal = {.bytes = need.bytes, .hostRefused = need.hostRefused};
 }
 
 void MemoryLedger::setWaiting(ClaimId claim, bool waiting) {
@@ -221,6 +223,17 @@ std::array<uint32_t, 3> MemoryLedger::heldPages(ClaimId claim) const {
   for (const auto &[id, state] : claims_)
     if (state.waiting && id != claim.value && state.spec.rank > self.spec.rank)
       held[static_cast<size_t>(state.need.form)] += state.need.pages;
+  // The bytes they lack, in each form's pages: a page handed out of a kept
+  // extent's free pages takes room they wait for as an extent would (the
+  // extents their landings complete hold free pages too). A form without
+  // pages has none to hold.
+  const uint64_t bytes = heldByClaims(self.spec.rank, claim.value);
+  for (size_t form = 0; form < held.size(); ++form)
+    if (pageBytes_[form]) {
+      const uint64_t pages = bytes / pageBytes_[form] + (bytes % pageBytes_[form] != 0);
+      held[form] = static_cast<uint32_t>(
+          std::min<uint64_t>(held[form] + pages, std::numeric_limits<uint32_t>::max()));
+    }
   return held;
 }
 
@@ -231,8 +244,8 @@ bool MemoryLedger::claimWaiting() const noexcept {
 uint64_t MemoryLedger::hostRefusedWaitingBytes() const noexcept {
   uint64_t bytes = 0;
   for (const auto &[id, state] : claims_)
-    if (state.waiting && state.need.hostRefused)
-      bytes = plus(bytes, state.need.bytes);
+    if (state.waiting && state.refusal.hostRefused)
+      bytes = plus(bytes, state.refusal.bytes);
   return bytes;
 }
 
@@ -512,7 +525,6 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
                                  std::optional<AccountId> growing, bool credited) {
   ClaimState &claim = claims_.at(id);
   const ClaimSpec &spec = claim.spec;
-  claim.need = need;
   const VictimQuery query{.claim = &spec, .need = need, .critical = critical, .rates = &rates_, .deficit = deficit};
 
   FreeResult result{.nowBytes = takeUnsized(query)};
@@ -595,10 +607,17 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
       result.outcome = waits(true) ? FreeOutcome::Pending : FreeOutcome::Short;
     }
   }
-  const bool waiting = result.outcome == FreeOutcome::Pending;
-  if (waiting && !claim.waiting)
-    claim.waitingSinceSeconds = nowSeconds_;
-  claim.waiting = waiting;
+  // Pending: the claim waits, holding this need. Short: it waits for
+  // nothing. Met: its wait stays as it was, since a need met for one of its
+  // request's allocations does not end the request's wait for another.
+  if (result.outcome == FreeOutcome::Pending) {
+    if (!claim.waiting)
+      claim.waitingSinceSeconds = nowSeconds_;
+    claim.waiting = true;
+    claim.need = need;
+  } else if (result.outcome == FreeOutcome::Short) {
+    claim.waiting = false;
+  }
   // One line per decision: whatever takes units, and a change of a
   // request's outcome.
   if ((run && run->covered) || (spec.requestId && claim.outcome != result.outcome))
