@@ -1359,7 +1359,9 @@ class GateTests(unittest.TestCase):
         self.assertEqual(sorted(r.tree for r in runs), ["cand", "pass"])
         work = next(
             v
-            for v in matrix.point_gate(cell, runs, PRICES, self.gates, True)
+            for v in matrix.point_gate(
+                cell, runs, spec["machines"]["mini"], PRICES, self.gates, True
+            )
             if v["rule"] == "G10 work vs pass"
         )
         self.assertEqual((work["verdict"], work["numbers"]["point"]), (stats.FAIL, 0.9))
@@ -2388,6 +2390,285 @@ class GateTests(unittest.TestCase):
             [(u["label"], u["reasons"]) for u in unused],
             [("s1-cand-2", ["the laptop was in use (HIDIdleTime 2.5 s)"])],
         )
+
+    def test_analyze_pools_the_cand_builds_it_is_given(self):
+        # The M6 cells ran on the M3b+C build src-a; the release binary src-b
+        # differs by a behaviour-neutral change, so its confirmation run
+        # (one per order, AMENDMENTS "Final test start") is pooled with them.
+        args = matrix.parse_args(
+            ["analyze", "--spec", str(SPEC), "--results", ".", "--out", "o"]
+            + ["--build", "cand=src-a,src-b"]
+        )
+        self.assertEqual(args.builds, {"cand": ["src-a", "src-b"]})
+        spec = self.with_cand_build(self.spec, ["src-a", "src-b"])
+        cell = next(c for c in spec["cells"] if c["name"] == "m6-fn-churn")
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        runs = []
+        for label, build in (
+            ("m6-fn-churn-cand-A1", "src-a"),
+            ("m6-fn-churn-cand-A3", "src-b"),
+            ("m6-fn-churn-cand-B1", "src-old"),
+        ):
+            churn_run(self.directory, label, done, [self.schema7(0)])
+            (self.directory / f"{label}.meta.json").write_text(
+                json.dumps({"label": label, "build_id": build})
+            )
+            runs.append(matrix.Run(self.directory, label, cell["name"], "cand"))
+        kept, unused = matrix.usable(spec, cell, runs)
+        self.assertEqual(
+            [r.label for r in kept], ["m6-fn-churn-cand-A1", "m6-fn-churn-cand-A3"]
+        )
+        self.assertEqual(
+            [(u["label"], u["reasons"]) for u in unused],
+            [
+                (
+                    "m6-fn-churn-cand-B1",
+                    ["build src-old, not the build under test src-a, src-b"],
+                )
+            ],
+        )
+
+    def test_g10_is_the_interval_rule(self):
+        # m6-27b-churn: one cand and one pass run per order. cand's work at
+        # 0.975 x pass lies inside the M6's +-3.6 % pooled resolution
+        # (amend/V.md §4.2): INCONCLUSIVE for the owner, not FAIL; at 0.9 it
+        # is surely worse, and a G4 failure fails it whatever the interval.
+        cell = next(c for c in self.spec["cells"] if c["name"] == "m6-27b-churn")
+
+        def runs(work):
+            found = []
+            for label, tree, order, rows in (
+                ("pa", "pass", "A", 1000),
+                ("pb", "pass", "B", 1000),
+                ("ca", "cand", "A", work),
+                ("cb", "cand", "B", work),
+            ):
+                done = [
+                    {
+                        "tag": f"w{w}-r1",
+                        "start": 0,
+                        "t": 100,
+                        "ttft": 5,
+                        "decode_tps": 30,
+                    }
+                    for w in range(3)
+                ]
+                r = churn_run(
+                    self.directory, label, done, [status(900, rows=int(rows * 585))]
+                )
+                r.tree, r.order = tree, order
+                found.append(r)
+            return found
+
+        def g10(work, g4_holds=True):
+            return {
+                v["rule"]: v["verdict"]
+                for v in matrix.point_gate(
+                    cell, runs(work), self.machine, PRICES, self.gates, g4_holds
+                )
+            }
+
+        self.assertEqual(g10(975)["G10 work vs pass"], stats.INCONCLUSIVE)
+        self.assertEqual(g10(900)["G10 work vs pass"], stats.FAIL)
+        self.assertEqual(g10(1000, g4_holds=False)["G10 ttft vs pass"], stats.FAIL)
+
+    def test_g10_ttft_takes_the_interval_over_round_worsts(self):
+        # s-27b-ttft: cand's round worsts sit 3 % above pass's, within their
+        # own round-to-round spread: INCONCLUSIVE for the owner, not FAIL.
+        def ttft_run(label, worsts):
+            write_jsonl(
+                self.directory / f"{label}.jsonl",
+                [
+                    {
+                        "kind": "round",
+                        "n": 2,
+                        "round": i,
+                        "ttft_ms": [100, w],
+                        "cached": [0, 0],
+                        "queue_ms": [0, 0],
+                    }
+                    for i, w in enumerate(worsts)
+                ],
+            )
+            (self.directory / f"{label}.out").write_text("DONE\n")
+
+        ttft_run("p", [4000, 4200, 4400])
+        ttft_run("c", [4120, 4326, 4532])
+        cell = {
+            "name": "t",
+            "machine": "studio",
+            "point_gate": "pass",
+            "gate_n": [2],
+            "recorded": {"pass": ["p"], "cand": ["c"]},
+        }
+        verdicts, _, _ = matrix.ttft_cell(cell, self.spec, [self.directory])
+        self.assertEqual(verdicts[0]["rule"], "G10 N=2")
+        self.assertEqual(verdicts[0]["verdict"], stats.INCONCLUSIVE, verdicts)
+
+    def test_the_free_disk_window_keeps_the_ssd_cache_comparable(self):
+        # s-fn-churn-ample: ntie's sNFb and sNFa filled their 10.49 GiB limits
+        # (ranges up to 10.70 GiB) and main's sMFb held 10.82 GiB under 11.14
+        # (range from 10.61): a cand run's limit must lie in [10.40, 10.92]
+        # GiB, i.e. 51.6-53.7 GiB free with the 10 GiB floor their first
+        # samples show. r150's s150Fb is in none of the cell's gates.
+        spec = matrix.load_spec(SPEC)
+        cell = next(c for c in spec["cells"] if c["name"] == "s-fn-churn-ample")
+        spec = {**spec, "cells": [cell]}
+        done = [
+            {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}
+            for w in range(3)
+        ]
+        for label, free, limit, held in (
+            ("sNFa", 51.92, 10.48, 10.32),
+            ("sNFb", 51.96, 10.49, 10.42),
+            ("sMFb", 54.6, 11.14, 10.82),
+            ("s150Fb", 55.5, 11.38, 11.34),
+        ):
+            samples = [
+                status(
+                    t,
+                    disk__limit_bytes=limit * 2**30,
+                    disk__used_bytes=used * 2**30,
+                    disk__volume_available_bytes=free * 2**30,
+                )
+                for t, used in ((0, 0), (900, held))
+            ]
+            churn_run(self.directory, label, done, samples)
+        runs = matrix.load_runs(spec, [self.directory])
+        window = matrix.ssd_window(cell, runs, "cand", spec["gates"]["tolerance"])
+        self.assertEqual(window["references"], ["sMFb", "sNFa", "sNFb"])
+        self.assertAlmostEqual(window["low"] / 2**30, 4 * 10.82 * 0.98**2 + 10, 2)
+        self.assertAlmostEqual(window["high"] / 2**30, 4 * 10.48 / 0.98**2 + 10, 2)
+        command = ["disk", "--spec", str(SPEC), "--results", str(self.directory)]
+        command += ["--cell", "s-fn-churn-ample"]
+        for free, code in ((56 * 2**30, 1), (52.5 * 2**30, 0), (47 * 2**30, 1)):
+            with (
+                mock.patch.object(matrix, "free_bytes", return_value=free),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out,
+            ):
+                self.assertEqual(matrix.main(command), code, out.getvalue())
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(matrix.main(command[:-1] + ["122b-churn"]), 0)
+
+    def test_prices_come_from_the_newest_complete_price_run(self):
+        # p-35b-price-pass-1 failed at its first 14,336-token request: its
+        # records stop at 2,048 tokens. Its rerun -2 completed; R is the
+        # 14,336-token prompt's rate of -2, never -1's 2,048-token one.
+        for label, sizes, complete in (
+            ("p-35b-price-pass-1", (300, 2048), False),
+            ("p-35b-price-pass-2", (300, 2048, 14336), True),
+        ):
+            write_jsonl(
+                self.directory / f"{label}.events.jsonl",
+                [
+                    {
+                        "kind": "request",
+                        "size": size,
+                        "prompt": size,
+                        "ttft_ms": size / 2 + 500,
+                        "decode_ms_per_token": 20,
+                    }
+                    for size in sizes
+                ],
+            )
+            (self.directory / f"{label}.out").write_text("DONE\n" if complete else "")
+        prices = matrix.serve1_prices("p-35b-price-pass-1", [self.directory])
+        self.assertEqual(prices["source"], "p-35b-price-pass-2")
+        self.assertAlmostEqual(prices["R"], 14336 / 7.668)
+        (self.directory / "p-35b-price-pass-2.out").write_text("")
+        self.assertIsNone(matrix.serve1_prices("p-35b-price-pass-1", [self.directory]))
+
+    def test_a_job_without_history_is_late_at_twice_the_minutes_it_states(self):
+        # M5 19-122b-yarn states 75 minutes and no yarn job finished before:
+        # at 50 minutes it is not late (20 minutes per churn run would say
+        # so); past 150 it is.
+        queue = Path(tempfile.mkdtemp())
+        (queue / "done").mkdir()
+        (queue / "running").mkdir()
+        job = queue / "running" / "19-122b-yarn-cand-1.sh"
+        job.write_text("#!/bin/bash\n# Expected ~75 min (estimate)\n")
+        (queue / "running" / "19-122b-yarn-cand-1.sh.log").write_text("")
+        self.assertEqual(matrix.overruns(queue, now=time.time() + 50 * 60), [])
+        self.assertEqual(len(matrix.overruns(queue, now=time.time() + 151 * 60)), 1)
+        job.write_text("LABEL=s-fn-churn-18g-cand-A1; KIND=churn; EXPECT=20\n")
+        self.assertEqual(len(matrix.overruns(queue, now=time.time() + 41 * 60)), 1)
+
+    def test_a_single_comparison_its_job_voided_is_not_judged(self):
+        # M5 p-single: the laptop was touched during the make, so the job
+        # wrote LABEL.void beside the comparison it copied.
+        cell = next(c for c in self.spec["cells"] if c["name"] == "p-single")
+        spec = {**self.with_cand_build(self.spec, "src-new"), "cells": [cell]}
+        label = "p-single-cand-27b-q4-1"
+        rounds = [
+            {"version": version, "identity": {"build_id": build}}
+            for version, build in (("baseline", "p"), ("candidate", "src-new"))
+        ]
+        (self.directory / f"{label}.backend-regression.json").write_text(
+            json.dumps({"rounds": rounds, "comparison": {"failures": []}, "pass": True})
+        )
+        (self.directory / f"{label}.void").write_text(
+            "HIDIdleTime 30 s < the make's 1200 s\n"
+        )
+        document = matrix.analyze(spec, [self.directory])
+        self.assertEqual(
+            {v["rule"]: v["verdict"] for v in document["verdicts"]}["G7 27b-q4"],
+            stats.INCONCLUSIVE,
+        )
+        self.assertEqual(
+            [(u["label"], u["reasons"]) for u in document["invalid"]],
+            [(label, ["void: HIDIdleTime 30 s < the make's 1200 s"])],
+        )
+
+    def test_a_trade_carries_the_numbers_of_its_gains(self):
+        # cand trails r150 by 3 % in work with a clearly better TTFT; the
+        # trade's record names that ratio, and the concurrent TTFT figures
+        # the machine's TTFT cell gave.
+        def make(label, tree, order, work, ttft):
+            done = [
+                {
+                    "tag": f"w{w}-r1",
+                    "start": 0,
+                    "t": 200,
+                    "ttft": ttft,
+                    "decode_tps": 30,
+                }
+                for w in range(3)
+            ]
+            r = churn_run(
+                self.directory, label, done, [status(900, rows=int(work * 585))]
+            )
+            r.tree, r.order = tree, order
+            return r
+
+        cell = {
+            "name": "c",
+            "machine": "m6",
+            "release": {"throughput": "r150"},
+            "health": [],
+        }
+        runs = [
+            make(f"r{o}{i}", "r150", o, 1000 + i, 100) for o in "AB" for i in range(3)
+        ] + [make(f"f{o}{i}", "cand", o, 970 + i, 60) for o in "AB" for i in range(2)]
+        concurrent = {
+            "gain": False,
+            "cell": "m6-fn-ttft",
+            "n": 4,
+            "cand_worst_max_ms": 5300,
+            "t150_worst_min_ms": 5100,
+        }
+        g1 = next(
+            v
+            for v in matrix.churn_cell(
+                cell, self.spec, runs, {"m6": concurrent}, PRICES
+            )
+            if v["rule"].startswith("G1")
+        )
+        self.assertTrue(g1["trade"])
+        self.assertTrue(g1["numbers"]["gains"]["ttft vs r150"].startswith("0.600"))
+        self.assertEqual(g1["numbers"]["gains"]["concurrent_ttft"], concurrent)
 
 
 class PlanTests(unittest.TestCase):
