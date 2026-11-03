@@ -98,6 +98,7 @@ public:
             .currentBytes = stats.liveBytes,
             .capBytes = stats.capBytes,
             .releaseUnitBytes = stats.releaseUnitBytes,
+            .releaseUnits = stats.releaseUnits,
             .growUnitBytes = stats.growUnitBytes,
             .wholeBytes = stats.liveBytes - stats.arenaBytes + stats.experts * slotBytes(stats)};
   }

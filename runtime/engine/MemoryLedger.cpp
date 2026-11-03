@@ -441,6 +441,7 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     model::PoolState state;
     model::PoolValue counters;
     uint64_t taken = 0;
+    uint32_t units = 0;
     bool pendingOffered = false;
   };
   std::vector<Head> heads;
@@ -458,13 +459,17 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     const uint64_t above = less(head.state.currentBytes, head.state.floorBytes);
     if (!head.state.releaseUnitBytes || head.taken >= above)
       return std::nullopt;
-    const uint64_t bytes = std::min(head.state.releaseUnitBytes, above - head.taken);
+    // Each unit at its own bytes where the pool lists them (the store's
+    // chunks, top first), else at the next one's.
+    const std::vector<uint64_t> &units = head.state.releaseUnits;
+    const uint64_t bytes =
+        std::min(head.units < units.size() ? units[head.units] : head.state.releaseUnitBytes, above - head.taken);
     // What the unit is worth over the claim's hold, and the release it takes
     // of the engine thread now.
     UnitCost cost =
         value::poolUnit(account.rate, head.counters, bytes, missingBytes(head.state), spec.holdSeconds, rates_);
     cost.onceSeconds += value::releaseSeconds(head.counters, bytes);
-    return Victim{.key = head.taken / head.state.releaseUnitBytes, .bytes = bytes, .cost = cost};
+    return Victim{.key = head.units, .bytes = bytes, .cost = cost};
   };
   for (size_t index = 0; index < sources_.size(); ++index)
     heads.push_back(Head{.victim = sources_[index]->peek(query, nullptr), .source = index});
@@ -482,8 +487,10 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
   }
   const auto advance = [&](Head &head) {
     if (head.pool) {
-      if (!head.pending)
+      if (!head.pending) {
         head.taken += head.victim->bytes;
+        ++head.units;
+      }
       head.victim = poolUnit(head);
     } else {
       head.victim = sources_[head.source]->peek(query, &*head.victim);
@@ -590,10 +597,11 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
 // order as it stands, past the units the run passed over, up to a unit no
 // longer offered as chosen (VictimSource), a pool's units by releasing
 // what the run's choices of them still lack, pending growth by cancelling
-// it. The run sized a pool's units after its first at the first's bytes,
-// and a later one may be larger (the store's last live chunk is the rest
-// of a size, the chunk before it about 1 GiB): released choice by choice,
-// each larger unit would go for a choice the one before already met.
+// it. The run sizes a pool's units at their own bytes where it lists them
+// (the store's last live chunk is the rest of a size, the chunk before it
+// about 1 GiB), else after its first at the first's, and a later one may be
+// larger: released choice by choice, each larger unit would go for a choice
+// the one before already met.
 FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, ClaimState *claim, bool &whole) {
   FreeResult result{.outcome = run.later ? FreeOutcome::Pending : FreeOutcome::Met};
   whole = true;

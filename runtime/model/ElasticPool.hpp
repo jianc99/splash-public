@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <string_view>
+#include <vector>
 
 namespace splash::model {
 
@@ -15,6 +16,8 @@ struct PoolState final {
   uint64_t capBytes = 0;          // the bound grow() approaches; == currentBytes for a pool that grows only as it
                                   // is used
   uint64_t releaseUnitBytes = 0;  // what release(1) frees now; 0 at the floor
+  std::vector<uint64_t> releaseUnits;  // what each release(1) frees from now to the floor, in turn, where the
+                                       // units differ (the store's chunks); empty: each releaseUnitBytes
   uint64_t growUnitBytes = 0;     // what grow() takes next; 0 when the engine cannot grow it now (at its cap,
                                   // released, a pool that grows only as it is used)
   uint64_t wholeBytes = 0;        // what it would allocate holding every key it serves (the store: every expert

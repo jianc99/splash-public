@@ -241,9 +241,10 @@ struct ExpertStore::Impl {
     SlotRecycler recycling{0};
     std::vector<uint32_t> ownerBlock, ownerExpert; // kNoSlot when free
 
-    // Its slots above its floor, as many as its live chunks hold.
-    [[nodiscard]] uint32_t aboveFloor() const noexcept {
-      return chunkLayout.first(chunks.liveChunks()) - chunkLayout.first(chunkLayout.floorChunks);
+    // Its slots above its floor, as many as its live chunks hold, or `live`.
+    [[nodiscard]] uint32_t aboveFloor() const noexcept { return aboveFloor(chunks.liveChunks()); }
+    [[nodiscard]] uint32_t aboveFloor(uint32_t live) const noexcept {
+      return chunkLayout.first(live) - chunkLayout.first(chunkLayout.floorChunks);
     }
   };
   struct Block final {
@@ -320,8 +321,10 @@ struct ExpertStore::Impl {
   // The streamed size whose last live elastic chunk goes next, the one with
   // the largest share of its slots above its floor, and the size whose next
   // elastic chunk comes back next, the one with the smallest; kNoSlot when
-  // none has such a chunk.
-  [[nodiscard]] uint32_t shrinkingSize() const noexcept;
+  // none has such a chunk; the first of them also at `live` chunks of each
+  // size (publish: the chunks in the order they go).
+  [[nodiscard]] uint32_t shrinkingSize() const;
+  [[nodiscard]] uint32_t shrinkingSize(std::span<const uint32_t> live) const noexcept;
   // Whether the store may give chunks back now: it holds its memory, no
   // command is in flight, no load failed, and no routed expert waits to be
   // staged. A command that failed after a load's last round staged leaves
@@ -815,13 +818,19 @@ void ExpertStore::Impl::fill() {
   forgetRepack();
 }
 
-uint32_t ExpertStore::Impl::shrinkingSize() const noexcept {
+uint32_t ExpertStore::Impl::shrinkingSize() const {
+  std::vector<uint32_t> live;
+  for (const Size &size : sizes) live.push_back(size.chunks.liveChunks());
+  return shrinkingSize(live);
+}
+
+uint32_t ExpertStore::Impl::shrinkingSize(std::span<const uint32_t> live) const noexcept {
   uint32_t chosen = kNoSlot;
   for (uint32_t index = 0; index < sizes.size(); ++index) {
     const Size &size = sizes[index];
-    if (size.chunks.liveChunks() <= size.chunkLayout.floorChunks) continue;
-    if (chosen == kNoSlot ||
-        uint64_t{size.aboveFloor()} * sizes[chosen].slots > uint64_t{sizes[chosen].aboveFloor()} * size.slots)
+    if (live[index] <= size.chunkLayout.floorChunks) continue;
+    if (chosen == kNoSlot || uint64_t{size.aboveFloor(live[index])} * sizes[chosen].slots >
+                                 uint64_t{sizes[chosen].aboveFloor(live[chosen])} * size.slots)
       chosen = index;
   }
   return chosen;
@@ -970,6 +979,15 @@ void ExpertStore::Impl::publish() {
   const uint32_t shrinking = resizes ? shrinkingSize() : kNoSlot, growing = resizes ? growingSize() : kNoSlot;
   counters.releaseUnitBytes =
       shrinking == kNoSlot ? 0 : sizes[shrinking].buffers[sizes[shrinking].chunks.liveChunks() - 1].sizeBytes();
+  // Every chunk above the floors, in the order releaseAboveFloor() gives
+  // them back: their sizes differ (the last of a size is the rest of it).
+  counters.releaseUnits.clear();
+  if (shrinking != kNoSlot) {
+    std::vector<uint32_t> live;
+    for (const Size &size : sizes) live.push_back(size.chunks.liveChunks());
+    for (uint32_t index = shrinking; index != kNoSlot; index = shrinkingSize(live))
+      counters.releaseUnits.push_back(sizes[index].buffers[--live[index]].sizeBytes());
+  }
   counters.growUnitBytes =
       growing == kNoSlot ? 0 : sizes[growing].buffers[sizes[growing].chunks.liveChunks()].sizeBytes();
   counters.ghostHits = counters.ghostBytes = counters.nearGhostHits = counters.tailHits = counters.marginBytes = 0;

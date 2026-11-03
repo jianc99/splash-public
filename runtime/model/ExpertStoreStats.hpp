@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace splash::model {
 
@@ -65,6 +66,9 @@ struct ExpertStoreStats final {
   // a failed load.
   uint64_t releaseUnitBytes = 0;
   uint64_t growUnitBytes = 0;
+  // The bytes of every chunk above the floors, in the order
+  // releaseAboveFloor() gives them back (the first is releaseUnitBytes).
+  std::vector<uint64_t> releaseUnits;
   // The claims of experts the streamed sizes' recycling gave up lately
   // (SlotRecycler::ghostHits), and the slots those ghosts would take now.
   uint64_t ghostHits = 0;

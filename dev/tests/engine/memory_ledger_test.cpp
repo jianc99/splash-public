@@ -123,12 +123,13 @@ public:
             .currentBytes = current,
             .capBytes = current,
             .releaseUnitBytes = units_.empty() ? 0 : units_.back(),
+            .releaseUnits = {units_.rbegin(), units_.rend()},
             .wholeBytes = wholeBytes_};
   }
   [[nodiscard]] model::PoolValue value() const override {
-    return {.hits = hits, .missMilliseconds = missMilliseconds_, .keyBytes = keyBytes_,
-            .scanReadBytes = scanReadBytes, .nearGhostHits = nearGhostHits, .tailHits = tailHits,
-            .marginBytes = marginBytes};
+    return {.hits = hits, .ghostHits = ghostHits, .ghostBytes = ghostBytes, .missMilliseconds = missMilliseconds_,
+            .keyBytes = keyBytes_, .scanReadBytes = scanReadBytes, .nearGhostHits = nearGhostHits,
+            .tailHits = tailHits, .marginBytes = marginBytes};
   }
   [[nodiscard]] uint64_t release(uint64_t bytes) override {
     uint64_t released = 0;
@@ -150,6 +151,8 @@ public:
   uint64_t hits = 0, scanReadBytes = 0;
   // The marginal counts and the bytes they count in, an elastic chunk's.
   uint64_t nearGhostHits = 0, tailHits = 0, marginBytes = 0;
+  // The ghosts' hits and the bytes they span.
+  uint64_t ghostHits = 0, ghostBytes = 0;
 
 private:
   uint64_t floorBytes_;
@@ -2843,6 +2846,49 @@ void testAShortfallTakesAtMostOneUnitBeyondIt() {
               " MiB of a store whose small chunk goes first, not it and one large chunk");
 }
 
+// N1 (smoke c, M6): the dry run counts and prices each of the store's units
+// at its own chunk's bytes, in the order the store gives them back. On the
+// M6 a 179 MiB chunk, the rest of its size, goes before 1023 MiB ones, and a
+// 272 MiB host claim took 1202 MiB, the second chunk counted and priced as
+// 179 MiB. A cache unit priced between the two chunks covers what the top
+// chunk leaves of the need more cheaply than the 1023 MiB chunk: the plan
+// takes it, not that chunk; with no other unit it takes the chunk, counted
+// at its bytes.
+void testEachStoreUnitCountsItsOwnChunk() {
+  Fixture fixture(host(32 * kGiB));
+  ListedPool experts(kGiB, {1023 * kMiB, 1023 * kMiB, 179 * kMiB}, 8 * kGiB, 16 * kMiB, 2.0);
+  experts.ghostBytes = 4 * kGiB;
+  TestSource cache("cache", &fixture.memory);
+  fixture.ledger().addSource(cache);
+  fixture.ledger().addPool(experts);
+  for (double t = 0.0; t < 30.0; t += 0.5) {
+    experts.ghostHits += 20;
+    fixture.ledger().observePools(t + 0.5, true);
+  }
+  const double perGiB = fixture.governor->snapshot().accounts.back().valuePerGiB;
+  require(perGiB > 0.0, "the store's units have no price");
+  // 128 MiB of idle cache at the price of 256 MiB of the store.
+  cache.units = {unit(1, 128 * kMiB, 0.25 * perGiB)};
+  fixture.memory.hold("cache", 128 * kMiB);
+  const ClaimId claim =
+      fixture.ledger().open(request(1, RequestPriority::Normal, ClaimClass::InService, kValueHorizonSeconds));
+  const FreeResult freed = fixture.ledger().free(claim, {.bytes = 272 * kMiB}, 0, false, false);
+  require(freed.outcome == FreeOutcome::Met && experts.currentBytes() == kGiB + 2046 * kMiB &&
+              cache.taken == std::vector<uint64_t>{1},
+          "a 272 MiB need took " + std::to_string(freed.nowBytes / kMiB) + " MiB, the store left at " +
+              std::to_string((experts.currentBytes() - kGiB) / kMiB) + " MiB above its floor and " +
+              std::to_string(cache.taken.size()) + " cache units, not its 179 MiB chunk and the cache");
+  ListedPool alone(kGiB, {1023 * kMiB, 1023 * kMiB, 179 * kMiB}, 8 * kGiB, 16 * kMiB, 2.0);
+  MemoryLedger ledger;
+  ledger.addPool(alone);
+  const FreeResult whole = ledger.free(ledger.open(request(1, RequestPriority::Normal)), {.bytes = 272 * kMiB}, 0,
+                                       false, false);
+  require(whole.outcome == FreeOutcome::Met && whole.nowBytes == 1202 * kMiB &&
+              alone.currentBytes() == kGiB + 1023 * kMiB,
+          "with no other unit a 272 MiB need took " + std::to_string(whole.nowBytes / kMiB) +
+              " MiB, not the 179 and 1023 MiB chunks");
+}
+
 // A host reading that lags the release behind it takes nothing more: the
 // next pass waits for the host to settle (owner 21:05, borrowed item 3(d)).
 void testALaggingHostReadingTakesNoSecondRelease() {
@@ -3815,6 +3861,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testCopiesAheadOnlyAfterDemandReachedUncopiedCache", testCopiesAheadOnlyAfterDemandReachedUncopiedCache},
       {"testPoolValueSurvivesAnIdleReleaseAndRestore", testPoolValueSurvivesAnIdleReleaseAndRestore},
       {"testAShortfallTakesAtMostOneUnitBeyondIt", testAShortfallTakesAtMostOneUnitBeyondIt},
+      {"testEachStoreUnitCountsItsOwnChunk", testEachStoreUnitCountsItsOwnChunk},
       {"testALaggingHostReadingTakesNoSecondRelease", testALaggingHostReadingTakesNoSecondRelease},
       {"testPoolFloorBoundsEveryTake", testPoolFloorBoundsEveryTake},
       {"testEachDecisionLogsOneLine", testEachDecisionLogsOneLine},
