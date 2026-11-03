@@ -151,6 +151,41 @@ Victim unit(uint64_t key, uint64_t bytes, double onceSeconds, bool later = false
   return {.key = key, .bytes = bytes, .later = later, .cost = {.onceSeconds = onceSeconds}};
 }
 
+// Lanes a claim may convert, each listed while its pages fit the quota left,
+// each lane alone: as EngineVictims listed them, a conversion's commitment
+// lowering the quota the others are listed against.
+class QuotaSource final : public VictimSource {
+public:
+  struct Lane final {
+    uint64_t id = 0;
+    uint64_t pages = 0;
+  };
+  [[nodiscard]] std::string_view name() const noexcept override { return "engine"; }
+  [[nodiscard]] std::optional<Victim> peek(const VictimQuery &, const Victim *after) const override {
+    auto lane = lanes.begin();
+    if (after)
+      lane = std::next(std::ranges::find(lanes, after->key, &Lane::id));
+    for (; lane != lanes.end(); ++lane)
+      if (std::ranges::find(converted, lane->id) == converted.end() && lane->pages <= quota)
+        return Victim{.key = lane->id,
+                      .bytes = kGiB,
+                      .later = true,
+                      .cost = {.onceSeconds = 1.0},
+                      .kind = VictimKind::Conversion};
+    return std::nullopt;
+  }
+  FreeResult take(const VictimQuery &, const Victim &victim) override {
+    const auto lane = std::ranges::find(lanes, victim.key, &Lane::id);
+    converted.push_back(lane->id);
+    quota -= lane->pages;
+    return {FreeOutcome::Pending, 0, victim.bytes};
+  }
+
+  std::vector<Lane> lanes;
+  uint64_t quota = 0;
+  std::vector<uint64_t> converted;
+};
+
 // A host of 64 GiB whose headroom, its spare memory above the governor's
 // 2 GiB spare reserve, is `headroom` while the engine holds nothing.
 FakeMemory::Config host(uint64_t headroom, MemoryPressure pressure = MemoryPressure::Normal,
@@ -760,6 +795,34 @@ void testUnitsKeyedByTheirPlaceAreTakenAsChosen() {
   require(placed.taken == std::vector<uint64_t>{1, 3, 4} && other.taken == std::vector<uint64_t>{5} &&
               placed.units.size() == 1 && placed.units.front().first == 2,
           "free() did not take the units its dry run chose from a source keyed by place");
+}
+
+// A conversion's key is its lane, and free() takes no lane its dry run did
+// not choose: when a lane it chose is no longer offered once the units
+// before it were taken (their commitments filled the quota it was listed
+// against), free() stops there with what it took, neither converting
+// another lane nor throwing.
+void testATakeConvertsOnlyTheLanesItsRunChose() {
+  for (const bool another : {true, false}) {
+    MemoryLedger ledger;
+    QuotaSource lanes;
+    lanes.quota = 12;
+    lanes.lanes = {{1, 10}, {2, 8}};
+    if (another)
+      lanes.lanes.push_back({3, 2});
+    ledger.addSource(lanes);
+    const ClaimId claim = ledger.open(request(9, RequestPriority::Foreground));
+    std::optional<FreeResult> freed;
+    try {
+      freed = ledger.free(claim, {.bytes = 2 * kGiB}, 0, false, false);
+    } catch (const std::exception &error) {
+      require(false, std::string("free() threw once a lane its dry run chose was no longer offered: ") + error.what());
+    }
+    require(lanes.converted == std::vector<uint64_t>{1} && freed->outcome == FreeOutcome::Pending &&
+                freed->laterBytes == kGiB && ledger.claim(claim).converted == std::vector<uint64_t>{1},
+            std::string("free() did not stop at the lane it chose that the quota no longer lists") +
+                (another ? " (another lane fits the quota left)" : ""));
+  }
 }
 
 // A state whose buffers the model's pool keeps, refilling those a lane
@@ -1971,6 +2034,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testCheapestPerByteFirstAcrossSources", testCheapestPerByteFirstAcrossSources},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
       {"testUnitsKeyedByTheirPlaceAreTakenAsChosen", testUnitsKeyedByTheirPlaceAreTakenAsChosen},
+      {"testATakeConvertsOnlyTheLanesItsRunChose", testATakeConvertsOnlyTheLanesItsRunChose},
       {"testAStateThePoolKeepsGoesWithTheNextUnitOfItsSource", testAStateThePoolKeepsGoesWithTheNextUnitOfItsSource},
       {"testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst",
        testTiesGoToTheImmediateUnitThenTheSourceRegisteredFirst},

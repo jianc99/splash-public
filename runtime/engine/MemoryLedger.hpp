@@ -190,8 +190,10 @@ struct VictimQuery final {
 // dry run chose in the source's order, each found again by peeking from the
 // head as it stands then, past as many units as the run passed over before
 // it. So taking a unit leaves the units before it where they were and those
-// after it in their order. Units that cost nothing and are sized only when
-// taken come first in a source's order.
+// after it in their order; a unit found again that is not the one chosen (of
+// another kind, or another lane's conversion) ends the take there, with what
+// it took, and the claim's retry weighs the rest afresh. Units that cost
+// nothing and are sized only when taken come first in a source's order.
 class VictimSource {
 public:
   virtual ~VictimSource() = default;
@@ -353,7 +355,9 @@ private:
   [[nodiscard]] uint64_t pendingGrowthBytes() const noexcept;
   [[nodiscard]] DryRun dryRun(const ClaimSpec &spec, const VictimQuery &query, uint64_t lackingBytes,
                               uint32_t lackingPages, std::optional<AccountId> growing) const;
-  [[nodiscard]] FreeResult take(const DryRun &run, const VictimQuery &query, ClaimState *claim);
+  // `whole`: false when a unit the run chose was no longer offered as
+  // chosen, where the take stopped.
+  [[nodiscard]] FreeResult take(const DryRun &run, const VictimQuery &query, ClaimState *claim, bool &whole);
   // Takes each source's units that cost nothing and are sized only when
   // taken, until one frees nothing; the bytes they freed.
   uint64_t takeUnsized(const VictimQuery &query);

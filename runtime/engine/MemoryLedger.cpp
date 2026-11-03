@@ -481,15 +481,16 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
 
 // Takes what a covered dry run chose, in its order: a source's unit, each
 // it carried before the one it went with, by its place in the source's
-// order as it stands, past the units the run passed over (VictimSource),
-// a pool's units by releasing what the run's choices of
-// them still lack, pending growth by cancelling it. The run sized a pool's
-// units after its first at the first's bytes, and a later one may be larger
-// (the store's last live chunk is the rest of a size, the chunk before it
-// about 1 GiB): released choice by choice, each larger unit would go for a
-// choice the one before already met.
-FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, ClaimState *claim) {
+// order as it stands, past the units the run passed over, up to a unit no
+// longer offered as chosen (VictimSource), a pool's units by releasing
+// what the run's choices of them still lack, pending growth by cancelling
+// it. The run sized a pool's units after its first at the first's bytes,
+// and a later one may be larger (the store's last live chunk is the rest
+// of a size, the chunk before it about 1 GiB): released choice by choice,
+// each larger unit would go for a choice the one before already met.
+FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, ClaimState *claim, bool &whole) {
   FreeResult result{.outcome = run.later ? FreeOutcome::Pending : FreeOutcome::Met};
+  whole = true;
   // Each source's last unit the run passed over, which stays in its order.
   std::vector<std::optional<Victim>> passed(sources_.size());
   // Each pool's bytes the run chose so far, and those its releases gave.
@@ -523,8 +524,11 @@ FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, Claim
       before = unit;
       unit = source.peek(query, &*before);
     }
-    if (!unit)
-      throw std::logic_error(std::string(source.name()) + " no longer offers a unit its dry run chose");
+    if (!unit || unit->kind != choice.victim.kind ||
+        (unit->kind == VictimKind::Conversion && unit->key != choice.victim.key)) {
+      whole = false;
+      return result;
+    }
     const FreeResult taken = source.take(query, *unit);
     result.nowBytes = plus(result.nowBytes, taken.nowBytes);
     result.laterBytes = plus(result.laterBytes, taken.laterBytes);
@@ -642,14 +646,19 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
     if (run->uncopied)
       uncopiedReachedSeconds_ = nowSeconds_;
     if (run->covered) {
-      FreeResult taken = take(*run, query, &claim);
+      bool whole = true;
+      FreeResult taken = take(*run, query, &claim, whole);
       if (run->bufferBytes && !need.stateBuffers)
         taken.nowBytes = plus(taken.nowBytes, takeUnsized(query));
       const bool alone = (lackingBytes && run->bytes >= lackingBytes) ||
                          (lackingPages && run->pages >= lackingPages) ||
                          (need.stateBuffers && run->buffers >= need.stateBuffers);
-      result = {alone ? taken.outcome : FreeOutcome::Pending, plus(result.nowBytes, taken.nowBytes),
-                taken.laterBytes};
+      // A take that stopped short waits for what it started to land, else
+      // leaves what it freed to the claim's retry.
+      const FreeOutcome outcome = !whole ? (taken.laterBytes ? FreeOutcome::Pending : FreeOutcome::Short)
+                                  : alone ? taken.outcome
+                                          : FreeOutcome::Pending;
+      result = {outcome, plus(result.nowBytes, taken.nowBytes), taken.laterBytes};
     } else {
       result.outcome = waits(true) ? FreeOutcome::Pending : FreeOutcome::Short;
     }
