@@ -24,6 +24,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -229,6 +230,46 @@ void testSupersedingClaimTakesThePassCommand() {
                 std::to_string(passes.events.completedCount) + ", failed " +
                 std::to_string(passes.events.failedCount));
   }
+}
+
+// A start the host refused beside a resident lane waits for the host's
+// passes, which free what it lacks (earlyfix.md, MemoryLedger.cpp:555 and
+// MemoryGovernor.cpp:515; amend/M.md B3): a Foreground lane waits for its
+// token mask, the host has the margin and 48 KiB more, and a start needs 64
+// KiB of fresh lane state; a control pass frees a unit of a pool at its cap
+// (no band), and the start runs.
+void testAHostRefusedStartIsFreedForByThePass() {
+  test::EngineHarness harness({.pages = 64, .memory = test::FakeMemory::Config{}});
+  test::FakeElasticPool pool("experts", *harness.memory, 64 * 1024, 1, 3, 4, 3, 0.25, 1.0);
+  static_cast<void>(harness.governor->ledger().addPool(pool));
+  harness.model.laneFootprintBytes = 64 * 1024;
+  harness.engine.submit(harness.request(1, std::vector<uint32_t>(513, 1)));
+  harness.runUntilIdle();
+  harness.engine.submit(maskedForeground(2, std::vector<uint32_t>(64, 2)));
+  harness.runUntil([&] { return harness.events.maskRequests.size() == 1; },
+                   "the Foreground lane did not wait for its mask");
+  test::FakeMemory &memory = *harness.memory;
+  memory.setHost(memory.hostBytes() - memory.total() - test::GovernorLimits{}.hostSpareReserveBytes -
+                     kHostMarginBytes - 48 * 1024,
+                 MemoryPressure::Normal);
+  harness.engine.submit(harness.request(3, std::vector<uint32_t>(64, 3)));
+  double pass = harness.now();
+  for (const double end = harness.now() + 3000.0; harness.now() < end && !harness.events.outputs.contains(3);) {
+    if (harness.now() >= pass) {
+      static_cast<void>(harness.governor->controlPass(harness.now()));
+      pass += 500.0;
+    }
+    if (!harness.tick())
+      harness.advanceTo(harness.now() + 1.0);
+  }
+  const MemoryGovernorSnapshot governor = harness.governor->snapshot();
+  require(harness.events.outputs.contains(3),
+          "a start the host refused beside a resident lane was never freed for by the host's passes: begins " +
+              std::to_string(harness.model.beginAttempts) + ", host headroom " +
+              std::to_string(governor.hostHeadroomBytes) + ", waiting claims " +
+              std::to_string(governor.claims.waiting) + ", states " + std::to_string(memory.held("states")) +
+              ", kv " + std::to_string(memory.held("kv")) + ", host refused " +
+              std::to_string(harness.governor->ledger().hostRefusedWaitingBytes()));
 }
 
 // Five cached one-page blocks under states on disk in a pool the budget
@@ -962,6 +1003,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testAHostRefusedStartWaitsOnItsClaim", testAHostRefusedStartWaitsOnItsClaim},
       {"testADecodeGapNamesItsCause", testADecodeGapNamesItsCause},
       {"testADecodeGapOnExpertReadsIsAnSsdWait", testADecodeGapOnExpertReadsIsAnSsdWait},
+      {"testAHostRefusedStartIsFreedForByThePass", testAHostRefusedStartIsFreedForByThePass},
   };
   return kTests;
 }
