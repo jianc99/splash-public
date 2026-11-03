@@ -702,8 +702,9 @@ def _resolve_draft(family, selection, installed, target):
     release, at the commit its default branch names now: one Hub request, as
     for the target, made only when the Hub answered for the target. Else the
     installed draft stands in, unlisted, or without one a commit the Hub
-    cache holds for this selection; the installed draft also stands in, with
-    the reason, when the draft cannot be resolved."""
+    cache holds for this selection; with neither, it fails with the target's
+    reason and class. The installed draft also stands in, with the reason,
+    when the draft cannot be resolved."""
     name = selection.draft_model or family.draft_repo
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
@@ -718,6 +719,7 @@ def _resolve_draft(family, selection, installed, target):
             unreachable=None
             if asked
             else target.unreachable_reason or "the Hub did not list the target",
+            unreachable_kind=target.unreachable_kind,
         )
     except models.ModelError as error:
         if not recorded:

@@ -247,6 +247,7 @@ class Repository:
         *,
         sizes=None,
         unreachable_reason=None,
+        unreachable_kind=None,
         default_branch=False,
     ):
         self.name, self.revision, self.files = name, revision, files
@@ -258,8 +259,10 @@ class Repository:
         # Hub filename -> (bytes, blob ID), to report what a download fetches.
         self.sizes = sizes or {}
         # Why the Hub did not resolve this source, when its cached snapshot
-        # stands in; None when no stand-in was needed.
+        # stands in, and that failure's class (failure_kind); None when no
+        # stand-in was needed.
         self.unreachable_reason = unreachable_reason
+        self.unreachable_kind = unreachable_kind
 
     @classmethod
     def local_directory(cls, path):
@@ -275,7 +278,7 @@ class Repository:
         return cls(name, None, set(paths), dict(paths))
 
     @classmethod
-    def cached(cls, name, commit, *, unreachable_reason=None):
+    def cached(cls, name, commit, *, unreachable_reason=None, unreachable_kind=None):
         """name at commit from its snapshot in the Hub cache, without the Hub;
         only the files downloaded before are available."""
         path = snapshot(name, commit)
@@ -283,7 +286,12 @@ class Repository:
             raise models.ModelError(f"the Hub cache has no snapshot {commit} of {name}")
         paths = _paths(path)
         return cls(
-            name, commit, set(paths), paths, unreachable_reason=unreachable_reason
+            name,
+            commit,
+            set(paths),
+            paths,
+            unreachable_reason=unreachable_reason,
+            unreachable_kind=unreachable_kind,
         )
 
     @classmethod
@@ -295,7 +303,14 @@ class Repository:
 
     @classmethod
     def resolve(
-        cls, name, revision=None, *, installation=None, installed=None, unreachable=None
+        cls,
+        name,
+        revision=None,
+        *,
+        installation=None,
+        installed=None,
+        unreachable=None,
+        unreachable_kind=None,
     ):
         """name at the commit revision names now. This decides whether the
         Hub is asked.
@@ -311,12 +326,14 @@ class Repository:
         it names for the default branch is recorded in the Hub cache once
         the cache holds it, now or when a download of it ends
         (_record_default_branch). When the Hub cannot answer, installed
-        stands in the same way, with the reason in unreachable_reason;
-        without it, the cached snapshot of a commit this selection already
-        names, or the cache records for revision, does (_cached_commits).
-        unreachable, why the Hub did not answer for another repository this
-        start, stands for its answer without a request. A different revision
-        is never substituted."""
+        stands in the same way, with the reason in unreachable_reason and
+        its class (failure_kind) in unreachable_kind; without it, the cached
+        snapshot of a commit this selection already names, or the cache
+        records for revision, does (_cached_commits); without either, the
+        ModelError carries that class for the app. unreachable, why the Hub
+        did not answer for another repository this start, and
+        unreachable_kind, its class, stand for its answer without a request.
+        A different revision is never substituted."""
         import httpx
         from huggingface_hub import HfApi, constants
 
@@ -328,16 +345,18 @@ class Repository:
         ):
             return cls(name, installed, frozenset())
         if constants.HF_HUB_OFFLINE:
-            why = "HF_HUB_OFFLINE is set"
+            # Not a network failure: the reason, which the app shows as it
+            # is, names the setting.
+            why, kind = "HF_HUB_OFFLINE is set", None
         elif unreachable:
-            why = unreachable
+            why, kind = unreachable, unreachable_kind
         else:
             try:
                 info = HfApi().model_info(
                     name, revision=revision, files_metadata=True, timeout=HUB_TIMEOUT
                 )
             except (OSError, httpx.HTTPError) as error:
-                why = reason(error)
+                why, kind = reason(error), failure_kind(error)
             else:
                 if not models.is_hex_digest(info.sha, 40):
                     raise models.ModelError(
@@ -360,11 +379,19 @@ class Repository:
                     default_branch=revision is None,
                 )
         if installed:
-            return cls(name, installed, frozenset(), unreachable_reason=why)
+            return cls(
+                name,
+                installed,
+                frozenset(),
+                unreachable_reason=why,
+                unreachable_kind=kind,
+            )
         commits = _cached_commits(name, revision, installation)
         for commit in commits:
             if snapshot(name, commit).is_dir():
-                return cls.cached(name, commit, unreachable_reason=why)
+                return cls.cached(
+                    name, commit, unreachable_reason=why, unreachable_kind=kind
+                )
         branch = revision or "the default branch"
         if commits:
             cache = "the Hub cache has no snapshot of " + ", ".join(commits)
@@ -375,7 +402,7 @@ class Repository:
             )
         else:
             cache = f"the Hub cache records no commit for {branch}"
-        raise models.ModelError(f"cannot resolve {name}: {why}; {cache}")
+        raise models.ModelError(f"cannot resolve {name}: {why}; {cache}", kind=kind)
 
     def _require(self, name):
         if name not in self.files:

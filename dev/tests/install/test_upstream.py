@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 import httpx
-from huggingface_hub.errors import IncompleteSnapshotError
+from huggingface_hub.errors import IncompleteSnapshotError, RepositoryNotFoundError
 
 from dev.tests.installer_fixtures import (
     CONFIGS,
@@ -1074,14 +1074,50 @@ class UpstreamTest(unittest.TestCase):
                 self.assertEqual(fake.requests, [(MODEL, None)])
 
     def test_unreachable_hub_without_an_installation_is_the_error(self):
+        """Classed as the Hub's failure is, which the app words: no such
+        repository, which the Hub answers with 401 when anonymous, or no
+        connection."""
         fake = fake_hub(self, self.cache)
-        fake.failure = http_error(404)
+        missing = RepositoryNotFoundError(
+            "401 Client Error. Repository Not Found", response=http_error(401).response
+        )
+        offline = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        for failure, kind in (
+            (http_error(404), "not_found"),
+            (missing, "not_found"),
+            (offline, "offline"),
+        ):
+            fake.failure = failure
+            reason = re.escape(hub.reason(failure))
+            with self.subTest(failure=failure):
+                with self.assertRaisesRegex(
+                    models.ModelError,
+                    f"cannot resolve someone/other: {reason}; neither this "
+                    "installation nor the Hub cache records a commit for the "
+                    "default branch",
+                ) as raised:
+                    self.prepare(selection(self.root, "someone/other"))
+                self.assertEqual(raised.exception.kind, kind)
+
+    def test_a_draft_the_cache_lacks_fails_as_the_hub_did_for_the_target(self):
+        """Offline, a target the Hub cache holds as `hf download` leaves it
+        installs without the Hub; the draft the cache lacks fails classed as
+        the target's request did, with no request of its own."""
+        fake = fake_hub(self, self.cache)
+        cached_snapshot(self.cache, MODEL, "a" * 40, lambda p: mlx_target(p, DENSE))
+        refs = self.cache / hub.folder_name(MODEL) / "refs"
+        refs.mkdir()
+        (refs / "main").write_text("a" * 40)
+        fake.failure = httpx.ConnectError("[Errno 8] nodename nor servname provided")
+        reason = re.escape(hub.reason(fake.failure))
         with self.assertRaisesRegex(
             models.ModelError,
-            "cannot resolve someone/other: 404 Client Error.*; neither this "
+            f"cannot resolve {DENSE.draft_repo}: {reason}; neither this "
             "installation nor the Hub cache records a commit for the default branch",
-        ):
-            self.prepare(selection(self.root, "someone/other"))
+        ) as raised:
+            self.prepare(selection(self.root))
+        self.assertEqual(raised.exception.kind, "offline")
+        self.assertEqual(fake.requests, [(MODEL, None)])
 
     def test_commit_and_offline_selections_make_no_request(self):
         fake = fake_hub(self, self.cache)
