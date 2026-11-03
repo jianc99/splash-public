@@ -444,6 +444,14 @@ private:
     // (ModelStepResult::firstToken) and until the first decode cycle commits
     // it: that cycle emits it first, and its event leaves it out.
     std::optional<uint32_t> sentFirstToken;
+    // Until its first tokens go out: what held it since the engine first saw
+    // it (TtftPart, the rest left out), what holds it from `heldSince` on, as
+    // the last tick left the engine (holds, holderOf), and whether they went
+    // out (EngineEventSink::firstTokenParts).
+    TtftParts held{};
+    std::optional<double> heldSince;
+    TtftPart heldBy = TtftPart::Rest;
+    bool firstTokenSent = false;
     // Its model held an anchor when its lane was last suspended: the token
     // it selected last, which the suspension keeps (Model::suspend). A
     // decoding lane holds one once its first token is selected, a
@@ -844,6 +852,15 @@ private:
   // Settles every lane that ended (Request::pendingEnd) that no command in
   // flight, restore or command between its passes holds any more.
   void settleEndedBetweenPasses();
+  // The time to their first tokens of the requests that have not sent them
+  // (AMENDMENTS Borrowed 7): holds(now) counts the time since the last tick
+  // to what held each then; holderOf names what holds one as the engine is
+  // now, by precedence: a prefill command in flight with its rows, its claim
+  // waiting, a decode command, another prefill command, the rest. Before a
+  // request's first tokens, firstTokens sends what held it.
+  void holds(double nowMilliseconds) noexcept;
+  [[nodiscard]] TtftPart holderOf(const Request &request) const;
+  void firstTokens(Request &request);
   // Memory a lane could not get, and what the engine knows about its return.
   struct Denial {
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;

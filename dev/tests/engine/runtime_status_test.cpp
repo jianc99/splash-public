@@ -190,6 +190,13 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   metrics.currentDecodeBatch = {true, 3, 0, 4, 21, 15, 1.5, 2666.0};
   metrics.decodeGap = {.count = 31, .totalMilliseconds = 1240, .maximumMilliseconds = 96.5,
                        .p50Milliseconds = 32.768, .p95Milliseconds = 65.536, .p99Milliseconds = 131.072};
+  // Two first tokens: their own prefill and the rest held them.
+  metrics.ttftParts[static_cast<size_t>(engine::TtftPart::OwnPrefill)] = {
+      .count = 2, .totalMilliseconds = 900, .maximumMilliseconds = 600,
+      .p50Milliseconds = 524.288, .p95Milliseconds = 1048.576, .p99Milliseconds = 1048.576};
+  metrics.ttftParts[static_cast<size_t>(engine::TtftPart::Rest)] = {
+      .count = 2, .totalMilliseconds = 30, .maximumMilliseconds = 20,
+      .p50Milliseconds = 16.384, .p95Milliseconds = 32.768, .p99Milliseconds = 32.768};
 
   engine::RuntimeCacheIdentity identity;
   identity.modelLayoutSha256 = std::string(64, 'a');

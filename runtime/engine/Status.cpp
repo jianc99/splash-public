@@ -105,6 +105,9 @@ const char *writesGatedName(DiskWritesGate gate) noexcept {
 // (model::SparseRowUse, and ops::MoePhase for model::ExpertStoreStats::uses).
 constexpr std::string_view kStreamedUses[] = {"prefill", "decode"};
 static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
+// What held requests before their first tokens, by TtftPart.
+constexpr std::string_view kTtftPartNames[] = {"own_prefill", "claim_wait", "decode", "other_prefill", "rest"};
+static_assert(std::size(kTtftPartNames) == kTtftParts);
 
 // A latency histogram (model::LatencyStats) in milliseconds, as ttft_ms is:
 // its quantiles, maximum and total, and its samples.
@@ -622,7 +625,12 @@ std::string runtimeStatusJson(
       << ",\"metrics\":{\"ttft_ms\":{\"p50\":" << metrics.ttftP50Milliseconds
       << ",\"p95\":" << metrics.ttftP95Milliseconds
       << ",\"samples\":" << metrics.ttftSamples
-      << "},\"itl_ms\":{\"p50\":" << metrics.itlP50Milliseconds
+      << "},\"ttft_parts_ms\":{";
+  for (size_t part = 0; part < kTtftParts; ++part) {
+    out << (part ? "," : "") << json::quote(kTtftPartNames[part]) << ':';
+    appendLatency(out, metrics.ttftParts[part]);
+  }
+  out << "},\"itl_ms\":{\"p50\":" << metrics.itlP50Milliseconds
       << ",\"p95\":" << metrics.itlP95Milliseconds
       << ",\"samples\":" << metrics.itlSamples << "},\"decode_gap_ms\":";
   appendLatency(out, metrics.decodeGap);

@@ -1,3 +1,4 @@
+| `metrics.ttft_parts_ms` | Each request's time to its first token since engine start, split by what held it, each interval counted once by precedence, the parts of a request summing to its native TTFT: `own_prefill` (a prefill command in flight carried its prompt's rows), `claim_wait` (its memory claim waited for memory on its way back), `decode` (a decode command ran), `other_prefill` (another request's prefill command ran) and `rest` (the host, admission, idle), each in the shape of `metrics.decode_gap_ms`. The native log has one line per request at its first token with the same five parts |
 # API
 
 Splash serves OpenAI's Chat Completions, Completions and Responses APIs and

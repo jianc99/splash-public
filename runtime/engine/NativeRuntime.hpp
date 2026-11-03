@@ -122,6 +122,9 @@ private:
     std::optional<double> firstTokenMilliseconds;
     std::optional<double> lastTokenMilliseconds;
     uint32_t emittedTokens = 0;
+    // What held it before its first token, as the engine counted it
+    // (EngineEventSink::firstTokenParts).
+    TtftParts ttftParts{};
   };
 
   struct PendingMask {
@@ -152,6 +155,7 @@ private:
                       uint32_t acceptedDraftTokens, double wallMilliseconds,
                       double cycleMilliseconds) override;
   void promptProgress(uint64_t requestId, uint32_t processedTokens) override;
+  void firstTokenParts(uint64_t requestId, const TtftParts &parts) override;
   void tokens(uint64_t requestId, std::span<const uint32_t> values) override;
   void maskRequested(uint64_t requestId,
                      std::span<const uint32_t> simulationTokens) override;

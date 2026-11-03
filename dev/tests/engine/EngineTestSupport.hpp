@@ -49,6 +49,7 @@ public:
     auto &transcript = outputs[id];
     transcript.insert(transcript.end(), values.begin(), values.end());
   }
+  void firstTokenParts(uint64_t id, const engine::TtftParts &parts) override { ttftParts[id] = parts; }
   void maskRequested(uint64_t requestId,
                      std::span<const uint32_t> simulation) override {
     maskRequests.emplace_back(
@@ -78,6 +79,8 @@ public:
   // With a clock, the time of each request's token events.
   std::function<double()> clock;
   std::unordered_map<uint64_t, std::vector<double>> tokenTimes;
+  // What held each request before its first token (the rest left out).
+  std::unordered_map<uint64_t, engine::TtftParts> ttftParts;
   std::unordered_map<uint64_t, std::vector<uint32_t>> progress;
   // The matched prompt tokens of each start, zero for a cold one.
   std::vector<uint32_t> starts;

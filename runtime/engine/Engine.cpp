@@ -173,6 +173,18 @@ bool Engine::flushRestorePoints() {
 }
 
 bool Engine::tick(double now) {
+  // The time since the last tick goes to what held each request then;
+  // however the tick ends, what holds each from now on is as it leaves the
+  // engine.
+  holds(now);
+  struct Holders final {
+    Engine &engine;
+    ~Holders() {
+      for (auto &[_, active] : engine.requests_)
+        if (!active.finalized && !active.firstTokenSent)
+          active.heldBy = engine.holderOf(active);
+    }
+  } const holders{*this};
   model_.checkHealth();
   nextHealthCheckMilliseconds_ = now + kHealthCheckIntervalMilliseconds;
   // A request's deadline ends it in whatever phase it is: at once, or once
@@ -443,6 +455,35 @@ bool Engine::admissionTries(const Request &active, std::optional<RequestPriority
 bool Engine::belowRunnable(const Request &active) const {
   const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
   return runnable && active.request.priority > *runnable;
+}
+
+void Engine::holds(double now) noexcept {
+  for (auto &[_, active] : requests_) {
+    if (active.finalized || active.firstTokenSent)
+      continue;
+    if (active.heldSince && active.heldBy != TtftPart::Rest)
+      active.held[static_cast<size_t>(active.heldBy)] += now - *active.heldSince;
+    active.heldSince = now;
+  }
+}
+
+TtftPart Engine::holderOf(const Request &active) const {
+  const bool own = pending_ && std::ranges::any_of(pending_->plan.items, [&](const BatchItem &item) {
+                     return item.requestId == active.request.id;
+                   });
+  if (own && pending_->plan.kind == WorkKind::Prefill)
+    return TtftPart::OwnPrefill;
+  if (active.claim.id && governor().ledger().claim(active.claim.id).waiting)
+    return TtftPart::ClaimWait;
+  if (pending_)
+    return pending_->plan.kind == WorkKind::Decode ? TtftPart::Decode : TtftPart::OtherPrefill;
+  return TtftPart::Rest;
+}
+
+void Engine::firstTokens(Request &active) {
+  if (std::exchange(active.firstTokenSent, true))
+    return;
+  events_.firstTokenParts(active.request.id, active.held);
 }
 
 std::optional<double> Engine::nextWakeupMilliseconds() const {
@@ -1828,14 +1869,17 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
         unsent = unsent.subspan(1);
         active.sentFirstToken.reset();
       }
-      if (!unsent.empty())
+      if (!unsent.empty()) {
+        firstTokens(active);
         events_.tokens(active.request.id, unsent);
+      }
     }
     if (result.firstToken) {
       if (active.sentFirstToken || !result.outputTokens.empty())
         throw std::logic_error(
             "model reported a first token twice or beside output");
       active.sentFirstToken = result.firstToken;
+      firstTokens(active);
       events_.tokens(active.request.id, {&*result.firstToken, 1});
     }
     if (plan.kind == WorkKind::Decode) {

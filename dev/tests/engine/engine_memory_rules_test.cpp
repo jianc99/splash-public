@@ -15,6 +15,7 @@
 #include "TestRegistry.hpp"
 #include "engine/Engine.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -773,6 +774,61 @@ void testCacheReuseFollowsTheRecentProbes() {
               std::to_string(engine.snapshot().cacheHits) + " hits, where e^-1 is 0.368");
 }
 
+// AMENDMENTS Borrowed 7: a request's time to its first token splits into
+// what held it, each interval once, by precedence: a prefill command in
+// flight with its rows, its claim waiting, a decode command, another
+// request's prefill command. On the harness clock with the M6 profile, two
+// prompts arrive while a third request decodes; each prompt's parts are the
+// time its own prefill commands, the decode commands and the other prompt's
+// commands ran between its arrival and its first token, and they leave out
+// only the time no command ran (the rest, which the native runtime takes as
+// the TTFT less them).
+void testTtftPartsSumToTtft() {
+  test::EngineHarness harness({.pages = 256, .timing = &test::kM6FlashNextQ2});
+  harness.model.decodeFinishes = false;
+  EngineRequest decoder = harness.request(1, std::vector<uint32_t>(40, 1));
+  decoder.maxNewTokens = 64;
+  decoder.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(decoder));
+  harness.runUntil([&] { return harness.events.outputs.contains(1); }, "the decoder did not decode");
+  const double arrived = harness.now();
+  for (const uint64_t id : {2, 3}) {
+    EngineRequest prompt = harness.request(id, std::vector<uint32_t>(3000, static_cast<uint32_t>(id)));
+    prompt.maxNewTokens = 2;
+    prompt.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(prompt));
+  }
+  harness.runUntil([&] { return harness.events.tokenTimes.contains(2) && harness.events.tokenTimes.contains(3); },
+                   "the prompts did not answer");
+  for (const uint64_t id : {2, 3}) {
+    const double first = harness.events.tokenTimes.at(id).front();
+    TtftParts expected{};
+    for (const test::EngineHarness::Command &command : harness.commands()) {
+      const double from = std::max(command.startMilliseconds, arrived);
+      const double to = std::min(command.startMilliseconds + command.wallMilliseconds, first);
+      if (to <= from)
+        continue;
+      const bool own = std::ranges::find(command.lanes, id) != command.lanes.end();
+      const TtftPart part = command.kind == WorkKind::Decode ? TtftPart::Decode
+                            : own                            ? TtftPart::OwnPrefill
+                                                             : TtftPart::OtherPrefill;
+      expected[static_cast<size_t>(part)] += to - from;
+    }
+    const TtftParts &parts = harness.events.ttftParts.at(id);
+    double counted = 0.0;
+    for (size_t part = 0; part < kTtftParts; ++part) {
+      require(std::abs(parts[part] - expected[part]) < 1e-6,
+              "request " + std::to_string(id) + "'s TTFT part " + std::to_string(part) + " was " +
+                  std::to_string(parts[part]) + " ms, not the " + std::to_string(expected[part]) +
+                  " ms its commands ran");
+      counted += parts[part];
+    }
+    require(parts[static_cast<size_t>(TtftPart::OwnPrefill)] > 0.0 &&
+                parts[static_cast<size_t>(TtftPart::Decode)] > 0.0 && counted <= first - arrived + 1e-6,
+            "the TTFT parts did not cover the commands that held the prompt within its TTFT");
+  }
+}
+
 } // namespace
 
 std::span<const test::TestCase> rulesTests() {
@@ -792,6 +848,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testEnginesOnOneGovernorOfferTheCacheOnce", testEnginesOnOneGovernorOfferTheCacheOnce},
       {"testAJunctionTakesNothingWorthMoreThanItSaves", testAJunctionTakesNothingWorthMoreThanItSaves},
       {"testCacheReuseFollowsTheRecentProbes", testCacheReuseFollowsTheRecentProbes},
+      {"testTtftPartsSumToTtft", testTtftPartsSumToTtft},
   };
   return kTests;
 }
