@@ -472,7 +472,7 @@ resolve it.
 | G8, G9 | no restart, failed request, Metal failure or tick past 5 s; warm start within the base's plus the warm-up; memory accounts summing to the charged bytes, nothing owed at the end, no claim waiting past the resource wait |
 | SSD | disk and expert bytes per unit of work not surely above both release references |
 | Tags | no tag whose every candidate run is past the references' worst by their own spread |
-| G10 | dense, resident, Flint and Apple9 cells against the base: work and TTFT point estimates within 2 %, and no G4 failure |
+| G10 | dense, resident, Flint and Apple9 cells against the base: work and TTFT within 2 % by the interval rule (TTFT cells on each round's worst), failing once surely worse, and no G4 failure; undecided goes to the owner |
 | Floor | the Flash-Next store held at its cap becomes the floor default only when no metric is worse than the value default's and one is better; mixed results go to the owner |
 
 Each candidate churn run also reports, with nothing judged on them, its
