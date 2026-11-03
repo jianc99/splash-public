@@ -897,7 +897,8 @@ void testAWaitingFloorKeepsTheMemoryOnItsWayBack() {
     // Extents of 16 pages. Every state goes straight to the SSD. The quota
     // holds the Spill lane's commitment but not the prompt's, which cannot
     // convert to Spill then.
-    Spilling spill(128, true, 100'000, 0, Spilling::Extent{16}, 0, test::commandShape(model::ExecutionLimits::prefillTokenBudget, passes));
+    Spilling spill(Spilling::Governed{}, 128, true, Spilling::Extent{16}, 0,
+                   test::commandShape(model::ExecutionLimits::prefillTokenBudget, passes));
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
     spill.model.stateTier->ready = true;
@@ -918,19 +919,20 @@ void testAWaitingFloorKeepsTheMemoryOnItsWayBack() {
     spill.runUntil([&] { return spill.model.prefillChunks[3] != 0; }, "the prompt did not run");
     spill.tier.writableFile = true;
     // The Spill lane's first decode command reads; from its second on,
-    // which follows the prompt's next command or its first pass, its floor
-    // fits once two extents have left memory since it was first refused.
+    // which follows the prompt's next command or its first pass, its floor,
+    // three extents' bytes, finds an extent's room: it fits once two extents
+    // have left memory since it was first refused.
     uint32_t asks = 0;
-    std::optional<uint64_t> limit;
+    bool limited = false;
     size_t refused = 0;
     spill.model.spilledReadsRoom = [&](uint64_t id) {
       if (id != 2 || ++asks == 1)
         return true;
-      if (!limit) {
-        limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
+      if (!std::exchange(limited, true)) {
+        spill.limit(spill.held() + 16 * 100);
         refused = promptPasses.size();
       }
-      return spill.storage.allocatedBytes() <= *limit;
+      return static_cast<bool>(spill.host.reserve(3 * 16 * 100));
     };
     spill.engine.submit(Spilling::prompt(2, 2, 20, 8));
     spill.runUntil(
@@ -939,7 +941,7 @@ void testAWaitingFloorKeepsTheMemoryOnItsWayBack() {
                  spill.events.outputs.contains(3);
         },
         "neither the Spill lane nor the prompt decoded");
-    require(limit && spill.engine.snapshot().spill.converted == 0,
+    require(limited && spill.engine.snapshot().spill.converted == 0,
             "the fixture's floor or quota is off");
     require(spill.events.outputs.contains(2) && !spill.events.outputs.contains(3),
             "a prompt that yields before a lane waiting for its floor took the memory on its way "
@@ -950,6 +952,7 @@ void testAWaitingFloorKeepsTheMemoryOnItsWayBack() {
                   std::ranges::none_of(waited, [](const auto &each) { return each.first == 0; }),
               "a prompt between its command's passes stopped, or started a command, while a lane it "
               "yields before waited for its floor");
+    spill.limit(Spilling::kGovernedLimitBytes);
     spill.model.decodeFinishes = true;
     spill.runUntilIdle();
     require(spill.events.failedCount == 0 && spill.events.completedCount == 3,
@@ -971,7 +974,7 @@ void testAWaitingFloorKeepsTheMemoryOnItsWayBack() {
 // floor.
 void testAHeldSpillLaneLeavesTheFloorToTheWaiter() {
   for (const bool holdsFloor : {false, true}) {
-    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16});
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
     spill.model.stateTier->ready = true;
@@ -985,13 +988,14 @@ void testAHeldSpillLaneLeavesTheFloorToTheWaiter() {
     spill.engine.submit(prompt(1, 1, 48));
     spill.runUntilIdle();
     spill.tier.writableFile = true;
-    // A floor takes an extent beside the KV pool. Once the floors run short,
-    // the first needs two extents back and the second one more.
+    // A floor takes an extent beside the KV pool, which the governor admits.
+    // Once the floors run short, the first needs two extents back and the
+    // second one more.
     constexpr uint64_t floorBytes = 16 * 100;
-    std::optional<uint64_t> budget;
-    const auto charged = [&] {
-      return spill.storage.allocatedBytes() + floorBytes * spill.model.spilledReadFloors.size();
-    };
+    spill.model.memory = &spill.host.memory;
+    spill.model.admission = spill.host.governor.allocationAdmission();
+    spill.model.spilledReadFloorBytes = floorBytes;
+    bool budget = false;
     uint32_t refusals = 0;
     spill.model.spilledReadsRoom = [&](uint64_t id) {
       if (spill.model.spilledReadFloors.contains(id))
@@ -999,9 +1003,10 @@ void testAHeldSpillLaneLeavesTheFloorToTheWaiter() {
       if (!budget) {
         if (holdsFloor && id == 2)
           return true;
-        budget = charged() - floorBytes;
+        budget = true;
+        spill.limit(spill.held() - floorBytes);
       }
-      const bool fits = charged() + floorBytes <= *budget;
+      const bool fits = static_cast<bool>(spill.host.reserve(floorBytes));
       refusals += !fits;
       return fits;
     };
@@ -1069,7 +1074,7 @@ void testAHeldSpillLaneLeavesTheFloorToTheWaiter() {
 // start that waits for a cached chain's writes to land, a Resident prompt
 // goes on growing.
 void testAWaitingStartHoldsNoLane() {
-  Spilling spill(128, true, 100'000, 0, Spilling::Extent{16});
+  Spilling spill(Spilling::Governed{}, 128, true, Spilling::Extent{16});
   spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
   spill.model.stateTier = std::make_shared<OffloadControl>();
   spill.model.stateTier->ready = true;
@@ -1080,15 +1085,16 @@ void testAWaitingStartHoldsNoLane() {
   spill.engine.submit(Spilling::prompt(3, 3, 120, 4096));
   spill.runUntil([&] { return spill.model.prefillChunks[3] != 0; }, "the prompt did not run");
   spill.tier.writableFile = true;
-  // The start's state fits once two extents have left memory since it was
-  // first refused.
-  std::optional<uint64_t> limit;
+  // The start's state, three extents' bytes, finds an extent's room when it
+  // is first refused: it fits once two extents have left memory since.
+  bool limit = false;
   spill.model.beginGrowthBlocked = [&] {
     if (spill.model.lastBeginId != 2)
       return false;
-    if (!limit)
-      limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
-    return spill.storage.allocatedBytes() > *limit;
+    if (!std::exchange(limit, true))
+      spill.limit(spill.held() + 16 * 100);
+    spill.model.beginAllocationFailure = spill.host.reserve(3 * 16 * 100).failure;
+    return spill.model.beginAllocationFailure != metal::AllocationFailure::None;
   };
   const size_t pages = spill.cache.pageTable(3).pages.size();
   const auto started = [&] {
@@ -1100,6 +1106,7 @@ void testAWaitingStartHoldsNoLane() {
                  "neither the start nor the prompt went on");
   require(limit && !started() && spill.cache.pageTable(3).pages.size() > pages,
           "a start waiting for memory on its way back held a resident prompt");
+  spill.limit(Spilling::kGovernedLimitBytes);
   spill.model.decodeFinishes = true;
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.events.completedCount == 3,
@@ -1108,13 +1115,13 @@ void testAWaitingStartHoldsNoLane() {
 
 // A held lane takes no KV pages past its capacity anywhere in its command:
 // its command ends at the state boundary its pages reach. A Resident prompt
-// whose first command, beside another prompt's rows, ended inside the page
-// of its replay point holds the KV up to that point, and its next command,
+// whose first command ended inside the page of its replay point, the rows a
+// command holds here, holds the KV up to that point, and its next command,
 // planned past it, runs while a Spill lane waits for its floor of the hot
 // block cache: it reaches the point, takes no page past it, and goes on
 // once the lane has its floor.
 void testAHeldLaneEndsItsCommandAtItsCapacity() {
-  Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16});
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16}, 0, test::commandShape(2018));
   spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
   spill.model.stateTier = std::make_shared<OffloadControl>();
   spill.model.stateTier->ready = true;
@@ -1138,19 +1145,25 @@ void testAHeldLaneEndsItsCommandAtItsCapacity() {
         return active.promptProcessed;
     return 0u;
   };
-  bool room = false;
-  spill.model.spilledReadsRoom = [&](uint64_t id) { return id != 2 || room; };
+  // The Spill lane's floor, an extent's bytes, finds no room at the engine's
+  // limit, which from its first refusal leaves none, until the limit goes.
+  bool limited = false;
+  spill.model.spilledReadsRoom = [&](uint64_t id) {
+    if (id != 2)
+      return true;
+    if (!std::exchange(limited, true))
+      spill.limit(spill.held());
+    return static_cast<bool>(spill.host.reserve(16 * 100));
+  };
   // The Spill lane decodes, its pages' writes in flight.
   spill.engine.submit(prompt(2, 2, 4 * KvCache::pageTokens + 1));
   for (uint32_t step = 0; step < 100 && !spill.events.outputs.contains(2); ++step)
     static_cast<void>(spill.engine.tick(spill.now += 50));
   require(spill.events.outputs.contains(2) && !spill.cache.holdsIndexPages(2),
           "the Spill lane did not decode before its pages spilled");
-  // Two prompts start Resident: one command runs the short one's 30 rows and
-  // 2018 of the long one's, inside the page that ends at its replay point,
-  // 2048.
+  // A prompt starts Resident: its first command runs 2018 rows, inside the
+  // page that ends at its replay point, 2048.
   spill.tier.writableFile = false;
-  spill.engine.submit(prompt(3, 3, 30));
   spill.engine.submit(prompt(4, 4, 2060));
   for (uint32_t step = 0; step < 100 && processed(4) == 0; ++step)
     static_cast<void>(spill.engine.tick(spill.now += 50));
@@ -1172,10 +1185,10 @@ void testAHeldLaneEndsItsCommandAtItsCapacity() {
   require(processed(4) == 2048 &&
               spill.cache.pageTable(4).pages.size() == 64,
           "a held lane's command took KV pages past its capacity");
-  room = true;
+  spill.limit(Spilling::kGovernedLimitBytes);
   spill.model.decodeFinishes = true;
   spill.runUntilIdle();
-  require(spill.events.failedCount == 0 && spill.events.completedCount == 4,
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 3,
           "the requests did not complete");
 }
 
@@ -1189,7 +1202,8 @@ void testAHeldLaneEndsItsCommandAtItsCapacity() {
 // memory to the waiting lane.
 void testAJoinerHeldBackLeavesACommandItsPasses() {
   for (const bool cancelled : {false, true}) {
-    Spilling spill(1024, true, 100'000, 0, Spilling::Extent{16}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4));
+    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16}, 0,
+                   test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 4));
     spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
     spill.model.stateTier = std::make_shared<OffloadControl>();
     spill.model.stateTier->ready = true;
@@ -1214,8 +1228,17 @@ void testAJoinerHeldBackLeavesACommandItsPasses() {
     spill.runUntilIdle();
     spill.tier.writableFile = true;
     spill.model.deniedReservations = 0;
-    bool room = false;
-    spill.model.spilledReadsRoom = [&](uint64_t id) { return id != 2 || room; };
+    // The Spill lane's floor, three extents' bytes, finds no room at the
+    // engine's limit, which from its first refusal leaves none, until the
+    // limit goes: no more than an extent comes back meanwhile.
+    bool limited = false;
+    spill.model.spilledReadsRoom = [&](uint64_t id) {
+      if (id != 2)
+        return true;
+      if (!std::exchange(limited, true))
+        spill.limit(spill.held());
+      return static_cast<bool>(spill.host.reserve(3 * 16 * 100));
+    };
     spill.engine.submit(prompt(2, 2, 4 * KvCache::pageTokens + 1));
     for (uint32_t step = 0; step < 100 && !spill.events.outputs.contains(2); ++step)
       static_cast<void>(spill.engine.tick(spill.now += 50));
@@ -1264,7 +1287,7 @@ void testAJoinerHeldBackLeavesACommandItsPasses() {
     require(spill.cache.holdsIndexPages(2) && spill.events.outputs.at(2).size() == outputs,
             "the Spill lane did not wait for its floor");
     require(!passesOf(4, 0), "an arrival took pages while a lane it yields before waited for its floor");
-    room = true;
+    spill.limit(Spilling::kGovernedLimitBytes);
     spill.model.decodeFinishes = true;
     spill.runUntilIdle();
     const EngineSnapshot counts = spill.engine.snapshot();
@@ -1282,7 +1305,7 @@ void testAJoinerHeldBackLeavesACommandItsPasses() {
 // open: the Resident prompt that yields before it waits within the limit,
 // and runs past it, while the lane still waits.
 void testAWaitThatNeverLandsHoldsLanesUpToItsLimit() {
-  Spilling spill(128, true, 100'000, 0, Spilling::Extent{16});
+  Spilling spill(Spilling::Governed{}, 128, true, Spilling::Extent{16});
   spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
   spill.model.stateTier = std::make_shared<OffloadControl>();
   spill.model.stateTier->ready = true;
@@ -1304,20 +1327,20 @@ void testAWaitThatNeverLandsHoldsLanesUpToItsLimit() {
   spill.engine.submit(prompt(3, 3, 120, 4096));
   spill.runUntil([&] { return spill.model.prefillChunks[3] != 0; }, "the prompt did not run");
   spill.tier.writableFile = true;
-  // From the Spill lane's second decode command on, its floor fits only
-  // once two extents have left memory, which only the cached chain's
-  // writes, which never land, would give back.
+  // From the Spill lane's second decode command on, its floor, six extents'
+  // bytes, finds four extents' room, which the lanes beside it grow into:
+  // it fits only once two extents have left memory, which only the cached
+  // chain's writes, which never land, would give back.
   uint32_t asks = 0;
-  std::optional<uint64_t> limit;
   std::optional<double> refusedAt;
   spill.model.spilledReadsRoom = [&](uint64_t id) {
     if (id != 2 || ++asks == 1)
       return true;
-    if (!limit) {
-      limit = spill.storage.allocatedBytes() - 2 * 16 * 100;
+    if (!refusedAt) {
+      spill.limit(spill.held() + 4 * 16 * 100);
       refusedAt = spill.now;
     }
-    return spill.storage.allocatedBytes() <= *limit;
+    return static_cast<bool>(spill.host.reserve(6 * 16 * 100));
   };
   // Ticks 50 ms apart, landing every transfer but those writes.
   const auto run = [&](const std::function<bool()> &done, const char *message) {
@@ -1345,6 +1368,7 @@ void testAWaitThatNeverLandsHoldsLanesUpToItsLimit() {
               spill.events.failedCount == 0,
           "the prompt grew late, or only once the Spill lane's wait had ended");
   spill.tier.complete();
+  spill.limit(Spilling::kGovernedLimitBytes);
   spill.model.decodeFinishes = true;
   spill.runUntilIdle();
   require(spill.events.failedCount == 0 && spill.events.completedCount == 4,
