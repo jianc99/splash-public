@@ -8,6 +8,7 @@
 // pin it down as finely as the bound it sets can tell.
 
 #include "model/CommandCost.hpp"
+#include "model/Model.hpp"
 
 #include <algorithm>
 #include <array>
@@ -85,12 +86,17 @@ public:
   // (accepted, DESIGN §0 O4).
   static constexpr uint32_t kSeedRows = 256;
   // The second warm-up's rows on a model of `limits`: kSeedRows, or the
-  // fewest rows its faster path takes where they are more
-  // (model::CommandLimits::minimumUnitRows), so that the seed's line runs
-  // through two sizes at the rate of the units the scheduler plans, none
-  // fewer but a prompt's rest (Scheduler).
+  // fewest rows its faster path takes where they are more, up to half the
+  // chunk (model::CommandLimits::minimumUnitRows), so that the seed's line
+  // runs through two sizes at the rate of the units a contended prompt is
+  // cut to (Scheduler). It then prices a whole prompt below them, which runs
+  // at a higher cost a row, low until the units teach the rates. Past half
+  // the chunk the two sizes would be too close for a slope, and kSeedRows
+  // stays.
   [[nodiscard]] static constexpr uint32_t seedRows(const model::CommandLimits &limits) noexcept {
-    return std::max(kSeedRows, limits.minimumUnitRows);
+    return limits.minimumUnitRows <= model::ExecutionLimits::prefillTokenBudget / 2
+               ? std::max(kSeedRows, limits.minimumUnitRows)
+               : kSeedRows;
   }
 
   // The decode gap G the scheduler bounds contended units by: the bound is

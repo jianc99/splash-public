@@ -134,17 +134,20 @@ void testTheSeedReproducesAnExactAffineTruth() {
 }
 
 // A model whose faster path takes 512 rows or more (the Neural Engine FFN
-// split's least chunk) runs its second warm-up at those, others at
-// kSeedRows: the seed's line then runs through two sizes at the rate of the
-// units the scheduler plans and prices them, where through 256 rows the GPU
-// alone runs at twice the cost a row it puts a constant per chunk no unit has
-// and a slope below theirs.
+// split's least chunk) runs its second warm-up at those, up to half the
+// chunk, others at kSeedRows: the seed's line then runs through two sizes at
+// the rate of the units a contended prompt is cut to and prices them, where
+// through 256 rows the GPU alone runs at twice the cost a row it puts a
+// constant per chunk no unit has and a slope below theirs. Past half the
+// chunk the sizes would be too close for a slope, and kSeedRows stays.
 void testTheSeedRunsWhereTheFasterPathTakes() {
   require(CostModel::seedRows({}) == CostModel::kSeedRows &&
               CostModel::seedRows({.minimumUnitRows = 64}) == CostModel::kSeedRows &&
               CostModel::seedRows({.minimumUnitRows = 512}) == 512 &&
-              CostModel::seedRows({.minimumUnitRows = kChunk}) == kChunk,
-          "the second warm-up's rows are not the model's least unit rows where they exceed kSeedRows");
+              CostModel::seedRows({.minimumUnitRows = kChunk / 2}) == kChunk / 2 &&
+              CostModel::seedRows({.minimumUnitRows = kChunk / 2 + 1}) == CostModel::kSeedRows &&
+              CostModel::seedRows({.minimumUnitRows = kChunk}) == CostModel::kSeedRows,
+          "the second warm-up's rows are not the model's least unit rows from kSeedRows to half the chunk");
   const auto took = [](uint32_t rows) {
     const model::CommandWork work = unit(rows, 0, 0, 0);
     return truth(work) + (rows < 512 ? kTruth[2] * rows * kLayers : 0.0);

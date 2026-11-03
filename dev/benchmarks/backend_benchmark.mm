@@ -1040,7 +1040,8 @@ int main(int argc, char **argv) {
     }
     // With a shorter one, it seeds the engine's prefill price below, as a
     // start's seeds the server's (RuntimeBootstrap).
-    const model::WarmupStepResult seedWarmup = executor->warmupPrefill(engine::CostModel::kSeedRows);
+    const model::WarmupStepResult seedWarmup =
+        executor->warmupPrefill(engine::CostModel::seedRows(executor->commandLimits()));
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
         decodeWarmupWall{};
     std::array<double, model::ExecutionLimits::maximumBatchWidth>
