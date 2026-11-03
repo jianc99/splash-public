@@ -1675,6 +1675,40 @@ void testStateBuffersMeetANeedOfBytes() {
           "a need of buffers in place did not keep the buffers its state freed");
 }
 
+// R2 step 0: the units that cost nothing go first and the fit is tried
+// again. A refusal of bytes the idle buffers they release cover is met by
+// them, whatever part of it memory already allocated could meet in place: a
+// state's buffers, or KV pages. A need that refused no bytes is met in
+// place, by the state.
+void testIdleBuffersThatCoverARefusalTakeNothingInPlace() {
+  for (const bool pages : {false, true}) {
+    MemoryLedger ledger;
+    BufferPool pool(64 * kMiB);
+    CachedStates cache(pool);
+    cache.units.push_back({.key = 1, .pages = 4, .stateBuffers = 1, .cost = {.onceSeconds = 0.1}});
+    ledger.addSource(cache);
+    ledger.addSource(pool);
+    pool.idle = 1;
+    const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
+    const Need need = pages ? Need{.bytes = 48 * kMiB, .pages = 4} : Need{.bytes = 48 * kMiB, .stateBuffers = 1};
+    const FreeResult freed = ledger.free(claim, need, 0, false, false);
+    require(freed.outcome == FreeOutcome::Met && freed.nowBytes == 64 * kMiB && cache.taken.empty() && !pool.idle,
+            std::string("a refusal of bytes the idle buffers cover took ") + (pages ? "a unit's pages" : "a state") +
+                " in place: " + std::to_string(cache.taken.size()) + " taken, " +
+                std::to_string(freed.nowBytes / kMiB) + " MiB freed");
+  }
+  MemoryLedger ledger;
+  BufferPool pool(64 * kMiB);
+  CachedStates cache(pool);
+  cache.units.push_back({.key = 1, .stateBuffers = 1, .cost = {.onceSeconds = 0.1}});
+  ledger.addSource(cache);
+  ledger.addSource(pool);
+  const ClaimId claim = ledger.open(request(1, RequestPriority::Normal));
+  require(ledger.free(claim, {.stateBuffers = 1}, 0, false, false).outcome == FreeOutcome::Met &&
+              cache.taken == std::vector<uint64_t>{1} && pool.idle == 1,
+          "a need of buffers alone was not met in place");
+}
+
 // A need the host refused is met in place first; failing that, in-service
 // work is exempted from the host for its retries, a start falls short.
 void testHostRefusedNeedIsMetInPlaceFirst() {
@@ -3196,6 +3230,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testImmediateSkipsLandings", testImmediateSkipsLandings},
       {"testLandingCountsBeforeVictimsInPart", testLandingCountsBeforeVictimsInPart},
       {"testStateBuffersMeetANeedOfBytes", testStateBuffersMeetANeedOfBytes},
+      {"testIdleBuffersThatCoverARefusalTakeNothingInPlace", testIdleBuffersThatCoverARefusalTakeNothingInPlace},
       {"testHostRefusedNeedIsMetInPlaceFirst", testHostRefusedNeedIsMetInPlaceFirst},
       {"testAnExemptRetryPassesTheHostWithEachReservation", testAnExemptRetryPassesTheHostWithEachReservation},
       {"testZeroCostUnsizedUnitsGoFirst", testZeroCostUnsizedUnitsGoFirst},

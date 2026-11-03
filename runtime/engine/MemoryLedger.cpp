@@ -697,7 +697,10 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
       host ? 0 : less(uint64_t{all.landingPages[form]} + own.owedPages[form], heldPagesAbove);
 
   std::optional<DryRun> run;
-  if (!need.hostRefused && !lackingBytes && !lackingPages && !need.stateBuffers) {
+  // A refusal of bytes the room covers once the units that cost nothing
+  // went is met: the fit is tried again (R2 step 0), whatever memory
+  // allocated could meet of it in place.
+  if (!need.hostRefused && !lackingBytes && (need.bytes || (!lackingPages && !need.stateBuffers))) {
     result.outcome = FreeOutcome::Met;
   } else if (waits(false)) {
     result.outcome = FreeOutcome::Pending;
