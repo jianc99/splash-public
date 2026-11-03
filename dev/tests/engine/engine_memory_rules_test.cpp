@@ -603,9 +603,9 @@ void testPlacementOncePerCandidatePerState() {
   harness.runUntilIdle();
   require(harness.events.completedCount == 4 && harness.events.failedCount == 0, "the prompts did not all run");
   require(!harness.shortfallQueries().empty(), "no candidate was placed by the spilled reads it would add");
-  require(harness.mostShortfallQueries() <= 2,
+  require(harness.mostShortfallQueries() <= 1,
           "a candidate was placed more than once in one state of memory: " +
-              std::to_string(harness.mostShortfallQueries()) + " queries");
+              std::to_string(harness.mostShortfallQueries()) + " queries of one kind");
 }
 
 // A state only on disk at `prompt`'s 64 tokens, over KV the cache holds in
