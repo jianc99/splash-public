@@ -568,6 +568,35 @@ void testPendingGrowthGrowsOnItsLandedVictims() {
           "the pending growth did not grow on its landed victims' credit");
 }
 
+// Pending growth whose take finds what it still lacks worth more than the
+// unit beyond its cycle holds nothing (R3, amend/M.md B4: growth displaces
+// only below that worth): the lanes took the pages its demotion freed, and
+// the cache left costs 9 s against the unit's 6 s. A start then fits the
+// room the pending growth held.
+void testAShortPendingGrowthHoldsNothing() {
+  Fixture fixture(host(32 * kGiB), 8 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 5, 3, 0.25, 60.0);
+  TestSource cache("cache", &fixture.memory);
+  fixture.memory.hold("cache", 2 * kGiB);
+  fixture.memory.hold("weights", 2560 * kMiB);
+  cache.units = {unit(1, kGiB, 0.5, true), unit(2, kGiB, 9.0)};
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addSource(cache);
+  ledger.addPool(experts);
+  serve(ledger, experts, 400.0, 0.0, 10.0);
+  static_cast<void>(fixture.pass(10.5));
+  require(cache.taken == std::vector<uint64_t>{1} && fixture.governor->snapshot().reservedBytes == kGiB,
+          "the displacement did not pend on its demotion");
+  // Its page landed, and a lane took it.
+  cache.landing.clear();
+  static_cast<void>(fixture.pass(11.0));
+  const ClaimId start = ledger.open(request(9, RequestPriority::Normal, ClaimClass::Start));
+  require(fixture.allocate(start, 256 * kMiB), "a start was refused the room a pending growth found short held");
+  require(fixture.governor->snapshot().reservedBytes == 0 && experts.units() == 3 &&
+              cache.taken == std::vector<uint64_t>{1},
+          "a pending growth found short took something or kept its bytes");
+}
+
 // Pending growth takes what its victims leave once they land: a demotion's
 // landing only empties its page's extent, which the cache releases when a
 // claim takes it (Cache.cpp's landing drops the page into its extent), so the
@@ -2155,6 +2184,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testPendingGrowthIsReservedAgainstOthers", testPendingGrowthIsReservedAgainstOthers},
       {"testPendingGrowthGrowsOnItsLandedVictims", testPendingGrowthGrowsOnItsLandedVictims},
       {"testPendingGrowthTakesWhatItsLandedVictimsLeave", testPendingGrowthTakesWhatItsLandedVictimsLeave},
+      {"testAShortPendingGrowthHoldsNothing", testAShortPendingGrowthHoldsNothing},
       {"testTakenPendingGrowthIsCancelled", testTakenPendingGrowthIsCancelled},
       {"testOneHostRule", testOneHostRule},
       {"testBandWaivedWhenTheHostClaimFindsNothing", testBandWaivedWhenTheHostClaimFindsNothing},

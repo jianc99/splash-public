@@ -717,12 +717,13 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 // R3 with amend/M.md B4. Pending growth grows once its bytes are free for
 // it, taking what its victims left once they landed as a claim's retry
 // takes it, on the host's credit of what its victims freed (the host's
-// footprint is then where it was), and stays pending while the host
-// refuses it. Free room beyond what the waiting claims, the
-// lanes' projected growth and every pending growth hold goes to the pools,
-// the one whose next unit is worth most first, while the host admits each
-// unit and, once claims take a pool's units, while a unit is worth its
-// expected retake. At most one unit per pass then displaces other memory,
+// footprint is then where it was), stays pending while the host refuses
+// it, and is cancelled once that take finds it short. Free room beyond
+// what the waiting claims, the lanes' projected growth and every pending
+// growth hold goes to the pools, the one whose next unit is worth most
+// first, while the host admits each unit and, once claims take a pool's
+// units, while a unit is worth its expected retake. At most one unit per
+// pass then displaces other memory,
 // outside critical pressure, when the victims cost less than the unit is
 // worth beyond its cycle: with the host's consent the victims need only meet
 // what the room lacks, and what its own victims free later is the pool's
@@ -785,7 +786,8 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
       // does: the extents a demotion's landing empties, which only a take
       // releases, and the steps of its units still to go, within the
       // unit's worth beyond its cycle; what that starts lands for a later
-      // pass.
+      // pass. Short, the growth is no longer worth what it takes, and holds
+      // nothing.
       if (!met && landed >= account.pendingLaterBytes) {
         const Candidate next = candidate(index);
         const ClaimId claim = open({.cls = ClaimClass::Growth,
@@ -798,6 +800,8 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
         credit = std::max(credit, freed.nowBytes);
         if (freed.outcome == FreeOutcome::Pending)
           account.pendingLaterBytes = freed.laterBytes;
+        else if (freed.outcome == FreeOutcome::Short)
+          account.pendingGrowth = account.pendingLaterBytes = 0;
       }
       if (met && growUnit(index, credit, "into its pending growth")) {
         account.pendingGrowth = account.pendingLaterBytes = 0;
