@@ -1004,7 +1004,12 @@ def floor_unit(run: Run) -> dict | None:
             for path in ("prefill_unit.gaps", "prefill_predicted_ms")
         )
         # A restart sets the counters back: its intervals tell nothing.
-        if commands > 0 and 0 <= committed < 2 * rows * commands and gaps > 0 and priced > 0:
+        if (
+            commands > 0
+            and 0 <= committed < 2 * rows * commands
+            and gaps > 0
+            and priced > 0
+        ):
             prices.append(priced / gaps)
     return {
         "minimum_rows": rows,
