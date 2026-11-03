@@ -37,6 +37,10 @@ struct PoolValue final {
                                   // not say
   uint64_t scanReadBytes = 0;     // bytes prefill loads read from the SSD, whose misses leave no ghosts; 0
                                   // without scans
+  uint64_t nearGhostHits = 0;     // ghost hits a pool larger by one unit would have served (the store: an
+                                  // elastic chunk, SlotRecycler::nearGhostHits); 0 without ghosts
+  uint64_t tailHits = 0;          // hits on what a pool smaller by one unit would have given up first (the
+                                  // store: SlotRecycler::tailHits); 0 when it does not say
 };
 
 // A memory of the model's that follows the engine's memory. The model owns the mechanism; the engine alone

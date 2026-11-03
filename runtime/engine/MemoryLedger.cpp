@@ -898,11 +898,15 @@ void MemoryLedger::fill(MemoryGovernorSnapshot &snapshot, uint64_t chargedBytes)
       row.currentBytes = state.currentBytes;
       row.capBytes = state.capBytes;
       row.unitBytes = state.releaseUnitBytes ? state.releaseUnitBytes : state.growUnitBytes;
-      if (row.unitBytes)
+      if (row.unitBytes) {
         row.valuePerGiB = value::poolUnit(account.rate, counters, row.unitBytes,
                                           missingBytes(state), kValueHorizonSeconds, rates_)
                               .at(kValueHorizonSeconds) *
                           kGiB / double(row.unitBytes);
+        const value::MarginalCost margin = value::marginal(account.rate, counters);
+        row.growValuePerGiB = margin.growRatePerSecond * kValueHorizonSeconds * kGiB / double(row.unitBytes);
+        row.shrinkValuePerGiB = margin.shrinkRatePerSecond * kValueHorizonSeconds * kGiB / double(row.unitBytes);
+      }
     } else {
       row.currentBytes = account.current();
       row.capBytes = row.currentBytes;

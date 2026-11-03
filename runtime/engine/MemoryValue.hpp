@@ -13,17 +13,18 @@
 namespace splash::engine::value {
 
 // A pool's measured rates: EWMAs (kRateTimeConstantSeconds) of its ghost
-// hits, hits and scan reads per second, of the bytes its ghosts span, and of
-// the units claims take from it per second. Only intervals in which the
-// engine ran a command update them (an idle interval says nothing of
-// demand); the first such interval sets them. They outlive the pool's own
-// resets: an idle release and restore clear its ghosts but not these.
+// hits, near-ghost and tail hits, hits and scan reads per second, of the
+// bytes its ghosts span, and of the units claims take from it per second.
+// Only intervals in which the engine ran a command update them (an idle
+// interval says nothing of demand); the first such interval sets them.
+// They outlive the pool's own resets: an idle release and restore clear its
+// ghosts but not these.
 class PoolRate final {
 public:
   // `taken`, the units claims took from it, is monotonic like the pool's
   // counters.
   void observe(const model::PoolValue &value, uint64_t taken, double nowSeconds, bool commandsRan) noexcept {
-    const Counters now{value.hits, value.ghostHits, value.scanReadBytes, taken};
+    const Counters now{value.hits, value.ghostHits, value.nearGhostHits, value.tailHits, value.scanReadBytes, taken};
     if (last_ && commandsRan && nowSeconds > lastSeconds_) {
       const double seconds = nowSeconds - lastSeconds_;
       const double weight = rates_ ? 1.0 - std::exp(-seconds / kRateTimeConstantSeconds) : 1.0;
@@ -33,6 +34,8 @@ public:
       Rates rates = rates_.value_or(Rates{});
       mix(rates.hits, now.hits, last_->hits);
       mix(rates.ghostHits, now.ghostHits, last_->ghostHits);
+      mix(rates.nearGhostHits, now.nearGhostHits, last_->nearGhostHits);
+      mix(rates.tailHits, now.tailHits, last_->tailHits);
       mix(rates.scanReadBytes, now.scanReadBytes, last_->scanReadBytes);
       mix(rates.takes, now.taken, last_->taken);
       rates.ghostBytes += weight * (double(value.ghostBytes) - rates.ghostBytes);
@@ -43,16 +46,19 @@ public:
   }
   [[nodiscard]] double hitsPerSecond() const noexcept { return rates_ ? rates_->hits : 0.0; }
   [[nodiscard]] double ghostHitsPerSecond() const noexcept { return rates_ ? rates_->ghostHits : 0.0; }
+  [[nodiscard]] double nearGhostHitsPerSecond() const noexcept { return rates_ ? rates_->nearGhostHits : 0.0; }
+  [[nodiscard]] double tailHitsPerSecond() const noexcept { return rates_ ? rates_->tailHits : 0.0; }
   [[nodiscard]] double ghostBytes() const noexcept { return rates_ ? rates_->ghostBytes : 0.0; }
   [[nodiscard]] double scanReadBytesPerSecond() const noexcept { return rates_ ? rates_->scanReadBytes : 0.0; }
   [[nodiscard]] double takesPerSecond() const noexcept { return rates_ ? rates_->takes : 0.0; }
 
 private:
   struct Counters final {
-    uint64_t hits = 0, ghostHits = 0, scanReadBytes = 0, taken = 0;
+    uint64_t hits = 0, ghostHits = 0, nearGhostHits = 0, tailHits = 0, scanReadBytes = 0, taken = 0;
   };
   struct Rates final {
-    double hits = 0.0, ghostHits = 0.0, scanReadBytes = 0.0, takes = 0.0, ghostBytes = 0.0;
+    double hits = 0.0, ghostHits = 0.0, nearGhostHits = 0.0, tailHits = 0.0, scanReadBytes = 0.0, takes = 0.0,
+           ghostBytes = 0.0;
   };
   std::optional<Counters> last_;
   double lastSeconds_ = 0.0;
@@ -109,6 +115,21 @@ private:
   if (missingBytes)
     cost.ratePerSecond += rate.scanReadBytesPerSecond() * rates.weightReadSecondsPerByte * unit / double(missingBytes);
   return cost;
+}
+// A pool's unit at the margin (AMENDMENTS Borrowed 1; research/SUMMARY.md
+// R1): one unit more saves a miss per ghost hit within the newest unit's
+// worth of ghosts, one unit less costs a miss per hit on what the pool gives
+// up first, both per second while the rates hold. The counters' window is
+// one unit, so the unit carries all of each. Reported beside poolUnit's
+// uniform spread, which the rule keeps as its input.
+struct MarginalCost final {
+  double growRatePerSecond = 0.0;
+  double shrinkRatePerSecond = 0.0;
+};
+[[nodiscard]] inline MarginalCost marginal(const PoolRate &rate, const model::PoolValue &value) noexcept {
+  const double missSeconds = value.missMilliseconds / 1000.0;
+  return {.growRatePerSecond = rate.nearGhostHitsPerSecond() * missSeconds,
+          .shrinkRatePerSecond = rate.tailHitsPerSecond() * missSeconds};
 }
 // What growth that displaces other memory costs beyond what it takes: the
 // unit read back key by key once it comes back (PoolValue::keyBytes a miss;

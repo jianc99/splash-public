@@ -288,6 +288,8 @@ void appendMemoryLedger(std::ostringstream &out, const MemoryGovernorSnapshot &g
         << ",\"floor_bytes\":" << account.floorBytes << ",\"current_bytes\":" << account.currentBytes
         << ",\"cap_bytes\":" << account.capBytes << ",\"reserved_bytes\":" << account.reservedBytes
         << ",\"unit_bytes\":" << account.unitBytes << ",\"value_per_gib\":" << account.valuePerGiB
+        << ",\"grow_value_per_gib\":" << account.growValuePerGiB
+        << ",\"shrink_value_per_gib\":" << account.shrinkValuePerGiB
         << ",\"grows\":" << account.grows << ",\"shrinks\":" << account.shrinks << '}';
   }
   out << "],\"reserved_bytes\":" << governor.reservedBytes << ",\"owed\":{\"transfers\":" << governor.owed.transfers

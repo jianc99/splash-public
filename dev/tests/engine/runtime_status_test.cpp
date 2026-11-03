@@ -241,6 +241,8 @@ void testCleanRuntimeStatus(const char *goldenPath) {
                         .reservedBytes = 256 * kMiB,
                         .unitBytes = 256 * kMiB,
                         .valuePerGiB = 1.75,
+                        .growValuePerGiB = 3.5,
+                        .shrinkValuePerGiB = 4.25,
                         .grows = 1,
                         .shrinks = 2}};
   governor.reservedBytes = 32 * 4096ULL + 256 * kMiB;

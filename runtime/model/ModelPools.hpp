@@ -90,7 +90,9 @@ public:
             .releasedBytes = stats.releasedBytes,
             .releaseMilliseconds = stats.releaseMilliseconds,
             .keyBytes = slotBytes(stats),
-            .scanReadBytes = prefill.readBytes};
+            .scanReadBytes = prefill.readBytes,
+            .nearGhostHits = stats.nearGhostHits,
+            .tailHits = stats.tailHits};
   }
   uint64_t release(uint64_t bytes) override {
     const ExpertStoreStats stats = store_.stats();

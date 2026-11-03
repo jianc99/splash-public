@@ -53,7 +53,9 @@ public:
             .ghostBytes = uint64_t{wholeUnits_ - units_} * unitBytes_,
             .missMilliseconds = missMilliseconds_,
             .releasedBytes = releasedBytes_,
-            .releaseMilliseconds = releaseMilliseconds_};
+            .releaseMilliseconds = releaseMilliseconds_,
+            .nearGhostHits = nearGhostHits,
+            .tailHits = tailHits};
   }
   [[nodiscard]] uint64_t release(uint64_t bytes) override {
     const uint64_t above = units_ - floorUnits_;
@@ -94,6 +96,9 @@ public:
   // read from the SSD (the scans' value, which ghosts do not show).
   uint64_t grows = 0, shrinks = 0;
   uint64_t prefillHits = 0, prefillMisses = 0;
+  // The hits at the edge it reports (model::PoolValue::nearGhostHits,
+  // tailHits), which the test moves.
+  uint64_t nearGhostHits = 0, tailHits = 0;
 
 private:
   std::string name_;

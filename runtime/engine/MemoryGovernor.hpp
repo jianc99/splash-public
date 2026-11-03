@@ -116,6 +116,11 @@ struct MemoryAccountSnapshot final {
   // What its next unit is worth: seconds of engine work over the ledger's
   // value horizon, per GiB.
   double valuePerGiB = 0.0;
+  // The same at the margin, which no rule reads (AMENDMENTS Borrowed 1;
+  // value::marginal): what one unit more would save and one unit less would
+  // cost, from the hits the pool counts within a unit of its edge.
+  double growValuePerGiB = 0.0;
+  double shrinkValuePerGiB = 0.0;
   // Units it took and gave back since the engine started.
   uint64_t grows = 0;
   uint64_t shrinks = 0;

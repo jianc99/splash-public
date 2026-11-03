@@ -885,6 +885,46 @@ void testAHostRefusedStartIsAdmittedWithinTwoPasses() {
   }
 }
 
+// AMENDMENTS Borrowed 1: /status reports a pool's price at its edge beside
+// the uniform spread, and the rule keeps the uniform input. On a concave
+// miss curve the ghost hits within a unit of the newest ghosts, and the hits
+// on the unit the pool gives up first, are twice the span's average a unit
+// (research/SUMMARY.md R1: about 2.2x on llama.cpp's tables). A claim choosing
+// between a unit of the store and a cache unit priced between the two takes
+// the store's unit, which the uniform price makes the cheaper.
+void testTheMarginalPriceIsReportedBesideTheUniform() {
+  Fixture fixture(host(32 * kGiB));
+  // Four 1 GiB units resident of eight: the ghosts span 4 GiB. A miss, 2 ms.
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 1, 4, 8, 4, 2.0, 0.0);
+  TestSource cache("cache", &fixture.memory);
+  fixture.ledger().addSource(cache);
+  fixture.ledger().addPool(experts);
+  // 40 ghost hits a second over the span, 10 a unit; 20 within a unit of the
+  // newest ghosts, and 20 on the unit given up first.
+  for (double t = 0.0; t < 30.0; t += 0.5) {
+    experts.served(0, 20, 0, 0);
+    experts.nearGhostHits += 10;
+    experts.tailHits += 10;
+    fixture.ledger().observePools(t + 0.5, true);
+  }
+  const MemoryGovernorSnapshot snapshot = fixture.governor->snapshot();
+  const MemoryAccountSnapshot &account = snapshot.accounts.back();
+  const double uniform = 10 * 0.002 * kValueHorizonSeconds;
+  require(account.name == "experts" && std::abs(account.valuePerGiB - uniform) < 1e-9 &&
+              std::abs(account.growValuePerGiB - 2 * uniform) < 1e-9 &&
+              std::abs(account.shrinkValuePerGiB - 2 * uniform) < 1e-9,
+          "the store's price at its edge was not reported beside the uniform one: " +
+              std::to_string(account.valuePerGiB) + " uniform, " + std::to_string(account.growValuePerGiB) +
+              " to grow, " + std::to_string(account.shrinkValuePerGiB) + " to shrink");
+  cache.units = {unit(1, kGiB, 1.5 * uniform)};
+  fixture.memory.hold("cache", kGiB);
+  const ClaimId claim =
+      fixture.ledger().open(request(1, RequestPriority::Normal, ClaimClass::InService, kValueHorizonSeconds));
+  require(fixture.ledger().free(claim, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Met &&
+              experts.shrinks == 1 && cache.taken.empty(),
+          "the rule priced the store's unit at its edge, not by the uniform spread");
+}
+
 // free() takes the cheapest unit per byte across sources first.
 void testCheapestPerByteFirstAcrossSources() {
   MemoryLedger ledger;
@@ -2328,6 +2368,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testEveryHostPassGivesBackIdleBuffers", testEveryHostPassGivesBackIdleBuffers},
       {"testDeficitCountsHostRefusedClaimsNotAnIdleMargin", testDeficitCountsHostRefusedClaimsNotAnIdleMargin},
       {"testAHostRefusedStartIsAdmittedWithinTwoPasses", testAHostRefusedStartIsAdmittedWithinTwoPasses},
+      {"testTheMarginalPriceIsReportedBesideTheUniform", testTheMarginalPriceIsReportedBesideTheUniform},
       {"testCheapestPerByteFirstAcrossSources", testCheapestPerByteFirstAcrossSources},
       {"testAUnitLargerThanTheNeedCostsItsWholeCost", testAUnitLargerThanTheNeedCostsItsWholeCost},
       {"testSourceOrderIsKeptWithinASource", testSourceOrderIsKeptWithinASource},
