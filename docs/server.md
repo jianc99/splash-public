@@ -677,9 +677,13 @@ stopped taking writes), `write_budget_bytes`, the bytes the next state's
 write not in use may take now, and `writes_deferred_ms`, how long writes held
 back for SSD reads a step waited for. Without a write budget `writes_gated` is
 never `budget` and `write_budget_bytes` is 0. It counts the KV pages copied
-ahead (`kv_copies`), and under `write_behind` the restore points waiting for
+ahead (`kv_copies`), and under `write_behind` the restore points queued for
 their copies (`waiting`), copied (`durable`), gone on from first (`unneeded`)
-and not copied for want of room or a file that takes writes (`refused`).
+and not copied for want of room or a file that takes writes (`refused`). The
+queued points are not work the engine owes, so an idle engine can report
+some: without the persistent cache each waits for memory to run short, which
+may never happen, and with it for its turn, 10 s after its publication at the
+earliest.
 
 Restarts recompute everything unless `--persistent-cache` is on (see
 [persistent cache](#persistent-cache)); otherwise the cache keeps evicted KV

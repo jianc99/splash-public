@@ -3,6 +3,7 @@ that report it: the probes, /status and /metrics."""
 
 import json
 import os
+import re
 import time
 import unittest
 from pathlib import Path
@@ -92,6 +93,19 @@ class StatusContractTests(unittest.TestCase):
                 f"splash_memory_account_shrinks_total{{{label}}} {account['shrinks']}",
                 lines,
             )
+
+    def test_write_behind_counts_are_documented(self):
+        # A reader waiting for an idle engine goes by this row of docs/api.md:
+        # the restore points queued for their copies (`waiting`) are not work.
+        status = json.loads(GOLDEN.read_text())
+        first, *rest = status["disk"]["write_behind"]
+        api = Path(__file__).parents[3] / "docs/api.md"
+        documented = [
+            re.findall(r"`([^`]+)`", line.split(" | ")[0])
+            for line in api.read_text().splitlines()
+            if line.startswith("| `disk.write_behind.")
+        ]
+        self.assertEqual(documented, [[f"disk.write_behind.{first}", *rest]])
 
 
 class StatusRouteTests(HarnessTestCase):
