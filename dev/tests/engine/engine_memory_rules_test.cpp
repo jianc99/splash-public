@@ -307,6 +307,76 @@ void testACancelBetweenPassesEndsBesideAHigherPrioritysDecode() {
           "the cancelled lane did not end while the Foreground lane decoded");
 }
 
+// A lane cancelled between the passes of its command beside a decode of the
+// command's own priority ends at the command's last pass, and the command's
+// other lanes keep the passes they ran (smoke b, T2): the decode that follows
+// each pass holds none off, so the command runs its next pass after it.
+// Two Normal prompts share a command in passes beside a Normal lane that
+// decodes; one is cancelled between the passes.
+void testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses() {
+  PassesUnderALimit passes(uint64_t{1} << 30);
+  // Each prefill pass's lanes, pass and passes.
+  struct Pass final {
+    std::vector<uint64_t> lanes;
+    uint32_t pass = 0;
+    uint32_t passes = 0;
+  };
+  std::vector<Pass> ran;
+  passes.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill) {
+      passes.prefills.emplace_back(plan.items.front().requestId, plan.pass);
+      Pass &unit = ran.emplace_back(Pass{.pass = plan.pass, .passes = plan.passes});
+      for (const BatchItem &item : plan.items)
+        unit.lanes.push_back(item.requestId);
+    }
+    return test::CommandTimes{};
+  };
+  const auto holds = [](const Pass &unit, uint64_t id) {
+    return std::ranges::find(unit.lanes, id) != unit.lanes.end();
+  };
+  const auto passesOf = [&](uint64_t id) {
+    std::string result;
+    for (const Pass &unit : ran)
+      if (holds(unit, id))
+        result += (result.empty() ? "" : ",") + std::to_string(unit.pass);
+    return result;
+  };
+  EngineRequest decoder = request(3, std::vector<uint32_t>(64, 3));
+  decoder.maxNewTokens = 1000;
+  decoder.deadlineMilliseconds = 1e9;
+  passes.engine.submit(std::move(decoder));
+  passes.runUntil([&] { return passes.events.outputs.contains(3); }, "the Normal lane did not decode");
+  passes.submit(1, 129, RequestPriority::Normal);
+  passes.submit(2, 129, RequestPriority::Normal);
+  passes.runUntil(
+      [&] {
+        return std::ranges::any_of(ran, [&](const Pass &unit) { return !holds(unit, 3); }) &&
+               !passes.engine.commandInFlight();
+      },
+      "the Normal prompts did not run a pass");
+  require(ran.back().pass == 0 && ran.back().passes > 1 && holds(ran.back(), 1) && holds(ran.back(), 2),
+          "the Normal prompts do not share a command between its passes");
+  const uint32_t commandPasses = ran.back().passes;
+  passes.engine.cancel(2);
+  for (uint32_t step = 0; step < 200 && !passes.events.usage.contains(2); ++step)
+    static_cast<void>(passes.engine.tick(passes.now++));
+  const Pass ending = ran.back();
+  const uint64_t abandonedAtEnd = passes.engine.snapshot().scheduler.abandonedPassCommands;
+  passes.runUntil([&] { return passes.events.outputs.contains(1); }, "the prompt left did not decode");
+  std::string expected;
+  for (uint32_t pass = 0; pass < commandPasses; ++pass)
+    expected += (pass ? "," : "") + std::to_string(pass);
+  require(passes.events.usage.contains(2) && passes.events.outputs.contains(3) && abandonedAtEnd == 0 &&
+              ending.pass + 1 == commandPasses && holds(ending, 2) && passesOf(1) == expected &&
+              passes.engine.snapshot().scheduler.abandonedPassCommands == 0,
+          "a lane cancelled between the passes beside a decode of its command's priority did not end at the "
+          "command's last pass, its other lane keeping its passes: abandoned commands " +
+              std::to_string(passes.engine.snapshot().scheduler.abandonedPassCommands) +
+              ", the cancelled lane ended after pass " + std::to_string(ending.pass) + " of " +
+              std::to_string(ending.passes) + (holds(ending, 2) ? " holding it" : " without it") +
+              ", the other lane ran passes " + passesOf(1) + " (expected " + expected + ")");
+}
+
 // A start the host refused beside a resident lane waits for the host's
 // passes, which free what it lacks (earlyfix.md, MemoryLedger.cpp:555 and
 // MemoryGovernor.cpp:515; amend/M.md B3): a Foreground lane waits for its
@@ -1253,6 +1323,8 @@ std::span<const test::TestCase> rulesTests() {
       {"testADecodeGapOnExpertReadsIsAnSsdWait", testADecodeGapOnExpertReadsIsAnSsdWait},
       {"testACancelBetweenPassesEndsBesideAHigherPrioritysDecode",
        testACancelBetweenPassesEndsBesideAHigherPrioritysDecode},
+      {"testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses",
+       testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses},
       {"testAHostRefusedStartIsFreedForByThePass", testAHostRefusedStartIsFreedForByThePass},
       {"testAStartRanksByTheWorkItHolds", testAStartRanksByTheWorkItHolds},
   };

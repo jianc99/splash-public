@@ -332,11 +332,16 @@ bool Engine::tick(double now) {
     if (!plan)
       break;
     // A command between its passes beside a lane of it that ended (a cancel,
-    // a deadline) gives way, whole, to any plan but its next pass, as at
-    // every point a lane yields (yieldsEndedLanes), and the tick ends there:
-    // the lane's end and its memory wait for no pass a higher priority's
-    // work may hold off.
+    // a deadline) gives way, whole, to a plan of a higher priority than its
+    // own, as at every point a lane yields (yieldsEndedLanes), and the tick
+    // ends there: the lane's end and its memory wait for no pass a higher
+    // priority's work may hold off. Beside a plan of its priority, such as
+    // the decode that follows each of its passes, or a lower one, its next
+    // pass comes after that plan: the command goes on, its other lanes
+    // keeping the passes they ran, and the lane ends at its last pass.
     if (passCommand_ && !plan->pass &&
+        requests_.at(plan->items.front().requestId).request.priority <
+            requests_.at(passCommand_->items.front().requestId).request.priority &&
         std::ranges::any_of(passCommand_->items, [&](const ModelBatchItem &item) {
           return requests_.at(item.requestId).pendingEnd.has_value();
         })) {
