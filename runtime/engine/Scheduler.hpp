@@ -277,9 +277,10 @@ private:
     // which it stays overdue.
     double waitedMilliseconds = 0.0;
     bool overdue = false;
-    // The prompt position its committed rows reach in prefillRows, which
-    // rows planned again after their command was abandoned between its
-    // passes do not pass; a resume's replay counts from its start again.
+    // The prompt position its committed rows reach in prefillRows, never
+    // behind promptProcessed, which rows planned again after their command
+    // was abandoned between its passes do not pass; a resume's replay counts
+    // the rows that ran again, those abandoned once.
     uint32_t rowsCounted = 0;
   };
 

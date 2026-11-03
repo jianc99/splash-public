@@ -1819,8 +1819,9 @@ void testCommandBetweenPassesHoldsItsLanes() {
 // A command's rows count once, with its first pass, in prefill_rows, the
 // work the matrix compares with 1.5.0, which counts them so: the rows its
 // lanes plan again after it was abandoned between its passes counted
-// already. A lane suspended between its command's passes replays its rows
-// once it resumes, and those count again, as 1.5.0's replays do.
+// already, and so did those a lane suspended between its command's passes
+// replays once it resumes. A lane whose command completed replays rows that
+// ran, and those count again.
 void testAnAbandonedCommandsRowsCountOnce() {
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   sim.seed();
@@ -1849,8 +1850,16 @@ void testAnAbandonedCommandsRowsCountOnce() {
   sim.scheduler.resumeFromResources(3, 0, 8192);
   while (sim.scheduler.phase(3) == Phase::Prefill)
     sim.step();
+  require(sim.scheduler.snapshot().prefillRows == counted,
+          "a replay of a command abandoned between its passes counted " +
+              std::to_string(sim.scheduler.snapshot().prefillRows - counted) + " of its 8192 rows again");
+  sim.scheduler.suspendForResources(3);
+  sim.scheduler.resumeFromResources(3, 0, 8192);
+  while (sim.scheduler.phase(3) == Phase::Prefill)
+    sim.step();
   require(sim.scheduler.snapshot().prefillRows == counted + 8192,
-          "a replay counted " + std::to_string(sim.scheduler.snapshot().prefillRows - counted) + " of its 8192 rows");
+          "a replay of a completed command counted " + std::to_string(sim.scheduler.snapshot().prefillRows - counted) +
+              " of its 8192 rows");
 }
 
 // A higher priority's decode does not abandon a command between its passes,
