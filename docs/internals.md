@@ -1240,7 +1240,9 @@ Between commands the control pass gives the host's claim what macOS's warning
 asks, up to the margin and cache only while the host lacks nothing past it,
 what the band lacks, or under critical pressure everything above the floors;
 then it grows the pools into the free room while a unit, should no claim
-take it back within the minute ahead, saves more than its cycle costs, or by
+take it back within the minute ahead, saves more than its cycle costs, but
+not while a claim waits for memory (a start's, a resume's) or to retry what
+the host refused it: the room is the request's; or by
 displacing cheaper cache once a pass (`/status`: `memory_governor.accounts`,
 `claims` and `owed`; `growth_allowed` is false while the host refuses
 growth). Claims take a pool's units at its measured rate, which falls over
