@@ -460,10 +460,10 @@ class ArchitectureTests(unittest.TestCase):
             {"gemma", "opal", "dflash"},
         )
 
-    def test_engine_mechanism_names_are_found_but_not_yet_checked(self):
+    def test_engine_policy_names_no_model_mechanism(self):
         name = "runtime/engine/Engine.cpp"
         for text, identifier in (
-            ("void releaseExpertChunk();\n", "releaseExpertChunk"),
+            ("void dropExperts();\n", "dropExperts"),
             ("auto experts = 0;\n", "experts"),
             ("bool hasIndexer = false;\n", "hasIndexer"),
             ("auto PLERows = 0;\n", "PLERows"),
@@ -482,9 +482,7 @@ class ArchitectureTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(
-                    check_architecture.check_engine_policy(
-                        name, text, [], mechanisms=True
-                    ),
+                    check_architecture.check_engine_policy(name, text, []),
                     [f"{name}: engine policy names a model mechanism ({identifier})"],
                 )
         # Words that only contain or neighbour a mechanism's, and comments.
@@ -494,16 +492,17 @@ class ArchitectureTests(unittest.TestCase):
             "bool gainsIndexPages = false;\nauto indexPageLanes = 0;\n"
             "// an expert's history stream\n"
         )
-        self.assertEqual(
-            check_architecture.check_engine_policy(name, text, [], mechanisms=True), []
-        )
+        self.assertEqual(check_architecture.check_engine_policy(name, text, []), [])
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / name
             source.parent.mkdir(parents=True)
-            source.write_text("void releaseExpertChunk();\n")
+            source.write_text("void dropExperts();\n")
             with mock.patch.object(check_architecture, "ROOT", root):
-                self.assertEqual(check_architecture.check(), [])
+                self.assertEqual(
+                    check_architecture.check(),
+                    [f"{name}: engine policy names a model mechanism (dropExperts)"],
+                )
 
     def test_identifiers_split_into_words(self):
         for identifier, parts in (

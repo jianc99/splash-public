@@ -214,12 +214,10 @@ def code_identifiers(text: str) -> list[str]:
     return IDENTIFIER.findall(NOT_CODE.sub(" ", INCLUDE.sub(" ", text)))
 
 
-def check_engine_policy(
-    name: str, text: str, includes: list[str], mechanisms: bool
-) -> list[str]:
+def check_engine_policy(name: str, text: str, includes: list[str]) -> list[str]:
     """An engine policy file's model dependencies: model headers outside the
-    boundary, and identifiers that name a model family or, with `mechanisms`,
-    a model mechanism."""
+    boundary, and identifiers that name a model family or a model
+    mechanism."""
     errors = [
         f"{name}: engine policy depends on model internals {include}"
         for include in includes
@@ -229,7 +227,7 @@ def check_engine_policy(
         parts = identifier_parts(identifier)
         if MODEL_FAMILY_PARTS.intersection(parts):
             errors.append(f"{name}: engine policy names a model family ({identifier})")
-        elif mechanisms and names_mechanism(parts):
+        elif names_mechanism(parts):
             errors.append(
                 f"{name}: engine policy names a model mechanism ({identifier})"
             )
@@ -386,8 +384,7 @@ def check() -> list[str]:
                         f"{name}: engine reporting depends on concrete model {include}"
                     )
         elif name.startswith("runtime/engine/") and name not in ENGINE_ASSEMBLY:
-            # Mechanism names are not checked: engine policy still names some.
-            errors.extend(check_engine_policy(name, text, includes, mechanisms=False))
+            errors.extend(check_engine_policy(name, text, includes))
         if name == "runtime/main.mm":
             for include in includes:
                 if include in CONCRETE_MODEL_HEADERS:
