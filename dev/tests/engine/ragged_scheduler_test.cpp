@@ -22,6 +22,7 @@
 #include <random>
 #include <span>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1495,11 +1496,14 @@ void testAContendedUnitPastTheBoundKeepsItsPasses() {
 // (model::CommandLimits::minimumUnitRows: the Neural Engine FFN split's
 // least chunk, below which the GPU alone runs the FFN), nor leaves its prompt
 // fewer than those to run after it, and runs past the bound instead: on the
-// dense 27B in one pass, units of 512 rows or more, the halving counted,
-// where without the limit it halves to its bound, below 512 rows. A prompt
-// whose remaining rows are fewer than the limit runs them as they are, and
-// one of fewer than twice the limit runs whole (a cut would leave a rest the
-// faster path does not take).
+// dense 27B in one pass, units of 512 to 1024 rows, the halving counted,
+// where without the limit it halves to its bound, below 512 rows. A rest of
+// fewer than twice the limit no later cut halves, so a unit and that rest
+// share the rows evenly: 1500 rows run as 750 and 750. A prompt whose
+// remaining rows are fewer than the limit runs them as they are, and one of
+// fewer than twice it runs whole. Where the unit at the limit costs more than
+// twice the unit's price a row (a cost per command its rows do not shorten),
+// it keeps its rows.
 void testAContendedUnitKeepsTheModelsLeastRows() {
   for (const uint32_t least : {1u, 512u}) {
     model::CommandLimits split = limits();
@@ -1518,28 +1522,44 @@ void testAContendedUnitKeepsTheModelsLeastRows() {
       }
       sim.run(plan);
     }
-    const uint32_t fewest = *std::ranges::min_element(units);
+    const auto [fewest, most] = std::ranges::minmax_element(units);
     if (least == 1) {
-      require(fewest < 512, "a contended dense unit without passes did not halve below 512 rows to its bound");
+      require(*fewest < 512, "a contended dense unit without passes did not halve below 512 rows to its bound");
       continue;
     }
-    require(fewest >= least, "a contended unit of a target whose faster path takes " + std::to_string(least) +
-                                 " rows or more halved to " + std::to_string(fewest) + " rows");
+    require(*fewest >= least && *most <= 2 * least,
+            "a contended prompt of a target whose faster path takes " + std::to_string(least) +
+                " rows or more ran units of " + std::to_string(*fewest) + " to " + std::to_string(*most) + " rows");
     require(sim.scheduler.snapshot().boundCuts > 0, "a contended unit past its bound kept its rows");
-    for (const uint64_t id : {3u, 4u}) {
-      const uint32_t remaining = id == 3 ? 300 : 700;
+    for (const auto &[id, remaining, first] : {std::tuple{3u, 300u, 300u}, {4u, 700u, 700u}, {5u, 1500u, 750u}}) {
       sim.lane(id, 0, remaining);
       BatchPlan plan = sim.plan();
       while (plan.kind != WorkKind::Prefill) {
         sim.run(plan);
         plan = sim.plan();
       }
-      require(plan.items[0].requestId == id && plan.items[0].tokenCount == remaining,
+      require(plan.items[0].requestId == id && plan.items[0].tokenCount == first,
               "a contended prompt of " + std::to_string(remaining) + " rows ran " +
-                  std::to_string(plan.items[0].tokenCount) + " of them");
-      sim.run(plan);
+                  std::to_string(plan.items[0].tokenCount) + " of them first, not " + std::to_string(first));
+      while (sim.scheduler.phase(id) == Phase::Prefill)
+        sim.step();
     }
   }
+  test::TimingProfile heavy = test::kDense27B;
+  heavy.chunkMilliseconds = 20'000.0;
+  model::CommandLimits split = limits();
+  split.minimumUnitRows = 512;
+  Sim sim(heavy, split);
+  sim.seed();
+  sim.decoder(1);
+  sim.lane(2, 0, 20'000);
+  completeDecode(sim);
+  const BatchPlan plan = sim.plan();
+  require(plan.kind == WorkKind::Prefill && plan.items[0].tokenCount == kChunk,
+          "a contended unit whose cost per command its rows do not shorten halved to " +
+              std::to_string(plan.items[0].tokenCount) + " rows");
+  sim.run(plan);
+  require(sim.scheduler.snapshot().boundCuts == 0, "a halving that pays no rows' cost was counted");
 }
 
 // S-P3: beside a Spill lane streaming its history, a decoder's gaps between
