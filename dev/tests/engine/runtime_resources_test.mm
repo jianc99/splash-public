@@ -16,6 +16,7 @@
 #include "model/SparseRowStore.hpp"
 #include "model/SsdReaders.hpp"
 #include "model/WorkFormulas.hpp"
+#include "tools/LoadOptions.hpp"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -158,6 +159,27 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
         model::loadModel(backend, root, config.model,
                          {.expertMemoryBytes = weights.expertMinimumBytes - 1, .readers = readers}));
   }, "holds fewer slots", "a store a byte below the smallest loaded");
+}
+
+// A tool's --expert-memory SIZE (tools::takeLoadOption) sets the floor of a
+// store of SIZE: all of the store, which it starts at and keeps, as a tool
+// runs no engine that grows or reclaims it. A SIZE between the smallest
+// store and every expert.
+void testAToolsStoreIsItsSize(const RuntimeResourcesConfig &config) {
+  const model::StreamableWeights weights =
+      model::streamableWeights(config.modelRoot, config.model, {.streamExperts = true});
+  const uint64_t size = (weights.expertMinimumBytes + weights.expertBytes) / 2;
+  model::ModelLoadOptions options{.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders)};
+  require(tools::takeLoadOption("--expert-memory", std::to_string(size), options),
+          "--expert-memory is not a tool's load option");
+  metal::MetalBackend backend(config.metallibPath.string());
+  const model::LoadedModel loaded = model::loadModel(backend, config.modelRoot, config.model, options);
+  require(loaded.expertStore() != nullptr, "a tool's --expert-memory below every expert did not stream them");
+  const model::ExpertStoreStats store = loaded.expertStore()->stats();
+  require(store.floorBytes == store.capBytes && store.liveBytes == store.capBytes && store.capBytes <= size,
+          "a tool's store of --expert-memory " + std::to_string(size) + " bytes has a floor of " +
+              std::to_string(store.floorBytes) + " bytes and holds " + std::to_string(store.liveBytes) +
+              " of its " + std::to_string(store.capBytes));
 }
 
 // --expert-memory auto loads a MoE target's routed experts where the plan
@@ -1603,6 +1625,7 @@ int main(int argc, char **argv) {
         const test::TemporaryDirectory root("splash-moe");
         const RuntimeResourcesConfig moe = moeConfig(argv[1], root.path());
         testStreamableWeightsAreWhatLoads(moe);
+        testAToolsStoreIsItsSize(moe);
         testAutomaticExpertMemory(moe);
         testVerifyRows(argv[1], moe);
         testStreamedRuntimeBoundary(moe);

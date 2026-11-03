@@ -426,7 +426,7 @@ $(TEST_GGUF_PLANNER): dev/tests/engine/gguf_planner_test.mm $(ENGINE_LIBRARY)
 $(TEST_GGUF_PREPARATION): dev/tests/engine/gguf_preparation_test.mm $(ENGINE_LIBRARY)
 $(TEST_BOOTSTRAP_TEST): dev/tests/engine/runtime_bootstrap_test.mm \
 		dev/tests/engine/ProtocolPeer.cpp $(ENGINE_LIBRARY)
-$(TEST_RESOURCES_TEST): dev/tests/engine/runtime_resources_test.mm \
+$(TEST_RESOURCES_TEST): dev/tests/engine/runtime_resources_test.mm dev/tools/LoadOptions.hpp \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_KV_PAGE_TIER_TEST): dev/tests/engine/kv_page_tier_test.mm \
 		$(ENGINE_LIBRARY)
