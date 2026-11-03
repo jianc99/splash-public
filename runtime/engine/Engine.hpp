@@ -793,14 +793,15 @@ private:
   // The victims that are the engine's decisions, in this order (amend/M.md
   // B7, B15): the model's idle state buffers, which cost nothing and are
   // sized as they go (Model::releaseIdleBuffer, keeping one lane's short of
-  // critical pressure); a Resident lane's conversion to Spill, the lane
-  // holding the most KV first, priced at what spilling costs it
-  // (spillPenaltySeconds); the command between its passes, for a claim
-  // whose work supersedes it, at no cost. A conversion is offered only for
-  // an admitted lane (a lane and no restore, in prefill or decode), not
-  // ended and not between passes, of a priority no higher than the claim's,
-  // on a target that can spill with the tier open and its quota holding
-  // the lane's pages, and only for what its pages can land into now (the
+  // critical pressure); the command between its passes, for a claim whose
+  // work supersedes it, at no cost; a Resident lane's conversion to Spill,
+  // the lane holding the most KV first, priced at what spilling costs it
+  // (spillPenaltySeconds). A conversion is offered only for an admitted
+  // lane (a lane and no restore, in prefill or decode), not ended and not
+  // between passes, of a priority no higher than the claim's, on a target
+  // that can spill with the tier open, its quota and its write budget
+  // holding the lane's pages beside those of the lanes offered before it,
+  // and only for what its pages can land into now (the
   // free Index pages the copies in flight and owed leave, Cache::
   // indexLandingPages) net of the hot block cache it then reads through;
   // with nothing left it is not offered. It frees its memory as its copies

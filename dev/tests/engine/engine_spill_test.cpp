@@ -1486,6 +1486,48 @@ void testAFloorConvertsTheLargestLaneThatGivesMemoryBack() {
   }
 }
 
+// A conversion commits quota of active KV, and the write budget then covers
+// that much more of what Spill requests committed: what one conversion
+// commits, the lanes after it have no more. The engine offers each lane
+// beside the lanes it offers before it, so a claim that takes all it finds
+// converts the lanes the quota, or the budget's balance, holds together,
+// takes no lane it did not weigh, and the engine goes on. Two Resident lanes
+// each commit about 136 slots; the quota keeps 200, or the balance covers
+// 100 slots' writes.
+void testConversionsFitTheQuotaAndTheWriteBudgetTogether() {
+  for (const bool budget : {false, true}) {
+    Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16});
+    spill.tier.writableFile = false;
+    spill.engine.submit(Spilling::prompt(4, 4, 8, 10000));
+    spill.engine.submit(Spilling::prompt(5, 5, 7, 10000));
+    spill.runUntil(
+        [&] {
+          return spill.events.outputs.contains(4) && spill.events.outputs.contains(5) &&
+                 !spill.engine.commandInFlight();
+        },
+        "the lanes did not decode");
+    spill.tier.writableFile = true;
+    if (budget)
+      spill.budget->setWriteBudget(4 * 100 * 100);
+    else
+      spill.budget->setActiveLimitBytes(spill.budget->activeLimitBytes() - spill.cache.spillRoom() + 200 * 100);
+    try {
+      static_cast<void>(test::hostPass(spill.host.governor));
+    } catch (const std::exception &error) {
+      require(false, std::string("a host pass that took every lane it found failed the engine: ") + error.what());
+    }
+    uint32_t spilled = 0;
+    for (const ActiveRequestSnapshot &active : spill.engine.snapshot().activeRequests)
+      spilled += active.kvMode == KvMode::Spill;
+    require(spilled == 1 && spill.engine.snapshot().spill.converted == 1,
+            std::string("the pass did not convert the one lane the ") + (budget ? "write budget" : "quota") +
+                " holds: " + std::to_string(spilled) + " Spill lanes");
+    spill.model.decodeFinishes = true;
+    spill.runUntilIdle();
+    require(spill.events.failedCount == 0, "a request failed");
+  }
+}
+
 // The copies a converted lane owes free its Full pages as they land, a few
 // writes at a time where an extent holds more pages than the tier writes at
 // once, as the production pool's do: while they bring an extent's pages
@@ -2063,6 +2105,7 @@ std::span<const test::TestCase> spillTests() {
       {"testAFloorConvertsAResidentNeighbourOrTakesTheExpertStore",
        testAFloorConvertsAResidentNeighbourOrTakesTheExpertStore},
       {"testAFloorConvertsTheLargestLaneThatGivesMemoryBack", testAFloorConvertsTheLargestLaneThatGivesMemoryBack},
+      {"testConversionsFitTheQuotaAndTheWriteBudgetTogether", testConversionsFitTheQuotaAndTheWriteBudgetTogether},
       {"testOwedCopiesHoldBackTheNextConversion", testOwedCopiesHoldBackTheNextConversion},
       {"testARefusedStartTakesNothingTheLanesInServiceHold", testARefusedStartTakesNothingTheLanesInServiceHold},
       {"testALaneBeingAdmittedDoesNotConvert", testALaneBeingAdmittedDoesNotConvert},

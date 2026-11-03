@@ -883,10 +883,14 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
   });
   // What the copies can land into now, each conversion's pages taking their
   // share in turn: the blocks of its chain past its dense history and tail
-  // window, which spill as their copies land (Cache::convertToSpill).
+  // window, which spill as their copies land (Cache::convertToSpill). And
+  // what each conversion commits, which the quota of active KV and the
+  // write budget then hold no more for the lanes after it: taking one leaves
+  // the others as they were offered (VictimSource).
   uint64_t room = engine.cache_.indexLandingPages();
   const uint64_t full = uint64_t{geometry.densePages} + geometry.windowPages;
   const uint64_t quota = geometry.slotBytes ? engine.cache_.spillRoom() / geometry.slotBytes : 0;
+  uint64_t committed = 0;
   for (const auto &[held, active] : lanes) {
     const uint64_t id = active->request.id;
     const uint64_t pages = (held + KvCache::pageTokens - 1) / KvCache::pageTokens;
@@ -895,13 +899,16 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
                                                      : active->publishedTokens) /
                             KvCache::pageTokens;
     const uint64_t landing = std::min(blocks > full ? blocks - full : 0, room);
-    if (!landing || quota < engine.spillPages(*active, engine.chainEnd(*active)))
+    const uint64_t commits = engine.spillPages(*active, engine.chainEnd(*active));
+    if (!landing || quota < committed + commits ||
+        engine.cache_.spillGate(committed * geometry.slotBytes) != SpillGate::Open)
       continue;
     const uint64_t freed = landing * (geometry.fullPageBytes - std::min(geometry.fullPageBytes, geometry.indexPageBytes));
     const uint64_t reads = engine.model_.spilledReadShortfall(id, {WorkKind::Decode, static_cast<uint32_t>(pages)});
     if (freed <= reads)
       continue;
     room -= landing;
+    committed += commits;
     units.push_back(Victim{.key = id,
                            .bytes = freed - reads,
                            .pages = static_cast<uint32_t>(landing),
@@ -917,28 +924,29 @@ std::optional<Victim> Engine::EngineVictims::peek(const VictimQuery &query, cons
   // The idle state buffers, sized as they go.
   if (!after)
     return Victim{.sized = false};
-  if (after->kind != VictimKind::PassCommand) {
-    const std::vector<Victim> units = conversions(query);
-    auto next = units.begin();
-    if (after->kind == VictimKind::Conversion) {
-      next = std::ranges::find(units, after->key, &Victim::key);
-      if (next != units.end())
-        ++next;
-    }
-    if (next != units.end())
-      return *next;
-    // The command between its passes, none of whose passes is in flight,
-    // for work that supersedes it: the buffers its captures hold, which the
-    // ledger counts as bytes for a need of bytes.
-    const Engine &engine = engine_;
-    if (engine.passCommand_ && !engine.pending_ && query.claim && query.claim->supersedes) {
-      uint32_t buffers = 0;
-      for (const ModelBatchItem &item : engine.passCommand_->items)
-        buffers += static_cast<uint32_t>(std::ranges::count_if(
-            item.stateCaptures, [](const StateCapture &capture) { return capture.reservation != nullptr; }));
-      return Victim{.stateBuffers = buffers, .kind = VictimKind::PassCommand};
-    }
+  // Then the command between its passes, none of whose passes is in flight,
+  // for work that supersedes it: the buffers its captures hold, which the
+  // ledger counts as bytes for a need of bytes. It costs that work nothing,
+  // and comes before the conversions, which cost their lanes the spill
+  // penalty (the base took it before any conversion).
+  const Engine &engine = engine_;
+  if (after->kind == VictimKind::Memory && engine.passCommand_ && !engine.pending_ && query.claim &&
+      query.claim->supersedes) {
+    uint32_t buffers = 0;
+    for (const ModelBatchItem &item : engine.passCommand_->items)
+      buffers += static_cast<uint32_t>(std::ranges::count_if(
+          item.stateCaptures, [](const StateCapture &capture) { return capture.reservation != nullptr; }));
+    return Victim{.stateBuffers = buffers, .kind = VictimKind::PassCommand};
   }
+  const std::vector<Victim> units = conversions(query);
+  auto next = units.begin();
+  if (after->kind == VictimKind::Conversion) {
+    next = std::ranges::find(units, after->key, &Victim::key);
+    if (next != units.end())
+      ++next;
+  }
+  if (next != units.end())
+    return *next;
   return std::nullopt;
 }
 

@@ -472,11 +472,12 @@ public:
 
   // Spilling. Whether a new Spill request may start, or a Resident one
   // convert: a writable tier, and a write budget that covers what Spill
-  // requests committed (DiskBudget::admitsSpill).
-  [[nodiscard]] SpillGate spillGate() const noexcept {
+  // requests committed (DiskBudget::admitsSpill), and `committingBytes`
+  // more that conversions before it would commit.
+  [[nodiscard]] SpillGate spillGate(uint64_t committingBytes = 0) const noexcept {
     if (!kvTierWritable())
       return SpillGate::TierClosed;
-    if (diskBudget_ && !diskBudget_->admitsSpill(diskBudget_->committedBytes()))
+    if (diskBudget_ && !diskBudget_->admitsSpill(diskBudget_->committedBytes() + committingBytes))
       return SpillGate::WriteBudget;
     return SpillGate::Open;
   }

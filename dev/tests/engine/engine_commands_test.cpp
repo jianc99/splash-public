@@ -1157,6 +1157,62 @@ void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
           "a superseding prompt converted itself to Spill before the command between its passes gave its memory back");
 }
 
+// The command between its passes, which costs a superseding claim nothing,
+// comes before every lane's conversion in the engine's units: beside a
+// Background lane that decodes Resident, its history past its dense page and
+// tail window, the superseding prompt takes the command's memory and
+// converts no lane (design/M.md M3.1 keeps the outcome above).
+void testASupersedingPromptTakesTheCommandBeforeAConversion() {
+  Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6));
+  spill.host.bookStates(spill.model);
+  std::vector<std::pair<uint64_t, uint32_t>> prefills;
+  spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
+    if (plan.kind == WorkKind::Prefill)
+      prefills.emplace_back(plan.items.front().requestId, plan.pass);
+    return test::CommandTimes{};
+  };
+  bool blocked = false;
+  spill.model.kvGrowthBlocked = &blocked;
+  spill.storage.growthAllowed = [&](uint32_t) {
+    if (blocked)
+      return static_cast<bool>(spill.host.reserve(64));
+    spill.host.leaveRoom(std::nullopt);
+    return true;
+  };
+  spill.model.beginObserver = [&] {
+    if (spill.model.lastBeginId == 3) {
+      blocked = true;
+      spill.host.leaveRoom(0);
+    }
+  };
+  test::seedAsStartup(spill.engine, spill.model);
+  spill.model.decodeFinishes = false;
+  EngineRequest decoding = Spilling::prompt(4, 4, 40, 100);
+  decoding.priority = RequestPriority::Background;
+  decoding.deadlineMilliseconds = 1e9;
+  spill.engine.submit(std::move(decoding));
+  spill.runUntil([&] { return spill.events.outputs.contains(4); }, "the Background lane did not decode");
+  prefills.clear();
+  for (uint64_t id = 1; id <= 2; ++id) {
+    EngineRequest background = Spilling::prompt(id, static_cast<uint32_t>(id), 4, 1);
+    background.priority = RequestPriority::Background;
+    spill.engine.submit(std::move(background));
+  }
+  spill.runUntil([&] { return !prefills.empty() && !spill.engine.commandInFlight(); },
+                 "the Background prompts did not run a pass");
+  // The units are priced at the scheduler's rates, as the control pass sets them.
+  spill.engine.refreshMemoryRates(spill.now);
+  EngineRequest foreground = Spilling::prompt(3, 3, 4, 1);
+  foreground.priority = RequestPriority::Foreground;
+  spill.engine.submit(std::move(foreground));
+  spill.runUntil([&] { return spill.events.usage.contains(3); }, "the superseding prompt did not finish");
+  const EngineSnapshot counts = spill.engine.snapshot();
+  require(counts.spill.converted == 0 && spill.model.reclaimedIdleStateBytes != 0,
+          "a superseding prompt converted a lane before it took the memory of the command between its passes");
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0 && spill.events.completedCount == 4, "the requests did not all complete");
+}
+
 // A lane that ended between its command's passes, whose KV leaves with that
 // command, is no part of a start's projection: a turn that would fit beside
 // the lanes that go on starts Resident, not Spill for life.
@@ -1648,6 +1704,7 @@ std::span<const test::TestCase> commandsTests() {
        testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded},
       {"testASupersedingPromptTakesACommandsMemoryBeforeSpilling",
        testASupersedingPromptTakesACommandsMemoryBeforeSpilling},
+      {"testASupersedingPromptTakesTheCommandBeforeAConversion", testASupersedingPromptTakesTheCommandBeforeAConversion},
       {"testAnEndedLaneLeavesAStartResident", testAnEndedLaneLeavesAStartResident},
       {"testALaneThatConvertsInItsFirstPassReplans", testALaneThatConvertsInItsFirstPassReplans},
       {"testACommandAnyLaneConvertsInReplans", testACommandAnyLaneConvertsInReplans},
