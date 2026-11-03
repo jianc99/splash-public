@@ -402,6 +402,7 @@ Need MemoryGovernor::need(ClaimId claim, const std::optional<Need> &inPlace) con
     need.pages = inPlace->pages;
     need.form = inPlace->form;
     need.stateBuffers = inPlace->stateBuffers;
+    need.keptPages = inPlace->keptPages;
   }
   return need;
 }

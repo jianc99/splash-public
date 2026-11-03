@@ -54,7 +54,8 @@ inline std::optional<Need> inPlace(const TokenAdmission &admission, const std::a
   return Need{.pages = static_cast<uint32_t>(
                   std::min<uint64_t>(wanted > admission.availablePages ? wanted - admission.availablePages : 0,
                                      std::numeric_limits<uint32_t>::max())),
-              .form = admission.form};
+              .form = admission.form,
+              .keptPages = admission.keptPages};
 }
 
 inline std::optional<Need> inPlace(const model::ModelMemoryAdmission &, const std::array<uint32_t, 3> &) {
@@ -109,7 +110,8 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
   const auto metBefore = [&](const Need &need) {
     return std::ranges::any_of(met, [&](const Need &before) {
       return need.bytes == before.bytes && need.hostRefused == before.hostRefused && need.pages == before.pages &&
-             need.form == before.form && need.stateBuffers == before.stateBuffers;
+             need.form == before.form && need.stateBuffers == before.stateBuffers &&
+             need.keptPages == before.keptPages;
     });
   };
   while (frees && memoryDenied(admission)) {

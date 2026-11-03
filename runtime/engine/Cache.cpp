@@ -720,11 +720,16 @@ Cache::Walk Cache::walkFor(const VictimQuery &query) const {
     // extent released covers it.
     walk.device = true;
     walk.refused = Shortfall{pool_.extentPages(), kv::PageForm::Full};
-    // A KV need takes the free pages of its form first: releasing their
-    // extent would give it bytes for an extent it then allocates again.
+    // A KV need takes the free pages of its form first, and those of the
+    // other forms its attempt takes: releasing their extent would give it
+    // bytes for an extent it then allocates again.
     if (need.pages) {
       walk.form = need.form;
-      walk.keptPages = pool_.freePageCount(need.form);
+      for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
+        const auto each = static_cast<size_t>(form);
+        walk.keptPages[each] = form == need.form ? pool_.freePageCount(form)
+                                                 : std::min(pool_.freePageCount(form), need.keptPages[each]);
+      }
     }
   } else if (need.pages) {
     // Pages in place; a host that refuses growth takes them in a page scan.
@@ -3428,30 +3433,36 @@ TokenAdmission Cache::restoreRequest(uint64_t requestId, const CacheLookup &look
   }
   if (std::ranges::any_of(restored, [](uint32_t pages) { return pages != 0; }) && !tier_)
     throw std::logic_error("disk-only KV block without a disk tier");
-  // All or nothing: pages one admission took go back when the next fails.
-  const auto giveBack = [&] {
+  // All or nothing: pages one admission took go back when the next fails,
+  // and the refusal names the free pages of every form the attempt takes
+  // (beyond those held), which the room made for it keeps: their extents,
+  // emptied, would go, and the retry would allocate them again.
+  const auto refused = [&](TokenAdmission admission) {
     for (const std::vector<uint32_t> &pages : taken)
       for (uint32_t page : pages)
         pool_.releasePage(page, false);
+    for (size_t each = 0; each < restored.size(); ++each) {
+      const uint64_t takes = restored[each] + (each == static_cast<size_t>(kv::PageForm::Full) ? unspilled.size() : 0);
+      if (takes)
+        admission.keptPages[each] = static_cast<uint32_t>(
+            std::min<uint64_t>(takes + held[each], std::numeric_limits<uint32_t>::max()));
+    }
+    return admission;
   };
   for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
     const auto each = static_cast<size_t>(form);
     if (!restored[each])
       continue;
     if (const TokenAdmission admission = admitPages(restored[each], taken[each], form, held[each]);
-        !admission.granted()) {
-      giveBack();
-      return admission;
-    }
+        !admission.granted())
+      return refused(admission);
   }
   if (!unspilled.empty()) {
     const KvPageMoveResult moved =
         pool_.movePages(unspilled, kv::PageForm::Full, held[static_cast<size_t>(kv::PageForm::Full)]);
-    if (!moved.granted()) {
-      giveBack();
-      return {TokenAdmissionFailure::Denied, static_cast<uint32_t>(unspilled.size()),
-              pool_.freePageCount(), moved.failure};
-    }
+    if (!moved.granted())
+      return refused({TokenAdmissionFailure::Denied, static_cast<uint32_t>(unspilled.size()),
+                      pool_.freePageCount(), moved.failure});
     followMoves(moved.moves);
     spilled_.unspills += unspilled.size();
   }

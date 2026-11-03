@@ -2035,6 +2035,51 @@ void testFailedRestoreReturnsTheCommitment() {
           "the start did not run from the prefix that remained");
 }
 
+// A start whose cached chain is only on disk restores its dense history
+// into Full pages and the rest into Index pages. At the wall a refusal of its
+// Index extent gives back the Full pages the attempt took, which leaves their
+// extent empty: the ledger frees for the Index extent from other memory, an
+// idle chain, and keeps that extent's free pages for the retry, which would
+// allocate it again, as it keeps those of the refused form. The start runs
+// from its cached prefix.
+void testARestoreOfTwoFormsKeepsTheFreePagesItTakes() {
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16});
+  spill.model.deniedReservations = std::numeric_limits<uint32_t>::max();
+  spill.model.stateTier = std::make_shared<OffloadControl>();
+  spill.model.stateTier->ready = true;
+  spill.model.restoreControl->ready = true;
+  // The first turn's chain is written through and its state goes to the SSD;
+  // a critical pass leaves the chain only on disk.
+  spill.engine.submit(Spilling::prompt(1, 1, 40, 1));
+  spill.runUntilIdle();
+  static_cast<void>(test::criticalPass(spill.host.governor));
+  // An idle chain that fills two Full extents, no copy of which the SSD
+  // cache took: no Full page is free.
+  spill.tier.writableFile = false;
+  EngineRequest idleChain = request(3, std::vector<uint32_t>(32 * KvCache::pageTokens, 3));
+  idleChain.maxNewTokens = 1;
+  spill.engine.submit(std::move(idleChain));
+  spill.runUntilIdle();
+  spill.tier.writableFile = true;
+  static_cast<void>(spill.pool.reclaimEmptyExtents(false, std::numeric_limits<uint32_t>::max(), kv::PageForm::Full));
+  require(!spill.pool.freePageCount(kv::PageForm::Full) && spill.pool.allocatedExtents(kv::PageForm::Full) == 2,
+          "fixture: " + std::to_string(spill.pool.freePageCount(kv::PageForm::Full)) + " free Full pages in " +
+              std::to_string(spill.pool.allocatedExtents(kv::PageForm::Full)) + " extents");
+  // Room for the Full extent the restore's dense history takes and half an
+  // Index extent beyond the Index pages free.
+  spill.limit(spill.held() + 1600 + 80);
+  const uint64_t idle = spill.held();
+  spill.engine.submit(Spilling::prompt(2, 1, 40, 1));
+  spill.runUntilIdle();
+  const auto start = std::ranges::find(spill.events.startIds, 2u);
+  const uint32_t matched =
+      start == spill.events.startIds.end() ? 0 : spill.events.starts[start - spill.events.startIds.begin()];
+  require(spill.events.failedCount == 0 && matched == 40 * KvCache::pageTokens,
+          "a start whose chain restores in two forms at the wall did not run from its cached prefix: matched " +
+              std::to_string(matched) + " tokens, " + std::to_string(spill.events.failedCount) +
+              " failures, idle memory " + std::to_string(idle) + " B");
+}
+
 // Borrowed 3(a): a Spill lane preempted in its prompt resumes from its
 // durable prefix, never from 0, though its copies land a command late. A
 // Background prompt that has passed its first prefill checkpoint (4096
@@ -2392,6 +2437,7 @@ std::span<const test::TestCase> spillTests() {
       {"testUnreadableKvEndsOnlyItsLane", testUnreadableKvEndsOnlyItsLane},
       {"testProjectionClipsTheOutput", testProjectionClipsTheOutput},
       {"testFailedRestoreReturnsTheCommitment", testFailedRestoreReturnsTheCommitment},
+      {"testARestoreOfTwoFormsKeepsTheFreePagesItTakes", testARestoreOfTwoFormsKeepsTheFreePagesItTakes},
       {"testPreemptedSpillPrefillResumesFromItsDurablePrefix", testPreemptedSpillPrefillResumesFromItsDurablePrefix},
   };
   return kTests;

@@ -212,6 +212,9 @@ struct TokenAdmission final {
   metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;
   // The form of the pages refused, which a page need makes room for.
   kv::PageForm form = kv::PageForm::Full;
+  // The free pages of each form the attempt takes, which the room made for
+  // it keeps (Need::keptPages): a restore's (restoreRequest).
+  std::array<uint32_t, 3> keptPages{};
 
   [[nodiscard]] bool granted() const noexcept {
     return failure == TokenAdmissionFailure::None;
@@ -1055,8 +1058,9 @@ private:
   // a form, whose unit is the evictions up to a page freed, the states on
   // the way among its victims unless the need counts state buffers too
   // (statesAreUnits). A device need that also lacks pages of a form keeps
-  // the free pages of that form it takes first (keptPages): its reclaims
-  // release an extent of that form only past them.
+  // the free pages of that form it takes first, and those of the other forms
+  // its attempt takes (keptPages): its reclaims release an extent of a form
+  // only past them.
   struct Walk final {
     WalkScope scope;
     ReclaimTiming timing = ReclaimTiming::CanWait;
@@ -1071,7 +1075,7 @@ private:
     bool statesAreUnits = false;
     uint32_t pages = 0;
     kv::PageForm form = kv::PageForm::Full;
-    uint32_t keptPages = 0;
+    std::array<uint32_t, 3> keptPages{};
     bool hostRefused = false;
     friend bool operator==(const Walk &, const Walk &) = default;
     // Whether its releases leave the form one empty extent.
@@ -1081,7 +1085,7 @@ private:
     // Whether its releases may take an extent of the form, which has
     // `freePages` free: only past the free pages it keeps (keptPages).
     [[nodiscard]] bool releases(kv::PageForm each, uint32_t freePages, uint32_t extentPages) const noexcept {
-      return each != form || freePages >= keptPages + extentPages;
+      return freePages >= keptPages[static_cast<size_t>(each)] + extentPages;
     }
     // Whether evicting KV of the form may still empty an extent: of the
     // form's `reusable` pages, those the demotions in flight hold

@@ -107,13 +107,16 @@ struct ClaimId final {
 // What a refused claim lacks. bytes and hostRefused come from the admission
 // refused inside its scope; pages and stateBuffers are set by the caller for
 // needs met in place (TokenAdmission::additionalPages,
-// Model::statesToActivate).
+// Model::statesToActivate), and for a KV need the free pages of each form
+// besides `form` its attempt takes, which the units taken for it keep as they
+// keep those of `form` (TokenAdmission::keptPages, Cache::walkFor).
 struct Need final {
   uint64_t bytes = 0;
   bool hostRefused = false;
   uint32_t pages = 0;
   kv::PageForm form = kv::PageForm::Full;
   uint32_t stateBuffers = 0;
+  std::array<uint32_t, 3> keptPages{};
 };
 
 enum class FreeOutcome : uint8_t { Met, Pending, Short };
