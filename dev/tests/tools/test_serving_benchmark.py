@@ -926,6 +926,139 @@ class GateTests(unittest.TestCase):
         self.assertEqual(facts["failures"], [])
         self.assertAlmostEqual(facts["g4"]["contended_p95_ms"], 900.0)
 
+    def ane_floor_run(self, label, ane_ffn, contended_max=1408.0, wide=0):
+        # smoke-b-27b-churn-A1 (M6, f0724a9d; results/smoke-b-m6-mini.md
+        # checks 4 and 9): the 27B with the Neural Engine's FFN split, at
+        # share 0.735 for chunks of 512 rows or more. G 500 ms, the units
+        # term 0, e95 0.0228; 86 intervals of contended 512-row units of
+        # 1178-1408 ms each, the longest 1408 ms (p95 read 2097.152, its
+        # bucket's edge); client gaps p50 119 ms, p99 1509 ms. Each 2 s
+        # interval here: first 18 of the first prompt alone (a 2048-row
+        # command each, no gap), then 86 of one contended
+        # command each, waited on by both decoders' gaps and priced 1 %
+        # under the smoke's unit means (e95 0.0228), the last `wide` of them
+        # 2048-row commands priced 2.8 s, then decodes alone to 240 s.
+        estimate = {
+            "terms": [{"quantity": "units", "ms_per_unit": 0.0}],
+            "relative_error": {"p50": 0.01, "p95": 0.0228},
+        }
+        samples, rows, commands, gaps, priced = [], 0, 0, 0, 0.0
+        for interval in range(121):
+            if 0 < interval <= 18:
+                commands += 1
+                rows += 2048
+            elif 18 < interval <= 104:
+                k = interval - 19
+                broad = k >= 86 - wide
+                commands += 1
+                rows += 2048 if broad else 512
+                gaps += 2
+                priced += 2 * (2800.0 if broad else 0.99 * (1178 + 230 * k / 85))
+            samples.append(
+                self.schema7(
+                    2 * interval,
+                    rows=rows,
+                    scheduler__prefill_batches=commands,
+                    scheduler__estimate__prefill=estimate,
+                    scheduler__contended_prefill_ms={
+                        "p95": 2097.152 if contended_max < 2097.152 else 4194.304,
+                        "max": contended_max,
+                    },
+                    metrics__decode_gap_causes={
+                        "prefill_unit": {"gaps": gaps, "ms": 0.0},
+                        "prefill_predicted_ms": priced,
+                        "prefill_ms": 0.0,
+                    },
+                    **({} if ane_ffn is None else {"ane_ffn": ane_ffn}),
+                )
+            )
+        done = [
+            {
+                "tag": f"w{w}-r1",
+                "start": 0,
+                "t": 240,
+                "ttft": 36,
+                "decode_tps": 25,
+                "chunks_ms": [
+                    sum(1509 if g % 10 == 9 else 119 for g in range(event))
+                    for event in range(100)
+                ],
+            }
+            for w in range(3)
+        ]
+        return churn_run(self.directory, label, done, samples)
+
+    def test_g4_allows_a_unit_the_ane_row_floor_holds_its_price(self):
+        # The owner's ANE row floor (AMENDMENTS, 11-03 03:10) lets a contended
+        # unit exceed G where the split is on: its bound is max(G, u/0.1, the
+        # longest price of a unit of the floor's rows), 1408 * 0.99 ms here,
+        # its limit that times 1 + e95: 1427.5 ms, over the 1408 ms unit; G4b
+        # 1427.5 + 119 ms over the 1509 ms p99. Before it, G4a/G4b failed:
+        # "contended prefill p95 1408 ms over 511 ms", "client gap p99 1509 ms
+        # over 630 ms" (the smoke's own check output). A split that stopped
+        # while serving keeps the floor the engine started with.
+        split = {"state": "split", "share": 0.735, "minimum_rows": 512}
+        for state in ("split", "stopped"):
+            facts = matrix.health(
+                self.ane_floor_run(state, {**split, "state": state}),
+                self.machine,
+                self.gates,
+            )
+            self.assertEqual(facts["failures"], [], state)
+            self.assertAlmostEqual(facts["g4"]["bound_ms"], 0.99 * 1408)
+            self.assertAlmostEqual(facts["g4"]["limit_ms"], 0.99 * 1408 * 1.0228)
+            # The first contended interval's window holds the alone prompt's
+            # 2048-row command: 85 intervals of floor units.
+            floor = facts["g4"]["floor"]
+            self.assertEqual((floor["minimum_rows"], floor["intervals"]), (512, 85))
+            self.assertAlmostEqual(floor["unit_ms"], 0.99 * 1408)
+
+    def test_g4_fails_a_unit_past_the_ane_row_floors_price(self):
+        # A unit of the floor's rows that took 1.9 s, past its price's
+        # limit, fails G4a; so do units the floor does not explain: 2048-row
+        # commands priced 2.8 s, in intervals averaging twice the floor's
+        # rows or more, leave the bound at the floor units' price.
+        split = {"state": "split", "share": 0.735, "minimum_rows": 512}
+        stalled = matrix.health(
+            self.ane_floor_run("stalled", split, contended_max=1900.0),
+            self.machine,
+            self.gates,
+        )
+        self.assertEqual(
+            stalled["failures"], ["G4a: contended prefill p95 1900 ms over 1426 ms"]
+        )
+        uncut = matrix.health(
+            self.ane_floor_run("uncut", split, contended_max=2900.0, wide=46),
+            self.machine,
+            self.gates,
+        )
+        self.assertEqual([f[:4] for f in uncut["failures"]], ["G4a:", "G4b:"])
+        floor = uncut["g4"]["floor"]
+        self.assertEqual(floor["intervals"], 39)
+        self.assertLess(floor["unit_ms"], 1300)
+
+    def test_g4_judges_a_run_without_the_split_as_before(self):
+        # The split off (ane_ffn's state off, minimum_rows 0) or no ane_ffn
+        # at all: the bound stays max(G, u/0.1), and the smoke's numbers
+        # fail as its check did.
+        for label, ane_ffn in (
+            ("off", {"state": "off", "share": 0, "minimum_rows": 0}),
+            ("none", None),
+        ):
+            facts = matrix.health(
+                self.ane_floor_run(label, ane_ffn), self.machine, self.gates
+            )
+            self.assertEqual(
+                facts["failures"],
+                [
+                    "G4a: contended prefill p95 1408 ms over 511 ms",
+                    "G4b: client gap p99 1509 ms over 630 ms",
+                ],
+                label,
+            )
+            self.assertNotIn("floor", facts["g4"])
+            self.assertEqual(facts["g4"]["bound_ms"], 500)
+
     def test_an_ample_run_starts_at_the_cap_on_a_host_without_pressure(self):
         # s-fn-churn-ample: ntie's recorded sNFa reads warning at Ready, right
         # after the load, in the engine's band state and in macOS's own level,

@@ -948,6 +948,51 @@ def gap_bound(status: dict, share: float) -> dict | None:
     }
 
 
+def floor_unit(run: Run) -> dict | None:
+    """The ANE row floor (AMENDMENTS, owner 11-03 03:10): where the Neural
+    Engine's FFN split is on, a contended unit is never cut below the split's
+    threshold (ane_ffn.minimum_rows, model::CommandLimits::minimumUnitRows;
+    the engine keeps it after the split stops), so a unit of those rows may
+    take longer than max(G, u/share): as long as the engine prices it. That
+    price, from the run's samples: of each interval whose prefill commands,
+    with those of the interval before, averaged fewer than twice the floor's
+    rows (a prompt's last rows go to one unit or two even ones, Scheduler
+    planPrefill), the price per gap of the prefill units the decode gaps
+    past the bound waited on (metrics.decode_gap_causes: prefill_predicted_ms
+    over prefill_unit.gaps); the longest, over `intervals` of them, as
+    unit_ms (None where none shows). None where the split was never on
+    (state off, or no ane_ffn: 1.5.0), so those runs keep max(G, u/share)."""
+    split = [
+        value(s["status"], "ane_ffn")
+        for s in run.samples
+        if value(s["status"], "ane_ffn.state") in ("split", "stopped")
+    ]
+    rows = max((value(a, "minimum_rows", 0) for a in split), default=0)
+    if rows <= 1:
+        return None
+    statuses = [s["status"] for s in run.samples]
+    prices = []
+    for i in range(1, len(statuses)):
+        first, earlier, later = statuses[max(0, i - 2)], statuses[i - 1], statuses[i]
+        commands, committed = (
+            value(later, f"scheduler.{path}", 0) - value(first, f"scheduler.{path}", 0)
+            for path in ("prefill_batches", "prefill_rows")
+        )
+        gaps, priced = (
+            value(later, f"metrics.decode_gap_causes.{path}", 0)
+            - value(earlier, f"metrics.decode_gap_causes.{path}", 0)
+            for path in ("prefill_unit.gaps", "prefill_predicted_ms")
+        )
+        # A restart sets the counters back: its intervals tell nothing.
+        if commands > 0 and 0 <= committed < 2 * rows * commands and gaps > 0 and priced > 0:
+            prices.append(priced / gaps)
+    return {
+        "minimum_rows": rows,
+        "unit_ms": max(prices, default=None),
+        "intervals": len(prices),
+    }
+
+
 def rose(path: str):
     """A gap cause shown by a counter that rose across the samples."""
     return lambda around: value(around[-1], path, 0) > value(around[0], path, 0)
@@ -1221,6 +1266,12 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
         )
     bound = gap_bound(run.last, gates["pass_overhead_share"])
     if bound:
+        # Where the ANE row floor holds units above max(G, u/share), the bound
+        # is the price of the floor's units: max(G, u/share, that price).
+        floor = floor_unit(run)
+        if floor:
+            bound["floor"] = floor
+            bound["bound_ms"] = max(bound["bound_ms"], floor["unit_ms"] or 0.0)
         limit = bound["bound_ms"] * (1 + bound["e95"])
         facts["g4"] = {**bound, "limit_ms": limit}
         if bound["contended_p95_ms"] > limit:
