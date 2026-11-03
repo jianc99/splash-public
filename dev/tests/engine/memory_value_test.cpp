@@ -15,7 +15,6 @@
 #include <span>
 #include <sstream>
 #include <string>
-#include <utility>
 #include <vector>
 
 using namespace splash;
@@ -305,29 +304,30 @@ void testRecordedLoadsDoNotFlipFlop() {
 // beyond 1.5.0's are the hits of ghosts spanning the 866 slots between,
 // each at mMNa's miss time (0.2095 ms, its mean host-step work a read): the
 // account's value_per_gib over the passes with commands, per decode token,
-// lies between the host work those misses cost a token and their count at
-// the miss time. It replays to 3.79 and 3.25 ms a decode token a GiB, past
-// D2's 1.1-3.6 (decode wall times) at 37.3: a mean read costs more than the
-// one a smaller store adds (a decode token's host work differs by 3.34 and
-// 2.40 ms for 21.6 and 18.5 reads, 0.155 and 0.130 ms a read; its wall time
-// by 2.66 and 2.07 ms). Whether a miss is priced at the marginal read
-// instead is open (merge report); until then the replay is held between
-// those bounds. pFa is not replayed: its 5128-slot store is not 1.5.0's floor pair, and it
-// misses more a token (61.7) than mMNa's smaller one.
+// is what the slots above the floor saved a decode token's wall time, D2's
+// 1.1-3.6 ms a GiB. At 37.3 it replays to 3.79, and at 40.4 to 3.25, 1.59
+// and 1.75 times what those runs' own wall times show (2.66 and 2.07 ms a
+// token, 2.39 and 1.86 a GiB): a mean read costs more than the one a
+// smaller store adds (a decode token's host work differs by 3.34 and 2.40
+// ms for 21.6 and 18.5 reads, 0.155 and 0.130 ms a read). Whether a miss
+// is priced at the marginal read is the owner's to decide (open); until
+// then this fails at 37.3. pFa is not replayed: its 5128-slot store is not
+// 1.5.0's floor pair, and it misses more a token (61.7) than mMNa's
+// smaller one.
 void testValuePerGiBReproducesThePinnedStore() {
   constexpr uint32_t kFloorSlots = 4856, kPinnedSlots = 5722;
-  // Host-step work a decode token (streamed_experts.decode.host_steps.work_ms
-  // total over metrics.decode_output_tokens, each run's last status): mMNa,
-  // and 1.5.0's m150a and m150b beside their misses a token.
-  constexpr double kFloorWorkMilliseconds = 12.34;
-  constexpr std::pair<double, double> kPinned[] = {{37.3, 9.00}, {40.4, 9.94}};
+  // What the store's slots above the floor saved a decode token's wall time
+  // on the M6, ms a GiB (amend/M.md D2: 1.5.0's whole store at 18.2-19.1 ms
+  // a token, main's and intpart's floor at 20.3-22.2, 1140 MiB between).
+  constexpr double kSavedLeast = 1.1, kSavedMost = 3.6;
+  // 1.5.0's misses a decode token: m150a and m150b.
+  constexpr double kPinnedMisses[] = {37.3, 40.4};
   const RecordedRun run = readRun("m6-mMNa.tsv");
   const double missMilliseconds = run.constants.at("miss_ms");
   const double tokens =
       run.constants.at("decode_tokens_per_second") * (run.samples.back().seconds - run.samples.front().seconds);
   const double missesPerToken = double(run.samples.back().misses - run.samples.front().misses) / tokens;
-  const double spanGiB = double(kPinnedSlots - kFloorSlots) * double(kSlotBytes) / kGiB;
-  for (const auto &[pinnedPerToken, pinnedWorkMilliseconds] : kPinned) {
+  for (const double pinnedPerToken : kPinnedMisses) {
     const double ghostShare = 1.0 - pinnedPerToken / missesPerToken;
     FakeMemory memory({});
     FakeElasticPool store("experts", memory, kSlotBytes, kFloorSlots, kPinnedSlots, kPinnedSlots, kFloorSlots,
@@ -360,12 +360,10 @@ void testValuePerGiBReproducesThePinnedStore() {
       }
     }
     const double perToken = worth / tokens * 1000.0;
-    const double work = (kFloorWorkMilliseconds - pinnedWorkMilliseconds) / spanGiB;
-    const double priced = (missesPerToken - pinnedPerToken) * missMilliseconds / spanGiB;
-    require(perToken >= work && perToken <= priced,
+    require(perToken >= kSavedLeast && perToken <= kSavedMost,
             "at 1.5.0's " + std::to_string(pinnedPerToken) + " misses a token value_per_gib replays to " +
-                std::to_string(perToken) + " ms a decode token a GiB, outside the host work " + std::to_string(work) +
-                " to the misses' price " + std::to_string(priced));
+                std::to_string(perToken) + " ms a decode token a GiB, outside the " + std::to_string(kSavedLeast) +
+                " to " + std::to_string(kSavedMost) + " the store saved (amend/M.md D2)");
   }
 }
 

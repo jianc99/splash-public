@@ -799,12 +799,13 @@ void testAPrefillsPriceIsTheCostModels() {
           "more rows did not cost more");
 }
 
-// S-P5: a cold start's first contended agent turn is never underpriced, as
-// the base's host-wait seed prices it (1119.9 ms for a 3226.8 ms turn), and
-// is priced within twice its time, so its first sample trains unclamped
+// S-P5 (the owner's bound, DESIGN §0, in place of §7.5's 25 %): a cold
+// start's first contended agent turn is never underpriced, as the base's
+// host-wait seed prices it (1119.9 ms for a 3226.8 ms turn), and is priced
+// within twice its time, so its first sample trains unclamped
 // (CostModel::observe counts a time within half and twice the price, the
-// clamp amend/S.md A10 keeps). Within 25 % (DESIGN §7.5) is out of this
-// seed's reach: seeded from the load's read rate (A10) and the token-0
+// clamp amend/S.md A10 keeps). Within 25 % is out of this seed's reach
+// without a guessed constant or a longer warm-up: seeded from the load's read rate (A10) and the token-0
 // warm-ups (A61), the price adds a unit's reads to its compute, where the
 // profile hides 0.8 x min(reads, compute). On the M6 profile at u 60 ms the
 // price, 4738.7 ms, is the warm-ups' line at no rows, 1632.5 (u 60 + chunk

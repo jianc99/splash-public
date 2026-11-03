@@ -698,8 +698,8 @@ until the pressure lifts.
 admission and image counts, the SSD cache's quota, limit, use, volume space,
 write budget, what holds its writes back and the bytes it read and wrote, and
 readiness, memory pressure and thermal state. It also exports the decode gaps,
-the scheduler's gap target, contended prefill units and prefill estimate
-error, the memory ledger's reserved, owed and claimed bytes and per account
+the scheduler's gap target, contended prefill units, prefill estimate error,
+bound cuts, index page conflicts and replans, the memory ledger's reserved, owed and claimed bytes and per account
 `splash_memory_account_bytes{account,measure}` (`floor`, `current`, `cap`,
 `reserved`) with its grows and shrinks, the streamed experts' chunks, shrinks
 and regrows, the requests that converted to `spill`, the loop's longest tick,

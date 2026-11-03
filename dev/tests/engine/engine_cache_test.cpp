@@ -6186,41 +6186,68 @@ void testDeviceNeedReachesTheLeavesPastTheStates() {
   cache.checkInvariants();
 }
 
+// A state of TestState's bytes that counts the cache's looks at it: its
+// bytes, and whether the tier takes its write.
+class CountedState final : public CompositeState {
+public:
+  explicit CountedState(uint64_t &looks) : looks_(looks) {}
+  [[nodiscard]] uint64_t bytes() const noexcept override {
+    ++looks_;
+    return 100;
+  }
+  [[nodiscard]] bool canOffload(bool) const noexcept override {
+    ++looks_;
+    return false;
+  }
+
+private:
+  uint64_t &looks_;
+};
+
 // A device need's walk weighs a cache of thousands of pages, states on
-// every conversation, in the time of one walk over it, not once per unit
-// and eviction.
+// every conversation, in one walk over it, not once per unit and eviction:
+// twice the conversations take twice the looks at their states, where a
+// walk per unit takes four times as many.
 void testDeviceNeedWeighsALargeCacheAtOnce() {
   constexpr uint32_t kConversations = 120, kPages = 32;
-  test::TestKvStorage storage{(kConversations + 8) * kPages, 100, 64};
-  KvPool pool{storage, 64};
-  engine::Cache cache(pool, nullptr, nullptr);
-  for (uint64_t id = 1; id <= kConversations; ++id) {
-    std::vector<uint32_t> prompt(kPages * KvCache::pageTokens + 1);
-    std::iota(prompt.begin(), prompt.end(), 100'000 * id);
-    cache.beginRequest(id);
-    require(admitTokens(cache, id, prompt.size()).granted(), "a conversation's pages were denied");
-    cache.publishCommittedBlocks(id, prompt, kPages * KvCache::pageTokens, {});
-    cache.publishCompositeState(cache.blockAt(id, kPages / 2 * KvCache::pageTokens), std::make_shared<TestState>(100),
-                                true);
-    cache.publishCompositeState(cache.blockAt(id, kPages * KvCache::pageTokens), std::make_shared<TestState>(100),
-                                false);
-    cache.endRequest(id);
-  }
-  const ClaimSpec claim{.cls = ClaimClass::InService};
-  const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}};
-  const auto start = std::chrono::steady_clock::now();
-  uint64_t weighed = 0;
-  uint32_t units = 0;
-  for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim; victim = cache.peek(query, &*victim)) {
-    weighed += victim->bytes;
-    ++units;
-  }
-  const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-  const uint64_t allocated = pool.allocatedBytes();
-  require(weighed == allocated && units >= kConversations * kPages / 64,
-          "the walk did not weigh every extent of the cache: " + std::to_string(weighed) + " of " +
-              std::to_string(allocated) + " bytes");
-  require(seconds < 5.0, "weighing the cache's memory reclaims took " + std::to_string(seconds) + " s");
+  // The looks at the states that weighing every extent of a cache of
+  // `conversations` takes.
+  const auto weigh = [](uint32_t conversations) {
+    uint64_t looks = 0;
+    test::TestKvStorage storage{(conversations + 8) * kPages, 100, 64};
+    KvPool pool{storage, 64};
+    engine::Cache cache(pool, nullptr, nullptr);
+    for (uint64_t id = 1; id <= conversations; ++id) {
+      std::vector<uint32_t> prompt(kPages * KvCache::pageTokens + 1);
+      std::iota(prompt.begin(), prompt.end(), 100'000 * id);
+      cache.beginRequest(id);
+      require(admitTokens(cache, id, prompt.size()).granted(), "a conversation's pages were denied");
+      cache.publishCommittedBlocks(id, prompt, kPages * KvCache::pageTokens, {});
+      cache.publishCompositeState(cache.blockAt(id, kPages / 2 * KvCache::pageTokens),
+                                  std::make_shared<CountedState>(looks), true);
+      cache.publishCompositeState(cache.blockAt(id, kPages * KvCache::pageTokens),
+                                  std::make_shared<CountedState>(looks), false);
+      cache.endRequest(id);
+    }
+    const ClaimSpec claim{.cls = ClaimClass::InService};
+    const VictimQuery query{.claim = &claim, .need = {.bytes = pool.allocatedBytes()}};
+    looks = 0;
+    uint64_t weighed = 0;
+    uint32_t units = 0;
+    for (std::optional<engine::Victim> victim = cache.peek(query, nullptr); victim;
+         victim = cache.peek(query, &*victim)) {
+      weighed += victim->bytes;
+      ++units;
+    }
+    const uint64_t allocated = pool.allocatedBytes();
+    require(weighed == allocated && units >= conversations * kPages / 64 && looks,
+            "the walk did not weigh every extent and state of the cache: " + std::to_string(weighed) + " of " +
+                std::to_string(allocated) + " bytes, " + std::to_string(looks) + " looks at its states");
+    return looks;
+  };
+  const uint64_t looks = weigh(kConversations), twice = weigh(2 * kConversations);
+  require(twice < 3 * looks, "weighing twice the conversations looked at their states " + std::to_string(twice) +
+                                 " times, against " + std::to_string(looks));
 }
 
 // What a request may wait for counts only the free pages beyond those

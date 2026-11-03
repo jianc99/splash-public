@@ -91,6 +91,12 @@ PROMETHEUS_SERIES = {
         "relative_error",
         "p95",
     ),
+    "splash_scheduler_bound_cuts_total": ("scheduler", "bound_cuts"),
+    "splash_scheduler_index_page_conflicts_total": (
+        "scheduler",
+        "index_page_conflicts",
+    ),
+    "splash_scheduler_replans_total": ("scheduler", "replans"),
     "splash_kv_pages_allocated": ("kv", "pages_allocated"),
     "splash_kv_pages_active": ("kv", "pages_active"),
     "splash_kv_extents_active": ("kv", "extents_active"),
