@@ -488,10 +488,8 @@ struct Runtime::Impl {
   // The readers of spilled K/V, when the target's K/V spills.
   KvBlockCache *blockCache;
   KvHistoryStream *historyStream;
-  // Admits the expert store's growth toward its cap (RuntimeContext).
-  metal::AllocationAdmission expertAdmission;
   // The resident requests the history's staging was reserved for
-  // (reserveHistoryStaging) since it was last given back, whose prefill
+  // (reserveSpilledReads) since it was last given back, whose prefill
   // commands stream into it. A command in passes reserves it once, before
   // its first pass, so a reservation for another prompt between its passes
   // leaves it the command's too.
@@ -667,7 +665,6 @@ struct Runtime::Impl {
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
-        expertAdmission(std::move(value.expertAdmission)),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)), loadReads(weightReads()) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
@@ -3441,18 +3438,6 @@ Runtime::snapshotToDisk(uint64_t requestId, std::function<void()> completion) {
   return impl_->states.snapshotToDisk(residentLane(requestId), std::move(completion));
 }
 
-uint32_t Runtime::prefillGroupRows(bool spills) const noexcept {
-  const bool groups = impl_->model.expertStore() || (spills && impl_->geometry.spilledKv);
-  return (groups ? impl_->geometry.prefillChunks : 1) * kPrefillRows;
-}
-
-// A command over streamed experts reads each layer's that its rows route,
-// almost all of them however few its rows: such a command may run a pass
-// per layer.
-uint32_t Runtime::prefillPasses() const noexcept {
-  return impl_->model.expertStore() ? impl_->geometry.target.layers : 1;
-}
-
 CommandLimits Runtime::commandLimits() const noexcept { return impl_->limits; }
 
 CommandWork Runtime::prefillWork(std::span<const PrefillLane> lanes, uint32_t pass, uint32_t passes) const {
@@ -3501,50 +3486,6 @@ ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId, SpilledRea
   if (!impl_->blockCache) return {.ok = true};
   if (impl_->historyStream && !impl_->stagingHeld()) static_cast<void>(impl_->releaseStaging());
   return impl_->blockCache->reserveLane(lane);
-}
-
-ModelMemoryAdmission Runtime::reserveSpilledReads(uint64_t requestId) {
-  return reserveSpilledReads(requestId, {.kind = WorkKind::Decode});
-}
-
-ModelMemoryAdmission Runtime::reserveHistoryStaging(uint64_t requestId, uint32_t pages) {
-  return reserveSpilledReads(requestId, {.kind = WorkKind::Prefill, .pages = pages});
-}
-
-bool Runtime::holdsSpilledReads(uint64_t requestId, uint32_t historyPages) const {
-  const uint32_t lane = residentLane(requestId);
-  if (historyPages)
-    return !impl_->historyStream || impl_->historyStream->holds(historyPages);
-  return !impl_->blockCache || impl_->blockCache->holdsLane(lane);
-}
-
-ModelMemoryAdmission Runtime::growSpilledReads() {
-  return impl_->blockCache ? impl_->blockCache->growTowardTarget() : ModelMemoryAdmission{.ok = true};
-}
-
-// The store above its floor follows memory between commands (ExpertStore::
-// releaseAboveFloor, growTowardCap); a store without the admission stays as
-// it is.
-uint64_t Runtime::releaseExpertChunk() {
-  ExpertStore *store = impl_->model.expertStore();
-  return store ? store->releaseAboveFloor() : 0;
-}
-
-uint64_t Runtime::releaseExpertsToFloor() {
-  ExpertStore *store = impl_->model.expertStore();
-  return store ? store->releaseToFloor() : 0;
-}
-
-uint64_t Runtime::expertGrowthBytes() const {
-  const ExpertStore *store = impl_->model.expertStore();
-  return store && impl_->expertAdmission ? store->growthBytes() : 0;
-}
-
-ModelMemoryAdmission Runtime::growExperts() {
-  ExpertStore *store = impl_->model.expertStore();
-  if (!store || !impl_->expertAdmission) return {.ok = true};
-  const metal::AllocationResult grown = store->growTowardCap(impl_->expertAdmission);
-  return {.ok = static_cast<bool>(grown), .allocationFailure = grown.failure};
 }
 
 uint64_t Runtime::reclaimIdleState(bool keepLane, IdleMemory scope) noexcept {

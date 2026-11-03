@@ -2195,7 +2195,7 @@ void testStoreRegrowsByDisplacementInTheBand() { storeRegrowsByDisplacement(Memo
 // Under macOS's warning, while the host lacks nothing past its margin, the
 // store a unit short grows back before the host's pass, which may take only
 // cache then, takes the cache it displaces (amend/M.md B4: one unit of
-// copied cache is enough; the base's growExperts ran before the reclaim
+// copied cache is enough; the base grew the store before the reclaim
 // under the warning alone): it takes the one unit of copied cache there is
 // for its own, the host's footprint unchanged.
 void testTheStoreRegrowsBeforeTheWarningPassTakesItsCache() {

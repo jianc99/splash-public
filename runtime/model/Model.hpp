@@ -310,9 +310,9 @@ struct BatchPlan final {
   std::vector<BatchItem> items;
   DecodeStage decodeStage = DecodeStage::Regular;
   // A prefill command may run in passes, each over the next of `passes` even
-  // shares of the target's layers (Model::prefillPasses), every one of the
-  // same items: this command is pass `pass`. The first pass begins the rows,
-  // the last ends them and commits; the rows' work between lives in the
+  // shares of the target's layers (CommandLimits::maximumPasses), every one
+  // of the same items: this command is pass `pass`. The first pass begins the
+  // rows, the last ends them and commits; the rows' work between lives in the
   // model's prefill memory, which no other prefill touches meanwhile, while
   // other lanes' decode commands run between passes. A command abandoned
   // between its passes commits nothing of its rows (Scheduler::abandonPasses).
@@ -588,8 +588,8 @@ struct ExecutionLimits final {
   // one after another, and the runtime lets at most one lane's rows run past
   // a chunk: a prefill group has one scratch GDN cell for the state between
   // a lane's parts. So every lane but a command's last lies within its first
-  // chunk, and a command holds at most each of its lanes' group rows
-  // (Model::prefillGroupRows; a chunk's for a lane that runs no groups). The
+  // chunk, and a command holds at most its group's rows
+  // (CommandLimits::commandRows; a chunk's where it runs no groups). The
   // rows the engine cuts, or a lane it drops, before the command runs keep
   // both: the lanes before the last still lie within the first chunk.
   static constexpr uint32_t prefillTokenBudget = 2048;
@@ -811,34 +811,19 @@ public:
   [[nodiscard]] virtual std::shared_ptr<const CompositeState> snapshot(uint64_t requestId) = 0;
   // The bytes one cached state's buffers take.
   [[nodiscard]] virtual uint64_t snapshotBytes() const noexcept = 0;
-  // Memory for reads of a request's spilled K/V, taken between commands and
-  // held until it ends or is suspended; a model that reads none grants it at
-  // once, taking nothing. The hot block cache's floor for the request's lane,
-  // which decodes over Index pages (model::KvBlockCache::reserveLane), in
-  // place of the staging once no prompt holds it; the staging of a
-  // prefill's history of `pages` pages, which holds Index pages, the
-  // request's while its prompt goes on, also once refused
-  // (model::KvHistoryStream::reserve); and, optionally, one more
-  // extent of the hot block cache toward its planned size
-  // (model::KvBlockCache::growTowardTarget).
-  [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t) { return {.ok = true}; }
-  [[nodiscard]] virtual ModelMemoryAdmission reserveHistoryStaging(uint64_t, uint32_t) { return {.ok = true}; }
-  [[nodiscard]] virtual ModelMemoryAdmission growSpilledReads() { return {.ok = true}; }
-  // Whether the resident request holds what reserveSpilledReads reserves
-  // (`historyPages` 0: its lane's floor of the hot block cache), or whether
-  // the staging, which the prompts that stream share, holds `historyPages`
-  // pages already, so reserveHistoryStaging takes nothing.
-  [[nodiscard]] virtual bool holdsSpilledReads(uint64_t, uint32_t) const { return true; }
   // The bytes reserveSpilledReads(requestId, need) would allocate now: zero
   // when the request holds what it reserves or the model reads no spilled
   // K/V, and by default.
   [[nodiscard]] virtual uint64_t spilledReadShortfall(uint64_t, SpilledReadNeed) const { return 0; }
-  // Reserves what `need` names: by default a decode's floor through
-  // reserveSpilledReads, a prefill's staging through reserveHistoryStaging.
-  [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t requestId, SpilledReadNeed need) {
-    return need.kind == WorkKind::Decode ? reserveSpilledReads(requestId)
-                                         : reserveHistoryStaging(requestId, need.pages);
-  }
+  // Memory for the reads of a request's spilled K/V that `need` names, taken
+  // between commands and held until it ends or is suspended; a model that
+  // reads none grants it at once, taking nothing, as by default. A decode's
+  // floor of the hot block cache for the request's lane, which decodes over
+  // Index pages (model::KvBlockCache::reserveLane), in place of the staging
+  // once no prompt holds it; a prefill's staging of its history of
+  // need.pages pages, which holds Index pages, the request's while its
+  // prompt goes on, also once refused (model::KvHistoryStream::reserve).
+  [[nodiscard]] virtual ModelMemoryAdmission reserveSpilledReads(uint64_t, SpilledReadNeed) { return {.ok = true}; }
   // Whether the disk tier takes a state written from a lane now, for a
   // state in use or not, as CompositeState::canOffload. Room in the quota is
   // the write's own concern.
@@ -866,27 +851,12 @@ public:
     static_cast<void>(evictedStates);
     return 0;
   }
-  // The most rows of one lane's prefill command: a prefill group's where
-  // the model runs them (one lane's chunks, layer by layer) to read
-  // something once for all of them, its streamed experts for every lane or a
-  // spilled history for a lane whose K/V spills or that holds spilled blocks
-  // (`spills`), else a chunk's.
-  [[nodiscard]] virtual uint32_t prefillGroupRows(bool spills) const noexcept {
-    static_cast<void>(spills);
-    return ExecutionLimits::prefillTokenBudget;
-  }
-  // The most passes over its layers a prefill command may run in
-  // (BatchPlan::passes): its layers where a command pays a cost per layer
-  // whatever its rows, which keeps a command long however few they are, as
-  // a streamed target's expert reads; 1 where a command runs whole. A
-  // command that streams a lane's history runs whole.
-  [[nodiscard]] virtual uint32_t prefillPasses() const noexcept { return 1; }
   // What one prefill command may hold (commandViolation): by default a
-  // prefill group's rows, prefillPasses() passes, one lane past a chunk and
-  // one lane whose history streams, at one rate a row from one row.
+  // chunk's rows in one pass, one lane past a chunk and one lane whose
+  // history streams, at one rate a row from one row.
   [[nodiscard]] virtual CommandLimits commandLimits() const noexcept {
-    return {.commandRows = prefillGroupRows(true),
-            .maximumPasses = prefillPasses(),
+    return {.commandRows = ExecutionLimits::prefillTokenBudget,
+            .maximumPasses = 1,
             .lanesPastChunk = 1,
             .indexPageLanes = 1};
   }
@@ -921,21 +891,6 @@ public:
   [[nodiscard]] virtual uint64_t releaseIdleBuffer(bool keepLane) noexcept {
     return reclaimIdleState(keepLane, IdleMemory::Buffers);
   }
-  // The store of streamed routed experts above its floor
-  // (model::ExpertStore), between commands. releaseExpertChunk gives one
-  // chunk back while memory is short and returns its bytes; zero when the
-  // store is at its floor or released, or the model has none.
-  // releaseExpertsToFloor gives back every chunk above the floor at once,
-  // while memory is critically short, and returns their bytes, zero where
-  // releaseExpertChunk would give none. expertGrowthBytes is what
-  // growExperts takes next, zero when nothing grows; growExperts takes that
-  // chunk back, its slots free, granted at once when nothing grows and
-  // refused with the admission's cause. A failure inside the store reaches
-  // the caller, whose failure boundary stops the engine.
-  [[nodiscard]] virtual uint64_t releaseExpertChunk() { return 0; }
-  [[nodiscard]] virtual uint64_t releaseExpertsToFloor() { return 0; }
-  [[nodiscard]] virtual uint64_t expertGrowthBytes() const { return 0; }
-  [[nodiscard]] virtual ModelMemoryAdmission growExperts() { return {.ok = true}; }
   // The model's elastic memories, stable for its lifetime; none by default.
   [[nodiscard]] virtual std::span<ElasticPool *const> pools() noexcept { return {}; }
   // What loading the weights read from the SSD through WeightSource, which

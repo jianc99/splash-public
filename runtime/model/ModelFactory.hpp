@@ -135,11 +135,6 @@ struct RuntimeContext final {
   KvBlockCache *blockCache = nullptr;
   KvHistoryStream *historyStream = nullptr;
   VerifyRows verifyRows = VerifyRows::Auto;
-  // Admits the memory the expert store takes back toward its cap
-  // (Model::growExperts) as growth it can do without
-  // (engine::MemoryGovernor::growthAdmission).
-  // Without it the store never grows, as in the tools that keep it fixed.
-  metal::AllocationAdmission expertAdmission = {};
 };
 
 // Validates only the interface between independently defined target and draft
