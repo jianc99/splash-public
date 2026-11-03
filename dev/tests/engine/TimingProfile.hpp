@@ -169,10 +169,11 @@ struct MeasuredPrompt final {
 
 // The fake model's work (Model::prefillWork) on its profile: the pass's
 // layers, its attending layers' pairs at their reach and block-index pairs,
-// the experts its rows route that are not resident (once per command or
-// pass, the measured routing), and a streaming lane's Index pages' history
-// over its attending layers. The residency is the experts pool's now, or the
-// profile's measured one without a pool.
+// the pairs of the target's heaviest attention layer, the experts its rows
+// route that are not resident (once per command or pass, the measured
+// routing), and a streaming lane's Index pages' history over its attending
+// layers. The residency is the experts pool's now, or the profile's measured
+// one without a pool.
 class TimedWork final : public model::PrefillWorkSource {
 public:
   explicit TimedWork(const TimingProfile &profile, std::function<double()> residentShare = {})
@@ -203,12 +204,18 @@ private:
   [[nodiscard]] model::CommandWork work(std::span<const model::PrefillLane> lanes, uint32_t pass, uint32_t passes,
                                         double distinctPerLayer) const {
     const model::LayerRange range = model::passLayers(pass, passes, profile_.layers);
-    uint32_t attending = 0, full = 0;
-    for (uint32_t layer = range.first; layer < range.end; ++layer) {
+    // The attending and full-attention layers the pass runs, and the
+    // target's.
+    uint32_t attending = 0, full = 0, allFull = 0;
+    for (uint32_t layer = 0; layer < profile_.layers; ++layer) {
       if ((layer + 1) % profile_.attentionEvery)
         continue;
-      ++attending;
-      full += profile_.fullAttentionEvery && layer % profile_.fullAttentionEvery == 0;
+      const bool dense = profile_.fullAttentionEvery && layer % profile_.fullAttentionEvery == 0;
+      allFull += dense;
+      if (layer >= range.first && layer < range.end) {
+        ++attending;
+        full += dense;
+      }
     }
     const uint32_t allAttending = profile_.layers / profile_.attentionEvery;
     model::CommandWork result{.lanes = static_cast<uint32_t>(lanes.size()), .layers = range.end - range.first};
@@ -230,7 +237,9 @@ private:
     result.chunks = (result.rows + model::ExecutionLimits::prefillTokenBudget - 1) /
                     model::ExecutionLimits::prefillTokenBudget;
     result.attentionPairs = (attending - full) * reachPairs + full * densePairs;
-    result.layerAttentionPairs = full ? densePairs : attending ? reachPairs : 0;
+    // The target's heaviest attention layer whatever layers the pass runs: a
+    // pass does not split a layer (CommandWork::layerAttentionPairs).
+    result.layerAttentionPairs = allFull ? densePairs : allAttending ? reachPairs : 0;
     result.indexPairs = (attending - full) * indexPairs;
     result.weightReadBytes = static_cast<uint64_t>(result.layers * distinctPerLayer *
                                                    (1.0 - prefillHit(profile_, residentShare())) *

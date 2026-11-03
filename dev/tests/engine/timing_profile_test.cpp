@@ -191,16 +191,13 @@ void testTheDenseAndFlintProfilesFitTheirPrompts() {
 
 // A command's passes split its layers and what they count: their layers,
 // pairs, block-index pairs, expert reads and history reads add up to the
-// whole command's, no pass computes more pairs in a layer than the
-// command's heaviest layer, and the pass that runs that layer computes them
-// all (a pass does not split a layer).
+// whole command's.
 void testThePassesSplitTheLayersAndTheirWork() {
   for (const TimingProfile *profile : {&test::kM6FlashNextQ2, &test::kFlint}) {
     const TimedWork work(*profile);
     const model::PrefillLane lanes[] = {{.position = 70'000, .rows = 6000, .indexPages = 100}, {.rows = 2000}};
     const model::CommandWork whole = work.prefillWork(lanes, 0, 1);
     model::CommandWork sum;
-    uint64_t heaviest = 0;
     for (uint32_t pass = 0; pass < profile->layers; ++pass) {
       const model::CommandWork part = work.prefillWork(lanes, pass, profile->layers);
       require(part.rows == whole.rows && part.chunks == whole.chunks && part.lanes == 2,
@@ -210,13 +207,10 @@ void testThePassesSplitTheLayersAndTheirWork() {
       sum.indexPairs += part.indexPairs;
       sum.weightReadBytes += part.weightReadBytes;
       sum.spilledKvReadBytes += part.spilledKvReadBytes;
-      require(part.layerAttentionPairs <= whole.layerAttentionPairs, "a pass computes more pairs in a layer than any");
-      heaviest = std::max(heaviest, part.layerAttentionPairs);
     }
     require(sum.layers == whole.layers && sum.attentionPairs == whole.attentionPairs &&
-                sum.indexPairs == whole.indexPairs && heaviest == whole.layerAttentionPairs &&
-                sum.weightReadBytes <= whole.weightReadBytes && whole.weightReadBytes - sum.weightReadBytes < 64 &&
-                sum.spilledKvReadBytes == whole.spilledKvReadBytes,
+                sum.indexPairs == whole.indexPairs && sum.weightReadBytes <= whole.weightReadBytes &&
+                whole.weightReadBytes - sum.weightReadBytes < 64 && sum.spilledKvReadBytes == whole.spilledKvReadBytes,
             std::string(profile->name) + ": the passes' work does not add up to the command's");
   }
   // Flint: the full-attention layers compute every key, the windowed ones at
@@ -227,6 +221,32 @@ void testThePassesSplitTheLayersAndTheirWork() {
               flint.attentionPairs ==
                   13 * model::denseAttentionPairs(100'000, 2048) + 36 * model::attentionPairs({.windowTokens = 513}, 100'000, 2048),
           "Flint's full and windowed layers are not counted at their reach");
+}
+
+// Every pass of a command reports the pairs of the target's heaviest
+// attention layer, the whole command's (amend/I.md B1): a pass does not
+// split a layer, and the bound on a layer's pairs holds rows to it whatever
+// the pass. That includes a pass that runs no attention layer (Flash-Next's
+// first of 48, its layer 0) or no full-attention one (Flint's second of 49,
+// a windowed layer).
+void testEveryPassReportsTheTargetsHeaviestLayer() {
+  const model::PrefillLane lanes[] = {{.position = 70'000, .rows = 6000}, {.rows = 2000}};
+  for (const TimingProfile *profile : {&test::kM6FlashNextQ2, &test::kFlint}) {
+    const TimedWork work(*profile);
+    const uint64_t whole = work.prefillWork(lanes, 0, 1).layerAttentionPairs;
+    for (const uint32_t passes : {2u, 19u, profile->layers})
+      for (uint32_t pass = 0; pass < passes; ++pass)
+        require(work.prefillWork(lanes, pass, passes).layerAttentionPairs == whole,
+                std::string(profile->name) + ": pass " + std::to_string(pass) + " of " + std::to_string(passes) +
+                    " reports " + std::to_string(work.prefillWork(lanes, pass, passes).layerAttentionPairs) +
+                    " pairs in a layer, not the target's heaviest layer's " + std::to_string(whole));
+  }
+  require(TimedWork(test::kM6FlashNextQ2).prefillWork(lanes, 0, 1).layerAttentionPairs ==
+                  model::attentionPairs(test::kM6FlashNextQ2.reach, 70'000, 6000) +
+                      model::attentionPairs(test::kM6FlashNextQ2.reach, 0, 2000) &&
+              TimedWork(test::kFlint).prefillWork(lanes, 0, 1).layerAttentionPairs ==
+                  model::denseAttentionPairs(70'000, 6000) + model::denseAttentionPairs(0, 2000),
+          "the heaviest layer's pairs are not the lanes' at the heaviest reach");
 }
 
 // Every profile is whole: layers that attend, a decode command of four lanes
@@ -374,6 +394,7 @@ int main(int argc, char **argv) {
       {"routingIsMeasured", testRoutingIsMeasured},
       {"theDenseAndFlintProfilesFitTheirPrompts", testTheDenseAndFlintProfilesFitTheirPrompts},
       {"thePassesSplitTheLayersAndTheirWork", testThePassesSplitTheLayersAndTheirWork},
+      {"everyPassReportsTheTargetsHeaviestLayer", testEveryPassReportsTheTargetsHeaviestLayer},
       {"everyProfileIsWhole", testEveryProfileIsWhole},
       {"ticketsSampleTheirWorkAndWaitForTheirEnd", testTicketsSampleTheirWorkAndWaitForTheirEnd},
       {"theHarnessClockRunsCommandsForTheirTime", testTheHarnessClockRunsCommandsForTheirTime},
