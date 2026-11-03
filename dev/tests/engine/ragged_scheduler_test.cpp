@@ -1955,8 +1955,9 @@ void testCommandBetweenPassesHoldsItsLanes() {
 // A command's rows count once, with its first pass, in prefill_rows, the
 // work the matrix compares with 1.5.0, which counts them so: the rows its
 // lanes plan again after it was abandoned between its passes counted
-// already. A lane suspended between its command's passes replays its rows
-// once it resumes, and those count again, as 1.5.0's replays do.
+// already, those of a lane suspended meanwhile too once it resumes. Of a
+// resume's replay, the rows that ran before its suspension count again, as
+// 1.5.0's replays do.
 void testAnAbandonedCommandsRowsCountOnce() {
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   sim.seed();
@@ -1985,8 +1986,35 @@ void testAnAbandonedCommandsRowsCountOnce() {
   sim.scheduler.resumeFromResources(3, 0, 8192);
   while (sim.scheduler.phase(3) == Phase::Prefill)
     sim.step();
-  require(sim.scheduler.snapshot().prefillRows == counted + 8192,
-          "a replay counted " + std::to_string(sim.scheduler.snapshot().prefillRows - counted) + " of its 8192 rows");
+  require(sim.scheduler.snapshot().prefillRows == counted,
+          "a lane suspended in its first command's passes counted " +
+              std::to_string(sim.scheduler.snapshot().prefillRows - counted) +
+              " of its 8192 rows again once it resumed, which never ran before");
+  // A lane whose first command ended, suspended between the passes of its
+  // second, resumes from its prompt's start: the first command's rows count
+  // again, the second's not.
+  sim.lane(4, 0, 2 * 8192);
+  plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill || !sim.scheduler.promptProcessed(4)) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  require(plan.width() == 1 && plan.items[0].requestId == 4 && plan.passes > 1,
+          "the second command did not run in passes");
+  const uint32_t ran = sim.scheduler.promptProcessed(4);
+  const uint32_t reached = plan.items[0].promptOffset + plan.items[0].tokenCount;
+  sim.run(plan);
+  const uint64_t before = sim.scheduler.snapshot().prefillRows;
+  sim.abandon();
+  sim.scheduler.suspendForResources(4);
+  sim.scheduler.resumeFromResources(4, 0, 2 * 8192);
+  while (sim.scheduler.phase(4) == Phase::Prefill)
+    sim.step();
+  const uint64_t replayed = sim.scheduler.snapshot().prefillRows - before;
+  require(replayed == ran + (2 * 8192 - reached),
+          "a replay from the prompt's start counted " + std::to_string(replayed) + " rows, not the " +
+              std::to_string(ran) + " that ran before its suspension and the " + std::to_string(2 * 8192 - reached) +
+              " no command counted");
 }
 
 // A higher priority's decode does not abandon a command between its passes,

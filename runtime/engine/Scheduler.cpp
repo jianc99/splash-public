@@ -103,6 +103,7 @@ void Scheduler::resourcesReady(uint64_t id, uint32_t processed) {
     throw std::logic_error("suspended request requires resumeFromResources");
   }
   request.promptProcessed = processed;
+  request.rowsCounted = processed;
   request.decodeStage = DecodeStage::Regular;
   request.phase =
       processed == request.spec.prefillTokens ? Phase::Decode : Phase::Prefill;
@@ -128,9 +129,11 @@ void Scheduler::resumeFromResources(uint64_t id, uint32_t processed,
   }
   if (processed >= replayTokens)
     throw std::invalid_argument("resource replay must leave an input token");
+  // The replay counts its rows again, as 1.5.0 counted replays, but not
+  // those counted past what ran: an abandoned command's, which never ran.
+  request.rowsCounted = processed + (request.rowsCounted - request.promptProcessed);
   request.spec.prefillTokens = replayTokens;
   request.promptProcessed = processed;
-  request.rowsCounted = processed;
   request.phase = Phase::Prefill;
   request.suspended = false;
 }
