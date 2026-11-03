@@ -675,8 +675,11 @@ public:
   // (QwenStateStorage::idleBytes); the fake's are what reclaimIdleState
   // gives: what the cache let go of already and each State it lets go of
   // next, beyond what refills the lane's footprint. KeptState and
-  // RowsHoldingState return no buffers.
+  // RowsHoldingState return no buffers, nor does a fake without `memory`,
+  // whose buffers the governor never booked.
   uint64_t idleBufferBytes(uint32_t evictedStates) const noexcept override {
+    if (!memory)
+      return 0;
     const uint64_t each = keptTier || stateHeldRows ? 0 : State().bytes();
     const uint64_t returned = *evictedStateBytes + uint64_t{evictedStates} * each;
     const uint64_t refill =

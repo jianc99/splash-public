@@ -386,11 +386,12 @@ void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
 // takes what the Background command between its passes holds before any
 // lane of it yields: its claim, of work that supersedes the command, takes
 // the command (amend/M.md B15), which a lane's suspension would abandon
-// anyway, and the buffers of the states it would capture are what the
-// prompt's KV fits in. No lane is suspended, and the Background prompts run
-// their rows again from a first pass.
+// anyway, and the buffers of the states it would capture, booked with the
+// governor, are what the prompt's KV fits in. No lane is suspended, and the
+// Background prompts run their rows again from a first pass.
 void testAHigherPriorityTakesWhatACommandBetweenPassesHolds() {
   PassingEngine passing(true);
+  passing.host.bookStates(passing.model);
   // While growth is blocked an extent asks the engine's limit for one
   // state's buffers, which it leaves no room for, and the buffers going
   // back unblock it (Executor::kvGrowthBlocked).
@@ -1109,10 +1110,11 @@ void testASpilledReadsRefusalFollowsTheRuleForLanesThatEnded() {
 // engine's limit refuses its KV takes what the Background command between its
 // passes holds before it converts itself to Spill: the command, which that
 // prompt's command gives up once it runs, costs its claim nothing (amend/M.md
-// B15), and the buffers of the states the command would capture are what
-// its KV fits in.
+// B15), and the buffers of the states the command would capture, booked
+// with the governor, are what its KV fits in.
 void testASupersedingPromptTakesACommandsMemoryBeforeSpilling() {
   Spilling spill(64, false, 100'000, 0, {4}, 0, test::commandShape(4 * model::ExecutionLimits::prefillTokenBudget, 6));
+  spill.host.bookStates(spill.model);
   std::vector<std::pair<uint64_t, uint32_t>> prefills;
   spill.model.commandTimes = [&](const BatchPlan &plan, std::span<const ModelBatchItem>) {
     if (plan.kind == WorkKind::Prefill)
