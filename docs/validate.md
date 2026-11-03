@@ -48,7 +48,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | Target | Runs |
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
-| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window |
+| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window, sizes that a `--spill-tokens` in `ORACLE_ARGS` replaces in all three (on a 24 GB Mac, `ORACLE_ARGS="--expert-memory 6656M"`; below) |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which on any MoE target takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](server.md#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
@@ -104,7 +104,21 @@ it and macOS's warning. A Neural Engine split leaves the plan room for what the
 checks hold at once (every lane's state, six cached states and the oracle's KV
 pages), as a start's split leaves `--max-context`, so the oracle's split may
 take fewer of the Neural Engine's units than a server's does. With only desktop
-applications open, a 24 GB Mac runs it for those variants.
+applications open, a 24 GB Mac runs it for those variants. A refusal of the
+budget fails its check with its cause, the bytes asked for and the governor's
+limit and charge. A block-sparse target's spill check counts what it allocates
+at most before its first prompt, and where the budget leaves less room, stops
+there, naming both, an `--expert-memory` that fits where that store still
+loads, and a `--spill-tokens` that fits for the oracle's command run by hand:
+`ORACLE_ARGS` reaches all three runs of `test-real`, and a `--spill-tokens`
+there replaces the first two runs' default prompts and the third's 32K.
+Beside the weights, Qwen3.8-Flash-Next's default checks hold up to 4.3 GB and
+its 32K check about 5.9 GB. On the 24 GB M6 (11-02) a check's need as the
+oracle names it (up to 1866 MiB by default, 3382 MiB at 32K) and the expert
+store together fit in about 10440 MiB on a text installation and 9580 MiB on
+one that serves vision, so all three runs take
+`ORACLE_ARGS="--expert-memory 6656M"`, or `5632M` where the installation
+serves vision, whose default checks alone fit only up to about `7700M`.
 
 The engine's `--kv-spill always`, which `splash serve` never passes, keeps
 the KV of every request of a block-sparse target on the SSD cache

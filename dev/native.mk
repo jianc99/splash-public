@@ -695,9 +695,19 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # model.json records. Nothing is printed when the installation serves no
 # vision (vision_format none: --language-only, or a GGUF without an mmproj).
 # ORACLE_ARGS: options every run of the runtime oracle takes besides its own,
-# as the oracle takes them (model_runtime_oracle_test.mm). A block-sparse
-# target's spill check runs in each: by default, with two staging buffers,
-# and at 32K tokens with the cache's default window.
+# as the oracle takes them (model_runtime_oracle_test.mm), an option given
+# twice taking its later value. A block-sparse target's spill check runs in
+# each: by default, with two staging buffers, and at 32K tokens with the
+# cache's default window, so a --spill-tokens here replaces the size of all
+# three. Each stops before its prompts, naming what fits, where the memory
+# plan's limit leaves less than it holds beside the weights: up to 4.3 GB
+# for Qwen3.8-Flash-Next's default checks, and 5.9 GB for its 32K check (on
+# the 24 GB M6, 11-02: the spill runtime's arenas 2.27 GB, four FP32 lane
+# states 1.11 GB, 17 Full extents 1.84 GB, the hot block cache's floor for
+# two lanes 0.61 GB, Index extents and staging). On a 24 GB Mac all three
+# runs take ORACLE_ARGS="--expert-memory 6656M", or 5632M where the
+# installation serves vision, whose default checks alone fit only up to
+# about 7700M (docs/validate.md).
 ORACLE_ARGS ?=
 VISION_FIXTURE_FAMILY := import json, pathlib, sys; \
 	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
