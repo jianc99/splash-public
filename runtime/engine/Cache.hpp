@@ -1083,6 +1083,16 @@ private:
     [[nodiscard]] bool releases(kv::PageForm each, uint32_t freePages, uint32_t extentPages) const noexcept {
       return each != form || freePages >= keptPages + extentPages;
     }
+    // Whether evicting KV of the form may still empty an extent: of the
+    // form's `reusable` pages, those the demotions in flight hold
+    // (`demoting`) and the empty extent its releases keep (keeps) leave one,
+    // past which extentsCompleted counts the extents landings complete too.
+    // The free pages a KV need takes first (keptPages) stay in: KV of its
+    // form that leaves gives it pages in place.
+    [[nodiscard]] bool reaches(kv::PageForm each, uint32_t reusable, uint32_t demoting,
+                               uint32_t extentPages) const noexcept {
+      return uint64_t{demoting} + uint64_t{extentPages} * (keeps(each) ? 2 : 1) <= reusable;
+    }
   };
   [[nodiscard]] Walk walkFor(const VictimQuery &query) const;
   // The walk's next unit, moving the cursor on: the checkpoints, the dead
@@ -1169,14 +1179,19 @@ private:
   // One eviction: the walk's first unit that goes, as reclaimOne describes.
   // A page scan has no checkpoints. A step that finds nothing reports
   // pending while a transfer in flight can return what is needed (returns).
-  [[nodiscard]] CacheReclaimResult evictOne(const Walk &walk);
+  // With `reach`, a leaf goes only where it leads to an extent in reach
+  // (takeOldest).
+  [[nodiscard]] CacheReclaimResult evictOne(const Walk &walk, std::optional<std::array<bool, 3>> reach = std::nullopt);
   // The units of the walk from the cursor on, each taken in turn until one
   // goes, which it returns. One that waits for a transfer in flight leaves
   // the others to go: a checkpoint ends the checkpoints, a state holds back
   // the newer states of its class, and once a demotion has to wait for the
   // tier, the leaves of its class that need one stay. Nothing once all
-  // stay.
-  [[nodiscard]] std::optional<Victim> takeOldest(const Walk &walk, WalkCursor cursor);
+  // stay. With `reach`, the forms whose extents evicting KV may still empty
+  // (formsInReach), a leaf that leads to none of them (leadsToReach) frees
+  // no memory, and the walk passes over it.
+  [[nodiscard]] std::optional<Victim> takeOldest(const Walk &walk, WalkCursor cursor,
+                                                 std::optional<std::array<bool, 3>> reach = std::nullopt);
   // The first state of the walk, of states alone, goes as the walk says: the
   // oldest checkpoint, else the oldest ordinary state, then, up to InUse, a
   // state in use. A state that needs a write the walk passes over leaves the
@@ -1185,10 +1200,11 @@ private:
   // One memory reclaim of a unit of the walk, which began with `demotions`
   // pages held by the demotions in flight (demotionPages) and `unit` pages
   // landing (demotedPages), by form: free pages first, as the extent they
-  // fill; then the walk's victims while their KV, with the pages the unit's
-  // demotions free as they land, can empty an extent of some form, until
-  // one is released, those pages complete one or a state goes; otherwise a
-  // state (recycleState).
+  // fill; then, while KV of some form, with the pages the unit's demotions
+  // free as they land, can empty an extent past the runway the walk keeps
+  // (formsInReach), the walk's victims, its leaves that lead to such an
+  // extent alone (leadsToReach), until one is released, those pages
+  // complete one or a state goes; otherwise a state (recycleState).
   [[nodiscard]] CacheReclaimResult takeReclaim(const Walk &walk, const std::array<uint32_t, 3> &demotions,
                                                const std::array<uint32_t, 3> &unit);
   // Oldest resident KV leaf after `after` no state restores through: nothing
@@ -1280,15 +1296,20 @@ private:
   // An ordinary state at the block or anywhere below it.
   [[nodiscard]] bool holdsOrdinaryState(uint64_t block) const;
   void startRestore(uint64_t block);
-  // Evicting KV of the class may empty an extent: of some form, the pages
-  // upTo may reuse (reusablePages), less those whose demotion is in flight,
-  // or the `demoting` of them a unit found in flight, by form, cover one.
-  // That counts the leaves that need a demotion too, which an Immediate step
-  // passes over while the tier takes writes. A page written through is none
-  // of them: its Spill request holds it, though it frees once its copy lands
-  // (pendingPages).
-  [[nodiscard]] bool extentWithinReach(ReclaimClass upTo = ReclaimClass::Ordinary,
-                                       std::optional<std::array<uint32_t, 3>> demoting = std::nullopt) const;
+  // By form, whether evicting the walk's KV may empty an extent
+  // (Walk::reaches): of the pages its class may reuse (reusablePages), the
+  // `demoting` pages a unit found in flight and the runway the walk keeps
+  // leave one. That counts the leaves that need a demotion too, which an
+  // Immediate step passes over while the tier takes writes. A page written
+  // through is none of them: its Spill request holds it, though it frees
+  // once its copy lands (pendingPages).
+  [[nodiscard]] std::array<bool, 3> formsInReach(const Walk &walk, const std::array<uint32_t, 3> &demoting) const;
+  // Evicting the resident leaf may lead to an extent of a form in `reach`
+  // emptying: its page is of such a form, or the page of a block above it,
+  // which may become a leaf once the leaf has gone, as a spilled chain's
+  // Index pages above its Full tail and a windowed one's Slim pages above its
+  // window do.
+  [[nodiscard]] bool leadsToReach(uint64_t block, const std::array<bool, 3> &reach) const;
   // The bytes of the extents the pages of the demotions started since
   // `before` pages were landing, by form, complete as they land, past the
   // runway the walk keeps; none for a walk that cannot wait.

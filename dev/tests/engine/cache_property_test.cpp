@@ -520,7 +520,9 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // write the quota refuses drops its state, a demotion counted unsure
 // starts, landings complete an extent with the free pages a unit leaves, or
 // Spill writes land copies through which blocks no request holds go; the
-// Slim and Index units after it reach as far as their own form's pages.
+// Slim and Index units after it reach as far as their own form's pages, and
+// in 483524 the Full tail of a spilled chain goes, though no Full extent can
+// empty any more, as the Index pages above it go only after it.
 void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
   uint64_t exact = 0, unsure = 0, landing = 0;
   const auto check = [&](uint32_t seed, bool windowed) {

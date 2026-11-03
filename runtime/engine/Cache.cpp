@@ -7,6 +7,7 @@
 #include <array>
 #include <chrono>
 #include <compare>
+#include <functional>
 #include <limits>
 #include <map>
 #include <set>
@@ -38,16 +39,6 @@ uint32_t completedExtents(uint32_t free, uint32_t pages, uint32_t extentPages, b
   const uint32_t kept = keepRunway ? 1 : 0;
   const auto beyond = [&](uint32_t count) { return std::max(count / extentPages, kept) - kept; };
   return beyond(free + pages) - beyond(free);
-}
-
-// Evicting KV may still empty an extent: of some form, the pages a reclaim
-// may reuse, less those demotions hold, cover one.
-bool extentInReach(const std::array<uint32_t, 3> &reusable, const std::array<uint32_t, 3> &demoting,
-                   uint32_t extentPages) noexcept {
-  for (size_t form = 0; form < reusable.size(); ++form)
-    if (demoting[form] + extentPages <= reusable[form])
-      return true;
-  return false;
 }
 
 } // namespace
@@ -1115,6 +1106,8 @@ private:
   [[nodiscard]] std::pair<bool, uint64_t> releaseExtent();
   [[nodiscard]] std::array<uint32_t, 3> completed(const std::array<uint32_t, 3> &before, bool restored) const;
   [[nodiscard]] uint64_t laterBytes(const std::array<uint32_t, 3> &before) const;
+  [[nodiscard]] std::array<bool, 3> reach() const;
+  [[nodiscard]] bool inReach(uint64_t block) const;
   // The orders.
   [[nodiscard]] std::optional<CacheEvictionCandidate> cacheNext(int order,
                                                                 std::optional<CacheEvictionCandidate> after) const;
@@ -1411,11 +1404,11 @@ std::optional<engine::Victim> Cache::ReclaimPlan::weigh(Weighed weighed) {
 }
 
 // takeReclaim, weighed; one that stopped at uncopied cache goes on there.
-// Its victims go while their KV can empty an extent of some form: the pages
-// of the form left to reuse, less those the demotions before the unit hold,
-// cover one. The pages the unit's own demotions free as they land count
-// toward the extent its victims empty, and it ends once they, or with them
-// the pages of its restored leaves, complete one.
+// Its victims go while KV of some form can empty an extent (reach), its
+// leaves that lead to such an extent alone (inReach). The pages the unit's
+// own demotions free as they land count toward the extent its victims
+// empty, and it ends once they, or with them the pages of its restored
+// leaves, complete one.
 Cache::ReclaimPlan::Step Cache::ReclaimPlan::step() {
   if (!std::exchange(resumes_, false)) {
     for (std::pair<bool, uint64_t> released; (released = releaseExtent()).first;)
@@ -1423,7 +1416,7 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::step() {
         return {.progress = true, .bytes = released.second};
   }
   bool kv = false;
-  while (extentInReach(reusable_, unitDemotions_, extentPages_)) {
+  while (std::ranges::any_of(reach(), std::identity{})) {
     const Step evicted = evict();
     if (evicted.uncopied) {
       resumes_ = true;
@@ -1465,6 +1458,8 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::evict() {
   }
   for (std::optional<CacheEvictionCandidate> dead; (dead = head(DeadLeaves));) {
     visit(DeadLeaves);
+    if (!inReach(dead->id))
+      continue;
     if (const LeafGoes goes = leafGoes(dead->id, timing()); goes == LeafGoes::Copy || goes == LeafGoes::Erase)
       return takeLeaf(dead->id, goes, false);
   }
@@ -1525,6 +1520,10 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::evictPhase(bool inUse) {
       took();
       return {.progress = true, .pages = takeState(leaf->id, inUse), .state = true};
     }
+    if (!inReach(leaf->id)) {
+      visit(leaves);
+      continue;
+    }
     if (reachesUncopied(leaf->id, false))
       return {.uncopied = true};
     visit(leaves);
@@ -1556,7 +1555,8 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::takeLater(bool inUse) {
     const uint64_t block = next.block;
     if (!leaf(block) && !leaf(block, true))
       continue;
-    if (keptLeaf(block) || (ramState(block) && keptPoint(block, std::max(generation_, next.generation))))
+    if (keptLeaf(block) || (ramState(block) && keptPoint(block, std::max(generation_, next.generation))) ||
+        !inReach(block))
       continue;
     const LeafGoes goes = leafGoes(block, ReclaimTiming::CanWait, true);
     if (goes == LeafGoes::Stays || goes == LeafGoes::Pending || (ramState(block) && !stateGoes(block).evicted))
@@ -1750,6 +1750,24 @@ uint64_t Cache::ReclaimPlan::laterBytes(const std::array<uint32_t, 3> &before) c
   for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
     bytes += uint64_t{extents[static_cast<size_t>(form)]} * extentPages_ * cache.pool_.bytesPerPage(form);
   return bytes;
+}
+
+// Cache::formsInReach for the unit: of each form, the pages left to reuse,
+// less those the demotions before the unit hold.
+std::array<bool, 3> Cache::ReclaimPlan::reach() const {
+  std::array<bool, 3> forms{};
+  for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
+    const auto index = static_cast<size_t>(form);
+    forms[index] = walk.reaches(form, reusable_[index], unitDemotions_[index], extentPages_);
+  }
+  return forms;
+}
+
+// A device need's leaf goes only where it leads to an extent in reach
+// (Cache::leadsToReach); one that leads to none frees no memory, and stays
+// (Cache::takeOldest).
+bool Cache::ReclaimPlan::inReach(uint64_t block) const {
+  return !walk.device || cache.leadsToReach(block, reach());
 }
 
 std::optional<CacheEvictionCandidate> Cache::ReclaimPlan::cacheNext(int order,
@@ -2488,15 +2506,16 @@ CacheReclaimResult Cache::reclaimStep(const Walk &walk, bool release, bool keepR
   return evicted;
 }
 
-CacheReclaimResult Cache::evictOne(const Walk &walk) {
-  if (const std::optional<Victim> victim = takeOldest(walk, {}))
+CacheReclaimResult Cache::evictOne(const Walk &walk, std::optional<std::array<bool, 3>> reach) {
+  if (const std::optional<Victim> victim = takeOldest(walk, {}, reach))
     return {.madeProgress = true, .evictedState = !victim->kv};
   // Nothing to reclaim now. Transfers land only in pollTransfers(), so what
   // was in flight during the pass still is, and comes back.
   return {.pending = returns(walk)};
 }
 
-std::optional<Cache::Victim> Cache::takeOldest(const Walk &walk, WalkCursor cursor) {
+std::optional<Cache::Victim> Cache::takeOldest(const Walk &walk, WalkCursor cursor,
+                                               std::optional<std::array<bool, 3>> reach) {
   using Phase = WalkCursor::Phase;
   ReclaimTiming timing = walk.timing;
   for (Phase phase = cursor.phase; const std::optional<WalkUnit> unit = nextStepUnit(walk, cursor);) {
@@ -2509,6 +2528,8 @@ std::optional<Cache::Victim> Cache::takeOldest(const Walk &walk, WalkCursor curs
       timing = walk.timing;
     }
     const bool leaf = unit->unit == Unit::DeadLeaf || unit->unit == Unit::Leaf || unit->unit == Unit::UsedLeaf;
+    if (leaf && reach && !leadsToReach(unit->candidate.id, *reach))
+      continue;
     const UnitTaken taken = takeUnit(walk, *unit, unit->unit == Unit::DeadLeaf ? walk.timing : timing);
     if (taken.taken) {
       if (victimsLeft_)
@@ -2563,19 +2584,23 @@ CacheReclaimResult Cache::takeReclaim(const Walk &walk, const std::array<uint32_
   for (CacheReclaimResult released; (released = releaseExtent(walk)).madeProgress;)
     if (released.reclaimedBytes)
       return released;
-  // Then the victims in reclaimOne's order while their KV can empty an
-  // extent of some form, until one is released, the pages the unit's
-  // demotions free as they land complete one, or a state goes; otherwise
-  // only a state. Those pages count toward the extent; the demotions in
-  // flight before the unit hold theirs, of their form. Whatever it returns
-  // says whether KV went.
+  // Then the victims in reclaimOne's order while KV of some form can empty
+  // an extent past the runway the walk keeps, the leaves that lead to such
+  // an extent alone, until one is released, the pages the unit's demotions
+  // free as they land complete one, or a state goes; otherwise only a
+  // state. Those pages count toward the extent; the demotions in flight
+  // before the unit hold theirs, of their form. Whatever it returns says
+  // whether KV went.
   bool evictedKv = false;
   const auto outcome = [&](CacheReclaimResult result) {
     result.evictedKv = evictedKv;
     return result;
   };
-  while (extentWithinReach(walk.scope.upTo, demotions)) {
-    const CacheReclaimResult evicted = evictOne(walk);
+  for (;;) {
+    const std::array<bool, 3> reach = formsInReach(walk, demotions);
+    if (std::ranges::none_of(reach, std::identity{}))
+      break;
+    const CacheReclaimResult evicted = evictOne(walk, reach);
     if (!evicted.madeProgress || evicted.evictedState)
       return outcome(evicted);
     evictedKv = true;
@@ -2616,9 +2641,13 @@ StateRoom Cache::reclaimOneState(StateClass state, bool growth) {
   if (checkpointsOnly)
     return {};
   // KV makes room with the extent its free pages fill, released at once,
-  // and goes only while one can be emptied.
-  if (growth && extentWithinReach()) {
-    while (const std::optional<Victim> victim = takeOldest(walk, WalkCursor{.phase = WalkCursor::Phase::DeadLeaves})) {
+  // and goes only while one it leads to can be emptied (takeOldest).
+  std::array<bool, 3> reach{};
+  if (growth)
+    reach = formsInReach(walk, demotionPages());
+  if (std::ranges::any_of(reach, std::identity{})) {
+    while (const std::optional<Victim> victim =
+               takeOldest(walk, WalkCursor{.phase = WalkCursor::Phase::DeadLeaves}, reach)) {
       if (!victim->kv)
         return {true};
       if (const CacheReclaimResult released = releaseExtent(false); released.reclaimedBytes)
@@ -2747,11 +2776,20 @@ void Cache::dropPoisoned() {
   });
 }
 
-bool Cache::extentWithinReach(ReclaimClass upTo, std::optional<std::array<uint32_t, 3>> demoting) const {
-  std::array<uint32_t, 3> reusable{};
-  for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index})
-    reusable[static_cast<size_t>(form)] = reusablePages(upTo, form);
-  return extentInReach(reusable, demoting.value_or(demotionPages()), pool_.extentPages());
+bool Cache::leadsToReach(uint64_t block, const std::array<bool, 3> &reach) const {
+  for (; block; block = kv_.key(block).parent)
+    if (reach[static_cast<size_t>(pool_.form(kv_.page(block)))])
+      return true;
+  return false;
+}
+
+std::array<bool, 3> Cache::formsInReach(const Walk &walk, const std::array<uint32_t, 3> &demoting) const {
+  std::array<bool, 3> reach{};
+  for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {
+    const auto index = static_cast<size_t>(form);
+    reach[index] = walk.reaches(form, reusablePages(walk.scope.upTo, form), demoting[index], pool_.extentPages());
+  }
+  return reach;
 }
 
 CacheReclaimResult Cache::releaseExtent(const Walk &walk) {

@@ -6262,6 +6262,77 @@ void testDeviceNeedWeighsALargeCacheAtOnce() {
                                  " times, against " + std::to_string(looks));
 }
 
+// A device need's KV goes only while it can empty an extent past the runway
+// the walk keeps, and the Index runway every claim short of critical
+// pressure keeps is no such extent. Where the pages requests hold leave no
+// Full extent to empty, three held in each of two extents
+// (testInUsePublicationTakesNoKvWhenNoExtentCanEmpty), an in-service need
+// of bytes takes the one state in RAM alone: the older dead leaf and the
+// leaf a state on disk restores through stay, and no demotion starts.
+void testDeviceNeedKeepsKvBesideTheIndexRunway() {
+  Spilling spill;
+  const uint64_t needed = cacheChain(spill.cache, 1, 1).second[0];
+  spill.publishState(needed);
+  require(spill.cache.reclaimOneState(StateClass::Ordinary, false) && spill.cache.pollTransfers(),
+          "the leaf's state was not written");
+  static_cast<void>(cacheChain(spill.cache, 2, 3, true));
+  static_cast<void>(cacheChain(spill.cache, 3, 1));
+  const uint64_t held = cacheChain(spill.cache, 4, 3, true).second[2];
+  spill.cache.publishCompositeState(held, std::make_shared<TestState>(100), false);
+  require(spill.cache.reusablePages(ReclaimClass::Ordinary) == 2 &&
+              spill.cache.reusablePages(ReclaimClass::Ordinary, kv::PageForm::Index) == 4 &&
+              spill.pool.freePageCount(kv::PageForm::Index) == 4 && spill.tier.writes.empty(),
+          "fixture geometry changed");
+  const uint64_t cached = spill.cache.snapshot().pool.pagesPrefix;
+  const ClaimSpec claim{.cls = ClaimClass::InService};
+  const VictimQuery query{.claim = &claim, .need = {.bytes = 400}};
+  const std::optional<engine::Victim> unit = spill.cache.peek(query, nullptr);
+  require(unit && unit->stateBuffers == 1 && !unit->bytes && !unit->later,
+          "the walk weighed KV that empties no extent but the Index runway it keeps");
+  require(spill.cache.take(query, *unit).outcome == FreeOutcome::Met && !spill.cache.stateResident(held) &&
+              spill.cache.snapshot().pool.pagesPrefix == cached && spill.tier.writes.empty(),
+          "a device need took KV that empties no extent but the Index runway it keeps");
+  spill.cache.checkInvariants();
+  spill.cache.endRequest(2);
+  spill.cache.endRequest(4);
+}
+
+// A device need's walk takes the leaves that lead to an extent its KV can
+// empty, by their own page or one above them, and passes over the others,
+// which free no memory. Here the Index leaves of an idle spilled chain empty
+// an Index extent past the runway, while the Full pages requests hold leave
+// no Full extent to empty: the older dead Full leaf stays, and the unit
+// releases the Index extent.
+void testDeviceNeedPassesOverLeavesOfFormsOutOfReach() {
+  Spilling spill;
+  const std::vector<uint32_t> prompt = Spilling::prompt(1000, 6);
+  spill.start(1, prompt, 6);
+  static_cast<void>(test::spillRound(spill.cache, spill.tier));
+  spill.cache.endRequest(1);
+  // The chain's Full tail goes for its copy: its last spilled block is a
+  // leaf, which the lookup leaves newer than the dead Full leaf.
+  require(spill.cache.spillSnapshot().spilledPages == 4 &&
+              spill.cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::InUse).madeProgress,
+          "the idle spilled chain was not set up");
+  static_cast<void>(cacheChain(spill.cache, 2, 1));
+  static_cast<void>(spill.cache.lookup(prompt, {}));
+  static_cast<void>(cacheChain(spill.cache, 3, spill.pool.freePageCount(), true));
+  require(spill.pool.freePageCount() == 0 && spill.cache.reusablePages(ReclaimClass::Ordinary) == 2 &&
+              spill.cache.reusablePages(ReclaimClass::Ordinary, kv::PageForm::Index) == 8 &&
+              spill.pool.freePageCount(kv::PageForm::Index) == 4,
+          "fixture geometry changed");
+  const uint64_t extent = 4 * spill.storage.bytesPerPage(kv::PageForm::Index);
+  const ClaimSpec claim{.cls = ClaimClass::InService};
+  const VictimQuery query{.claim = &claim, .need = {.bytes = extent}};
+  const std::optional<engine::Victim> unit = spill.cache.peek(query, nullptr);
+  const uint64_t allocated = spill.pool.allocatedBytes();
+  require(unit && unit->bytes == extent && spill.cache.take(query, *unit).outcome == FreeOutcome::Met &&
+              allocated - spill.pool.allocatedBytes() == extent && spill.pool.freePageCount() == 0,
+          "a device need took a leaf of a form no extent of which its KV could empty");
+  spill.cache.checkInvariants();
+  spill.cache.endRequest(3);
+}
+
 // What a request may wait for counts only the free pages beyond those
 // waiting claims above it hold: with growth refused, a demotion in flight
 // freeing one page leaves the request short of the three pages held ones
@@ -6780,6 +6851,8 @@ int main() {
     testBurstReclaimTakesWholeExtentsOncePerNeed();
     testDeviceNeedReachesTheLeavesPastTheStates();
     testDeviceNeedWeighsALargeCacheAtOnce();
+    testDeviceNeedKeepsKvBesideTheIndexRunway();
+    testDeviceNeedPassesOverLeavesOfFormsOutOfReach();
     testHeldPagesAreNoRoomToWaitFor();
     testImmediateWalksOfferWhatLandsLaterInItsPlace();
     testImmediateDeviceWalkOffersWhatAWriteFreesFirst();
