@@ -66,8 +66,8 @@ Command prefill(const std::vector<uint32_t> &rows, uint32_t indexed = 0) {
   return command(WorkKind::Prefill, rows, indexed);
 }
 
-Command inPasses(uint32_t pass, uint32_t passes) {
-  Command result = prefill({kChunk});
+Command inPasses(uint32_t pass, uint32_t passes, uint32_t rows = kChunk) {
+  Command result = prefill({rows});
   result.plan.pass = pass;
   result.plan.passes = passes;
   return result;
@@ -214,9 +214,11 @@ void testABlockSparseLayerSaturatesAtTheSelectionAndTail() {
 }
 
 // A model of the defaults alone (Model::prefillWork, Model::commandLimits)
-// whose commands run in up to its 48 layers' passes.
+// whose commands hold a streamed target's group of four chunks and run in
+// up to its 48 layers' passes.
 class DefaultModel final : public model::Model {
 public:
+  uint32_t prefillGroupRows(bool) const noexcept override { return 4 * kChunk; }
   uint32_t prefillPasses() const noexcept override { return 48; }
   StateAdmission begin(const ModelRequest &) override { return {}; }
   void suspend(uint64_t) override {}
@@ -241,29 +243,27 @@ public:
 };
 
 // A target of 48 layers, every fourth attention, and a native window of
-// 262144 tokens (Qwen3.5-122B-A10B): a pass of 19 of a chunk at YaRN depth
-// past the window that runs an attention layer computes in it the pairs of
-// every row of the chunk, more than one layer may compute, as the whole
-// command does. Passes do not lower a layer's pairs; half the rows do.
-void testPassesDoNotLowerALayersAttentionPairs() {
+// 262144 tokens (Qwen3.5-122B-A10B): a group of 8192 rows at position
+// 70,000 computes in each attention layer more pairs than one layer may.
+// Every pass of 19 reports those of the heaviest layer of the target, the
+// passes that run no attention layer (layers 3, 7, ..., 47 attend) too, as
+// a pass does not split a layer; half the rows fit.
+void testLayerPairsIgnorePasses() {
   DefaultModel target;
-  constexpr uint32_t position = 300000;
+  constexpr uint32_t position = 70'000, rows = 4 * kChunk;
   const uint64_t layerBound = model::denseAttentionPairs(262144 - kChunk, kChunk);
-  const std::array<model::PrefillLane, 1> chunk{{{.position = position, .rows = kChunk}}};
-  const uint64_t whole = target.prefillWork(chunk, 0, 1).layerAttentionPairs;
-  require(whole == model::denseAttentionPairs(position, kChunk) && whole > layerBound,
-          "a chunk at YaRN depth did not compute its dense pairs in a layer");
+  const std::array<model::PrefillLane, 1> group{{{.position = position, .rows = rows}}};
+  const uint64_t whole = target.prefillWork(group, 0, 1).layerAttentionPairs;
+  require(whole == model::denseAttentionPairs(position, rows) && whole > layerBound,
+          "a group at position 70,000 did not compute its dense pairs in a layer");
   for (uint32_t pass = 0; pass < 19; ++pass) {
-    requireKeeps(inPasses(pass, 19), "a pass of 19 broke a rule of a 48-layer target", target.commandLimits());
-    // Layers 3, 7, ..., 47 attend: end / 4 of them lie below layer end.
-    const model::LayerRange layers = model::passLayers(pass, 19, 48);
-    if (layers.end / 4 > layers.first / 4)
-      require(target.prefillWork(chunk, pass, 19).layerAttentionPairs == whole,
-              "a pass of 19 lowered the attention pairs of the attention layer it runs");
+    requireKeeps(inPasses(pass, 19, rows), "a pass of 19 broke a rule of a 48-layer target", target.commandLimits());
+    require(target.prefillWork(group, pass, 19).layerAttentionPairs == whole,
+            "pass " + std::to_string(pass) + " of 19 did not report the heaviest attention layer's pairs");
   }
-  const std::array<model::PrefillLane, 1> half{{{.position = position, .rows = kChunk / 2}}};
+  const std::array<model::PrefillLane, 1> half{{{.position = position, .rows = rows / 2}}};
   require(target.prefillWork(half, 0, 1).layerAttentionPairs <= layerBound,
-          "half a chunk at YaRN depth computed more pairs than one layer may");
+          "half a group at position 70,000 computed more pairs than one layer may");
 }
 
 void testALoadRoutesFromTopKToEveryExpert() {
@@ -312,7 +312,7 @@ int main() {
     testDenseAttentionPairsAreEveryRowsKeys();
     testAWindowedLayerSaturatesAtItsWindow();
     testABlockSparseLayerSaturatesAtTheSelectionAndTail();
-    testPassesDoNotLowerALayersAttentionPairs();
+    testLayerPairsIgnorePasses();
     testALoadRoutesFromTopKToEveryExpert();
     testTheDefaultSampleIsTheTicketsTimes();
     std::cout << "model boundary tests passed\n";
