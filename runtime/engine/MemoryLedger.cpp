@@ -631,7 +631,9 @@ uint64_t MemoryLedger::takeUnsized(const VictimQuery &query) {
 // (`credited`) at least what free() leaves now: the room under the engine's
 // limit returns nothing to the host. State buffers the units free meet a
 // need of bytes once they leave the model's pool: the units that cost
-// nothing go again (a need in place keeps them).
+// nothing go again (a need in place keeps them). A claim that can wait,
+// short of units only with the room waiting claims ranked above it hold,
+// waits as their holds end (amend/M.md B14).
 FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeBytes, bool critical, bool deficit,
                                  std::optional<AccountId> growing, bool credited) {
   ClaimState &claim = claims_.at(id);
@@ -645,7 +647,8 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
   // may take by value; waiting claims ranked above it hold room it waits
   // for.
   const uint64_t growth = host ? 0 : heldForGrowth(growing, spec.cls);
-  const uint64_t held = host ? 0 : plus(growth, heldByClaims(spec.rank, id));
+  const uint64_t above = host ? 0 : heldByClaims(spec.rank, id);
+  const uint64_t held = plus(growth, above);
   const uint64_t forClaim = less(room, held);
   const uint64_t lackingBytes =
       need.hostRefused || !need.bytes
@@ -722,7 +725,13 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
                                           : FreeOutcome::Pending;
       result = {outcome, plus(result.nowBytes, taken.nowBytes), taken.laterBytes};
     } else {
-      result.outcome = waits(true) ? FreeOutcome::Pending : FreeOutcome::Short;
+      // Short only with the room waiting claims ranked above it hold, which
+      // its units would meet without, it waits for them, taking nothing, as
+      // for the room they hold (R2 step 1): short, a lane alone would end as
+      // if at its capacity (Engine::judge).
+      const bool heldAbove = canWait && lackingBytes && above &&
+                             plus(plus(run->bytes, creditBytes), above) >= lackingBytes;
+      result.outcome = waits(true) || heldAbove ? FreeOutcome::Pending : FreeOutcome::Short;
     }
   }
   // Pending: the claim waits, holding this need. Short: it waits for

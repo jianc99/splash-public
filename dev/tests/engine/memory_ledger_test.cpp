@@ -1471,6 +1471,36 @@ void testRoomHeldForHigherRanksMakesAWait() {
           "a claim the room held above it fits took a victim instead of waiting");
 }
 
+// So does one the units would meet but for the room waiting claims ranked
+// above it hold: with no room free, 1 GiB of cache meets a 1 GiB need, not
+// that and the 1 GiB held above it. It waits for them, taking nothing (R2
+// step 1); short, a lane alone would end as if at its capacity (judge).
+// One the units would not meet without that room either, a 2 GiB need, is
+// short, and so is one that cannot wait (Immediate).
+void testUnitsHeldForHigherRanksMakeAWait() {
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  cache.units = {unit(1, kGiB, 0.1)};
+  ledger.addSource(cache);
+  const ClaimId high = ledger.open(request(1, RequestPriority::Foreground));
+  waitForItsCopies(ledger, high, {.bytes = kGiB});
+  const ClaimId low = ledger.open(request(2, RequestPriority::Normal));
+  const FreeOutcome outcome = ledger.free(low, {.bytes = kGiB}, 0, false, false).outcome;
+  require(outcome == FreeOutcome::Pending && cache.taken.empty() && ledger.claim(low).waiting,
+          std::string("a claim the cache meets but for the room a waiting claim ranked above it holds found free() ") +
+              (outcome == FreeOutcome::Short ? "short" : outcome == FreeOutcome::Met ? "met" : "pending") +
+              ", " + std::to_string(cache.taken.size()) + " units taken");
+  const ClaimId larger = ledger.open(request(4, RequestPriority::Background));
+  require(ledger.free(larger, {.bytes = 2 * kGiB}, 0, false, false).outcome == FreeOutcome::Short &&
+              cache.taken.empty() && !ledger.claim(larger).waiting,
+          "a claim the cache does not meet without the room held above it either waited for that room");
+  ClaimSpec spec = request(3, RequestPriority::Normal);
+  spec.timing = NeedTiming::Immediate;
+  const ClaimId now = ledger.open(spec);
+  require(ledger.free(now, {.bytes = kGiB}, 0, false, false).outcome == FreeOutcome::Short && cache.taken.empty(),
+          "an Immediate claim waited behind the room held above it");
+}
+
 // Landings first, then the cheapest victims, then owed copies: a need the
 // landing bytes do not meet takes a victim before it waits for another
 // lane's write-through (the base's escalate waited on owed copies first,
@@ -2281,8 +2311,9 @@ void testDisplacementTakesNothingItCannotGrowInto() {
 // ranked above it hold, beyond the room. With 512 MiB free and 1 GiB held
 // above it, a 1 GiB claim lacks 1.5 GiB: 1 GiB of cache does not meet it,
 // so it takes nothing (sized at its 1 GiB it took the cache for an
-// allocation admission refused), available() counts 512 MiB, and with
-// another 1 GiB of cache it takes both.
+// allocation admission refused) and waits for the claim above it,
+// available() counts 512 MiB, and with another 1 GiB of cache it takes
+// both.
 void testAClaimLacksTheRoomHeldAboveIt() {
   MemoryLedger ledger;
   TestSource cache("cache");
@@ -2294,9 +2325,9 @@ void testAClaimLacksTheRoomHeldAboveIt() {
   const ClaimId low = ledger.open(spec);
   require(ledger.available(spec, kGiB, 512 * kMiB, false, false) == 512 * kMiB,
           "available() counted the room the claim above holds");
-  require(ledger.free(low, {.bytes = kGiB}, 512 * kMiB, false, false).outcome == FreeOutcome::Short &&
+  require(ledger.free(low, {.bytes = kGiB}, 512 * kMiB, false, false).outcome == FreeOutcome::Pending &&
               cache.taken.empty(),
-          "the claim took cache for an allocation the room held above it refuses");
+          "the claim took cache for an allocation the room held above it refuses, or did not wait for it");
   cache.units.push_back(unit(2, kGiB, 0.1));
   require(ledger.free(low, {.bytes = kGiB}, 512 * kMiB, false, false).outcome == FreeOutcome::Met &&
               cache.taken.size() == 2,
@@ -3160,6 +3191,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testAStartTakesAnIdleCacheOnlyWhereItIsCheaper", testAStartTakesAnIdleCacheOnlyWhereItIsCheaper},
       {"testShortTakesNothing", testShortTakesNothing},
       {"testRoomHeldForHigherRanksMakesAWait", testRoomHeldForHigherRanksMakesAWait},
+      {"testUnitsHeldForHigherRanksMakeAWait", testUnitsHeldForHigherRanksMakeAWait},
       {"testLandingThenVictimsThenOwed", testLandingThenVictimsThenOwed},
       {"testImmediateSkipsLandings", testImmediateSkipsLandings},
       {"testLandingCountsBeforeVictimsInPart", testLandingCountsBeforeVictimsInPart},
