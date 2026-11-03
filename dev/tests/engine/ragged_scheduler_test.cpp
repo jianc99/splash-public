@@ -726,6 +726,46 @@ void testContendedPrefillCountsTheUnitsPlanningBounds() {
           "a unit beside a decoder of its priority was not counted once");
 }
 
+// contended_prefill_ms' quantiles are the units' own times to within a
+// millisecond, never above the longest (amend/V.md A09's G4a judges its p95).
+// Units sized to the 500 ms gap fall either side of a log-2 microsecond edge,
+// 524.288 ms, where reading a quantile as its bucket's upper edge put smoke
+// b's churn p95 at 1048.576 ms. 17 units of 510 ms and 3 of 600 ms (15 %).
+void testContendedPrefillQuantilesAreTheUnitsTimes() {
+  DenseSim sim;
+  sim.decoder(1);
+  sim.lane(2, 0, 200'000);
+  for (uint32_t unit = 0; unit < 20; ++unit) {
+    while (sim.plan().kind == WorkKind::Decode)
+      completeDecode(sim);
+    completePrefill(sim, sim.plan(), {.wallMilliseconds = unit < 17 ? 510.0 : 600.0});
+  }
+  const model::LatencyStats units = sim.scheduler.snapshot().contendedPrefill;
+  require(units.count == 20 && units.maximumMilliseconds == 600.0 && units.p50Milliseconds >= 510.0 &&
+              units.p50Milliseconds <= 511.0 && units.p95Milliseconds == 600.0 && units.p99Milliseconds == 600.0,
+          "contended units of 510 and 600 ms read p50 " + std::to_string(units.p50Milliseconds) + ", p95 " +
+              std::to_string(units.p95Milliseconds) + ", p99 " + std::to_string(units.p99Milliseconds) +
+              ", max " + std::to_string(units.maximumMilliseconds) + " over " + std::to_string(units.count));
+}
+
+// Units past contended_prefill_ms' millisecond buckets (4.094 s) read as the
+// longest: units of 1, 4500 and 6000 ms read a p50 of 6000.
+void testContendedPrefillPastItsBucketsReadsTheLongest() {
+  DenseSim sim;
+  sim.decoder(1);
+  sim.lane(2, 0, 200'000);
+  for (const double wall : {1.0, 4500.0, 6000.0}) {
+    while (sim.plan().kind == WorkKind::Decode)
+      completeDecode(sim);
+    completePrefill(sim, sim.plan(), {.wallMilliseconds = wall});
+  }
+  const model::LatencyStats units = sim.scheduler.snapshot().contendedPrefill;
+  require(units.count == 3 && units.p50Milliseconds == 6000.0 && units.p95Milliseconds == 6000.0 &&
+              units.maximumMilliseconds == 6000.0,
+          "contended units of 1, 4500 and 6000 ms read p50 " + std::to_string(units.p50Milliseconds) + ", p95 " +
+              std::to_string(units.p95Milliseconds) + ", max " + std::to_string(units.maximumMilliseconds));
+}
+
 // Behaviour change 7: a ready peer of its priority, with no decoder, does
 // not bound a lane that streams its history: the Spill lane leads a group's
 // rows beside a long Resident prompt as it does alone, and on a store-less
@@ -2731,6 +2771,8 @@ constexpr test::TestCase kTests[] = {
     {"testALowerPrioritysDecodeDoesNotBoundAPrefill", testALowerPrioritysDecodeDoesNotBoundAPrefill},
     {"testWaitingOrPrefillingPeersDoNotBoundAPrefill", testWaitingOrPrefillingPeersDoNotBoundAPrefill},
     {"testContendedPrefillCountsTheUnitsPlanningBounds", testContendedPrefillCountsTheUnitsPlanningBounds},
+    {"testContendedPrefillQuantilesAreTheUnitsTimes", testContendedPrefillQuantilesAreTheUnitsTimes},
+    {"testContendedPrefillPastItsBucketsReadsTheLongest", testContendedPrefillPastItsBucketsReadsTheLongest},
     {"testAReadyPeerDoesNotBoundAStreamingLeader", testAReadyPeerDoesNotBoundAStreamingLeader},
     {"testUntimedOrAuxiliaryUnitsTrainNothing", testUntimedOrAuxiliaryUnitsTrainNothing},
     {"testACommandHoldsOneLanePastAChunk", testACommandHoldsOneLanePastAChunk},

@@ -895,11 +895,12 @@ class GateTests(unittest.TestCase):
         self.assertAlmostEqual(facts["client_gap_p50_s"], 0.1)
 
     def test_g4a_reads_no_quantile_above_the_largest_unit(self):
-        # LatencyHistogram reports a quantile as its log2 bucket's upper edge,
-        # never clamped to the largest value it holds: smoke-a-27b-churn-A1's
-        # decode_gap_ms p95 read 1048.576 with max 609.03. A contended p95
-        # read as 1048.576 whose largest unit took 900 ms is within the
-        # 960 ms limit.
+        # Trees before contended_prefill_ms' FineLatencyHistogram report it
+        # as LatencyHistogram does, a quantile as its log2 bucket's upper
+        # edge, never clamped to the largest value it holds:
+        # smoke-a-27b-churn-A1's decode_gap_ms p95 read 1048.576 with max
+        # 609.03. A contended p95 read as 1048.576 whose largest unit took
+        # 900 ms is within the 960 ms limit.
         samples = [
             self.schema7(0),
             self.schema7(

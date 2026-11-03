@@ -920,9 +920,10 @@ def gap_bound(status: dict, share: float) -> dict | None:
     the units term of its last prefill estimate, and that estimate's p95
     relative error (schema 7; None for older trees, and while the scheduler
     reports no target: the contract renders it 0 until a scheduler sets it).
-    The contended units' p95 is a LatencyHistogram quantile, its log2
-    bucket's upper edge (runtime/model/LatencyHistogram.hpp), so it is read
-    no higher than the largest unit."""
+    The contended units' p95 is within a millisecond above theirs and no
+    higher than the largest (FineLatencyHistogram,
+    runtime/model/LatencyHistogram.hpp); trees before it report a log2
+    bucket's upper edge, so it is read no higher than the largest unit."""
     scheduler = status.get("scheduler") or {}
     target, estimate = (
         scheduler.get("decode_gap_target_ms"),

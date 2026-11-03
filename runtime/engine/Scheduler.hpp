@@ -136,7 +136,7 @@ struct SchedulerSnapshot final {
   double decodeGapTargetMilliseconds = 0.0;
   // The wall time of each prefill unit, a command or one pass of it, that ran
   // while a lane of its priority or a higher one decoded: what the target
-  // bounds.
+  // bounds, its quantiles within a millisecond (model::FineLatencyHistogram).
   model::LatencyStats contendedPrefill;
   // Prefill units run; commands that ran in passes, and those a superseding
   // plan abandoned between passes; plans whose rows were halved because
@@ -425,7 +425,7 @@ private:
   double decodeDebtMilliseconds_ = 0.0;
   std::optional<WorkKind> lastCommittedKind_;
   SchedulerSnapshot counters_;
-  model::LatencyHistogram contendedPrefill_;
+  model::FineLatencyHistogram contendedPrefill_;
 };
 
 } // namespace splash::engine
