@@ -91,19 +91,21 @@ std::optional<std::pair<double, double>> VerifyBudget::line(uint32_t lanes, bool
   return std::pair{meanTime - slope * meanRows, slope};
 }
 
-std::optional<double> VerifyBudget::price(uint32_t lanes, bool constrained, uint32_t rows) const {
-  const auto fit = line(lanes, constrained);
-  if (!fit)
-    return std::nullopt;
-  const Cost &cost = table(lanes, constrained);
-  return std::max(fit->first + fit->second * rows, kCostFloor * cost.time / cost.weight);
-}
-
 std::array<float, VerifyBudget::kBlockRows * VerifyBudget::kLanes + 1>
 VerifyBudget::costs(uint32_t lanes, bool constrained) const {
+  const uint32_t first = lanes, last = lanes * kBlockRows;
   std::array<float, kBlockRows * kLanes + 1> result{};
-  for (uint32_t rows = lanes; rows <= lanes * kBlockRows; ++rows)
-    result[rows] = static_cast<float>(price(lanes, constrained, rows).value_or(seed(lanes, rows)));
+  const auto fit = line(lanes, constrained);
+  if (!fit) {
+    for (uint32_t rows = first; rows <= last; ++rows)
+      result[rows] = static_cast<float>(seed(lanes, rows));
+    return result;
+  }
+  const Cost &cost = table(lanes, constrained);
+  // Nondecreasing and positive: a negative intercept leaves the fewest rows
+  // a twentieth of the mean.
+  for (uint32_t rows = first; rows <= last; ++rows)
+    result[rows] = static_cast<float>(std::max(fit->first + fit->second * rows, 0.05 * cost.time / cost.weight));
   return result;
 }
 
@@ -124,8 +126,10 @@ void VerifyBudget::observe(std::span<const Lane> lanes, bool constrained, double
   const uint32_t count = static_cast<uint32_t>(lanes.size());
   ++tableCycles_[constrained ? 1 : 0][count - 1];
   if (std::isfinite(milliseconds) && milliseconds > 0.0) {
-    if (const auto expected = price(count, constrained, rows))
-      milliseconds = std::clamp(milliseconds, 0.5 * *expected, 2.0 * *expected);
+    if (const auto fit = line(count, constrained)) {
+      const double expected = std::max(fit->first + fit->second * rows, 1.0e-3);
+      milliseconds = std::clamp(milliseconds, 0.5 * expected, 2.0 * expected);
+    }
     Cost &cost = tables_[constrained ? 1 : 0][count - 1];
     cost.weight = kDecay * cost.weight + 1.0;
     cost.rows = kDecay * cost.rows + rows;

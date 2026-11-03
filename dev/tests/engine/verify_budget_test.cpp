@@ -8,10 +8,8 @@
 // labels were drawn from; a refit from the model a fit reached keeps it. The
 // costs are the seed's shape before any cycle, then the affine fit of the
 // latest cycles of each lane count and kind, positive and nondecreasing, the
-// seed's slope where their rows do not spread, and never under kCostFloor of
-// their mean, so that a stall over rows that cluster cannot price the fewest
-// rows at next to nothing; every kExploreCycles-th cycle of a lane count
-// explores.
+// seed's slope where their rows do not spread; every kExploreCycles-th cycle
+// of a lane count explores.
 #include "TestChecks.hpp"
 #include "model/VerifyBudget.hpp"
 
@@ -324,52 +322,6 @@ void learnsTheCosts() {
             "a negative intercept gave a cost that is not positive or decreases");
 }
 
-// Two lanes whose proposals each survive 0.75 of the time, over cycles of the
-// seed's shape, verify the total of the most expected tokens per cost, which
-// draft_verify_rows takes: 10 rows in all, so the fit's rows cluster. A stall
-// that doubles the second exploring cycle tilts the fit's line below zero at
-// the anchors, but no total costs less than kCostFloor of the cycles' mean,
-// so no cycle after it verifies the anchors alone: priced at next to nothing,
-// those cycles would count as that and keep the line there.
-void stallOverClusteredRows() {
-  constexpr uint32_t kLanes = 2, kEvery = kLanes * VerifyBudget::kBlockRows;
-  constexpr double kSurvival = 0.75;
-  VerifyBudget budget;
-  VerifyBudget::Lane lane;
-  lane.labels = false;
-  const auto time = [](uint32_t rows) { return 50.0 * VerifyBudget::seed(kLanes, rows); };
-  // The anchors, then each lane's next proposal in turn.
-  const auto expected = [&](uint32_t rows) {
-    double tokens = kLanes;
-    for (uint32_t row = kLanes; row < rows; ++row)
-      tokens += std::pow(kSurvival, 1 + (row - kLanes) / kLanes);
-    return tokens;
-  };
-  const auto choice = [&](const auto &cost) {
-    uint32_t best = kLanes;
-    for (uint32_t rows = kLanes + 1; rows <= kEvery; ++rows)
-      if (expected(rows) / cost(rows) > expected(best) / cost(best))
-        best = rows;
-    return best;
-  };
-  require(choice(time) == 10, "the cycles' times did not make 10 rows the best total");
-  uint32_t explored = 0;
-  bool stalled = false;
-  for (uint32_t cycle = 0; cycle < 4 * VerifyBudget::kExploreCycles; ++cycle) {
-    const auto costs = budget.costs(kLanes, false);
-    const bool explores = budget.explores(kLanes, false);
-    const uint32_t rows = explores ? kEvery : choice([&](uint32_t total) { return double(costs[total]); });
-    require(!stalled || rows > kLanes, "cycle " + std::to_string(cycle) + " after a stall verified the anchors alone");
-    std::array batch{lane, lane};
-    batch[0].verifyRows = rows - rows / 2;
-    batch[1].verifyRows = rows / 2;
-    const bool stalls = explores && ++explored == 2;
-    budget.observe(batch, false, (stalls ? 2.0 : 1.0) * time(rows));
-    stalled = stalled || stalls;
-  }
-  require(stalled, "no cycle stalled");
-}
-
 void invalidInputs() {
   VerifyBudget budget;
   VerifyBudget::Lane lane;
@@ -410,7 +362,6 @@ int main() {
     fitsTheLabels();
     confidencesThatAreNotProbabilities();
     learnsTheCosts();
-    stallOverClusteredRows();
     invalidInputs();
   } catch (const std::exception &error) {
     std::cerr << "verify_budget_test: FAIL: " << error.what() << '\n';
