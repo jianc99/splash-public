@@ -117,6 +117,9 @@ struct SchedulerSnapshot final {
   uint32_t waitingMask = 0;
   uint32_t terminal = 0;
   uint64_t prefillBatches = 0;
+  // The prefill commands' rows, a command's with its first pass, as 1.5.0
+  // counts them (the matrix's work); rows its lanes plan again after it was
+  // abandoned between its passes count once.
   uint64_t prefillRows = 0;
   uint64_t decodeBatches = 0;
   std::array<uint64_t, model::ExecutionLimits::maximumBatchWidth>
@@ -266,6 +269,10 @@ private:
     // which it stays overdue.
     double waitedMilliseconds = 0.0;
     bool overdue = false;
+    // The prompt position its committed rows reach in prefillRows, which
+    // rows planned again after their command was abandoned between its
+    // passes do not pass; a resume's replay counts from its start again.
+    uint32_t rowsCounted = 0;
   };
 
   // A prefill lane as planning weighs it.

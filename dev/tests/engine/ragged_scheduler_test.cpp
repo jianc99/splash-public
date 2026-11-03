@@ -1785,6 +1785,43 @@ void testCommandBetweenPassesHoldsItsLanes() {
           "a lane suspended between its command's passes did not run its rows again with the others");
 }
 
+// A command's rows count once, with its first pass, in prefill_rows, the
+// work the matrix compares with 1.5.0, which counts them so: the rows its
+// lanes plan again after it was abandoned between its passes counted
+// already. A lane suspended between its command's passes replays its rows
+// once it resumes, and those count again, as 1.5.0's replays do.
+void testAnAbandonedCommandsRowsCountOnce() {
+  Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+  sim.seed();
+  sim.lane(1, 0, 3 * 8192);
+  sim.run(sim.plan());
+  require(sim.passes.has_value(), "the long command did not run in passes");
+  sim.lane(2, 8192, 300);
+  require(sim.scheduler.abandonsPasses(sim.plan(), sim.in()), "the turn did not supersede the long command");
+  while (sim.scheduler.phase(1) == Phase::Prefill || sim.scheduler.phase(2) == Phase::Prefill)
+    sim.step();
+  const SchedulerSnapshot counts = sim.scheduler.snapshot();
+  require(counts.abandonedPassCommands > 0 && counts.prefillRows == 3 * 8192 + 300,
+          std::to_string(counts.prefillRows) + " rows counted for the prompts' " + std::to_string(3 * 8192 + 300) +
+              " after " + std::to_string(counts.abandonedPassCommands) + " abandoned commands");
+  sim.lane(3, 0, 8192);
+  BatchPlan plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  sim.run(plan);
+  require(sim.passes.has_value(), "the contended command did not run in passes");
+  const uint64_t counted = sim.scheduler.snapshot().prefillRows;
+  sim.abandon();
+  sim.scheduler.suspendForResources(3);
+  sim.scheduler.resumeFromResources(3, 0, 8192);
+  while (sim.scheduler.phase(3) == Phase::Prefill)
+    sim.step();
+  require(sim.scheduler.snapshot().prefillRows == counted + 8192,
+          "a replay counted " + std::to_string(sim.scheduler.snapshot().prefillRows - counted) + " of its 8192 rows");
+}
+
 // A higher priority's decode does not abandon a command between its passes,
 // which goes on with its next pass after it; a higher priority's prompt
 // early in the command supersedes it, cannot commit beside it, and once it
@@ -1988,6 +2025,7 @@ constexpr test::TestCase kTests[] = {
     {"testOnlyAHeldStartLiftsTheCommand", testOnlyAHeldStartLiftsTheCommand},
     {"testRepeatedSupersedesEndOnceTheLongLaneIsOverdue", testRepeatedSupersedesEndOnceTheLongLaneIsOverdue},
     {"testCommandBetweenPassesHoldsItsLanes", testCommandBetweenPassesHoldsItsLanes},
+    {"testAnAbandonedCommandsRowsCountOnce", testAnAbandonedCommandsRowsCountOnce},
     {"testPassesYieldToAHigherPriority", testPassesYieldToAHigherPriority},
     {"testACommandRunsAtThePriorityOfWhatItHoldsBack", testACommandRunsAtThePriorityOfWhatItHoldsBack},
     {"testImageEncodesStayOutOfAPassedCommandsEstimate", testImageEncodesStayOutOfAPassedCommandsEstimate},
