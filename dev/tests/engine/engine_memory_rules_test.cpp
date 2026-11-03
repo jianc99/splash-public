@@ -21,6 +21,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <span>
 #include <string>
 #include <string_view>
@@ -35,6 +36,7 @@ using splash::test::HarnessOptions;
 using splash::test::guardReleases;
 using splash::test::idle;
 using splash::test::request;
+using splash::test::runUntilIdle;
 using splash::test::Spilling;
 
 namespace {
@@ -531,6 +533,81 @@ void testAReplayPointBesideACheckpointIsReservedInAClaim() {
               std::to_string(passes.model.heldStateBytes));
 }
 
+// A junction is worth the prefill it saves a later request that branches
+// there, the rows since the state boundary before it, as a checkpoint is
+// worth what a recovery computes again without it: refused its buffers at
+// the engine's limit, its capture takes nothing that costs more than that
+// (amend/M.md B2: Optional claims take pool units while they cost less than
+// their benefit), neither a unit of the expert store nor a state of a
+// conversation whose turns resume from it, worth its rows at their reuse.
+void testAJunctionTakesNothingWorthMoreThanItSaves() {
+  test::GovernedHost host;
+  test::TestKvStorage storage(512, 4096, 4);
+  KvPool pool(storage, 0);
+  engine::Cache cache(pool, nullptr, nullptr);
+  Executor model(1);
+  Events events;
+  engine::Engine engine(host.connect({}), cache, model, events);
+  guardReleases(storage, engine);
+  test::seedAsStartup(engine, model);
+  test::FakeElasticPool experts("experts", host.memory, 1ULL << 20, 0, 2, 4, 2, 0.25, 0.0);
+  MemoryLedger &ledger = host.governor.ledger();
+  std::string decisions;
+  ledger.setDecisionLog([&](std::string_view line) { decisions += std::string(line) + "\n"; });
+  static_cast<void>(ledger.addPool(experts));
+  // Decode misses the store's units would serve, many a second.
+  for (double seconds = 0.5; seconds <= 10.0; seconds += 0.5) {
+    experts.served(0, 1'000'000, 0, 0);
+    ledger.observePools(seconds, true);
+  }
+  // One prefill chunk every prompt shares, then a conversation of its own:
+  // a branch off the cached conversation plans a junction at 2048.
+  const auto branch = [](uint32_t token, uint32_t own) {
+    std::vector<uint32_t> prompt(model::ExecutionLimits::prefillTokenBudget);
+    std::iota(prompt.begin(), prompt.end(), 1);
+    prompt.resize(prompt.size() + own, token);
+    return prompt;
+  };
+  // The conversation, then three turns that resume from its state at 6144,
+  // the last decoding meanwhile, its state in use: three of the four
+  // probes hit, which the control pass's rates price its states by.
+  const std::vector<uint32_t> conversation = branch(777, 4097);
+  double now = 1;
+  engine.refreshMemoryRates(now);
+  for (const uint64_t id : {5, 8, 9}) {
+    EngineRequest value = request(id, conversation);
+    value.deadlineMilliseconds = 1e9;
+    engine.submit(std::move(value));
+    test::tickUntil(engine, now, [&] { return idle(engine); }, "the conversation did not end");
+  }
+  model.decodeFinishes = false;
+  EngineRequest turn = request(7, conversation);
+  turn.maxNewTokens = 200;
+  turn.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(turn));
+  test::tickUntil(engine, now, [&] { return events.outputs.contains(7); }, "the next turn did not decode");
+  engine.refreshMemoryRates(now);
+  const StateCacheSnapshot before = cache.snapshot().stateCache;
+  // The junction's buffers ask the engine's limit for more than the room.
+  bool junction = true;
+  model.reservationRoom = [&] {
+    return !std::exchange(junction, false) || static_cast<bool>(host.reserve(512 * 1024));
+  };
+  host.leaveRoom(0);
+  EngineRequest branched = request(6, branch(888, 65));
+  branched.deadlineMilliseconds = 1e9;
+  engine.submit(std::move(branched));
+  test::tickUntil(engine, now, [&] { return idle(engine); }, "the requests did not end");
+  host.leaveRoom(std::nullopt);
+  const StateCacheSnapshot after = cache.snapshot().stateCache;
+  require(!junction, "the branch planned no junction");
+  require(experts.shrinks == 0 && after.evictions == before.evictions && events.failedCount == 0 &&
+              events.completedCount == 5,
+          "a junction's capture took what is worth more than the prefill it saves: " +
+              std::to_string(experts.shrinks) + " store units, " + std::to_string(after.evictions - before.evictions) +
+              " states\n" + decisions);
+}
+
 } // namespace
 
 std::span<const test::TestCase> rulesTests() {
@@ -544,6 +621,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testPlacementOncePerCandidatePerState", testPlacementOncePerCandidatePerState},
       {"testARestoredStateIsPromotedInAClaim", testARestoredStateIsPromotedInAClaim},
       {"testAReplayPointBesideACheckpointIsReservedInAClaim", testAReplayPointBesideACheckpointIsReservedInAClaim},
+      {"testAJunctionTakesNothingWorthMoreThanItSaves", testAJunctionTakesNothingWorthMoreThanItSaves},
   };
   return kTests;
 }

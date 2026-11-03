@@ -716,9 +716,12 @@ ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, uint32_t to
     // back, and takes what is in use last (amend/M.md B6).
     spec.reach = ReclaimClass::InUse;
     break;
-  case StateClass::Checkpoint: {
+  case StateClass::Checkpoint:
+  case StateClass::Ordinary: {
     // A checkpoint is worth the rows since the state boundary before it,
-    // which a recovery would compute again without it.
+    // which a recovery would compute again without it; a junction or a
+    // shared prefix's state the same rows, which a later request that
+    // resumes from it does not compute.
     spec.timing = NeedTiming::Immediate;
     uint32_t since = 0;
     for (const Request::StateBoundary &boundary : active.stateBoundaries)
@@ -728,9 +731,6 @@ ClaimSpec Engine::stateClaim(const Request &active, StateClass kind, uint32_t to
     spec.benefitSeconds = scheduler_.prefillMilliseconds(model_.prefillWork({&lane, 1}, 0, 1)) / 1000.0;
     break;
   }
-  case StateClass::Ordinary:
-    spec.timing = NeedTiming::Immediate;
-    break;
   }
   return spec;
 }

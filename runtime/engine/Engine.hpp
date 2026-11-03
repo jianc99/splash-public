@@ -786,9 +786,9 @@ private:
   // The claim of a state's buffers of class `kind` at `tokens` (amend/M.md
   // B6): the prompt's replay point, the state the request's next turn
   // resumes from, is work in service that may wait for memory on its way
-  // back and reaches what is in use; a checkpoint is Optional and takes
-  // nothing that costs more than computing its rows again; a junction or
-  // an ordinary state is Optional too, within what frees memory at once.
+  // back and reaches what is in use; a checkpoint, a junction or an
+  // ordinary state is Optional, within what frees memory at once, and takes
+  // nothing that costs more than computing its rows again.
   [[nodiscard]] ClaimSpec stateClaim(const Request &request, StateClass kind, uint32_t tokens,
                                      bool supersedes) const;
   // The victims that are the engine's decisions, in this order (amend/M.md
