@@ -163,7 +163,9 @@ struct Victim final {
   uint32_t stateBuffers = 0;    // pooled state buffers it frees (in-place needs; bytes, setBufferBytes)
   bool later = false;           // frees on a landing (a demotion, a state write, a conversion's copies)
   bool certainReuse = false;    // in use, the newest resume point, a chain a queued request restores
-  bool sized = true;            // false: a unit that costs nothing and whose size is known only when taken
+  // false: a unit that costs nothing, taken before any dry run, whose
+  // bytes are at least what peek gives (available() counts them)
+  bool sized = true;
   ReclaimClass cls = ReclaimClass::Ordinary;
   UnitCost cost;
   VictimKind kind = VictimKind::Memory;

@@ -933,15 +933,16 @@ std::vector<Victim> Engine::EngineVictims::conversions(const VictimQuery &query)
 }
 
 std::optional<Victim> Engine::EngineVictims::peek(const VictimQuery &query, const Victim *after) const {
-  // The idle state buffers, sized as they go.
+  // The idle state buffers, taken as they go, of at least the bytes the
+  // pool releases short of critical pressure.
+  const Engine &engine = engine_;
   if (!after)
-    return Victim{.sized = false};
+    return Victim{.bytes = engine.model_.idleBufferBytes(0), .sized = false};
   // Then the command between its passes, none of whose passes is in flight,
   // for work that supersedes it: the buffers its captures hold, which the
   // ledger counts as bytes for a need of bytes. It costs that work nothing,
   // and comes before the conversions, which cost their lanes the spill
   // penalty (the base took it before any conversion).
-  const Engine &engine = engine_;
   if (after->kind == VictimKind::Memory && engine.passCommand_ && !engine.pending_ && query.claim &&
       query.claim->supersedes) {
     uint32_t buffers = 0;

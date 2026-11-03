@@ -1266,6 +1266,27 @@ void testAvailableTakesNothing() {
   require(cache.taken.empty() && pool.units() == 3 && pool.shrinks == 0, "available() took something");
 }
 
+// available() is R2's steps 0-2 as a dry run (design/M.md R5): for a claim
+// that can wait, what lands and the copies its own request owes count
+// before any victim, as free() counts them; an Immediate claim counts
+// neither.
+void testAvailableCountsWhatLandsForAClaimThatCanWait() {
+  MemoryLedger ledger;
+  TestSource cache("cache");
+  cache.units = {unit(1, 256 * kMiB, 0.1)};
+  ledger.addSource(cache);
+  ledger.setReturning([] { return Returning{.landingBytes = 512 * kMiB}; },
+                      [](uint64_t id) { return id == 1 ? Returning{.owedBytes = 128 * kMiB} : Returning{}; });
+  const ClaimSpec start = request(1, RequestPriority::Normal, ClaimClass::Start);
+  require(ledger.available(start, 2 * kGiB, 128 * kMiB, false, false) == 1024 * kMiB,
+          "available() did not count what lands and the copies the request owes before its victims");
+  ClaimSpec immediate = start;
+  immediate.timing = NeedTiming::Immediate;
+  require(ledger.available(immediate, 2 * kGiB, 128 * kMiB, false, false) == 384 * kMiB,
+          "available() counted what lands for a claim that cannot wait");
+  require(cache.taken.empty(), "available() took something");
+}
+
 // Free room beyond the lanes' projected growth goes to the pools at once,
 // whatever their value, while no claim has taken their units (T3).
 void testGrowthRetakesFreeRoomBeyondLaneDemand() {
@@ -2158,6 +2179,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testZeroCostUnsizedUnitsGoFirst", testZeroCostUnsizedUnitsGoFirst},
       {"testBenefitBoundsTheDryRun", testBenefitBoundsTheDryRun},
       {"testAvailableTakesNothing", testAvailableTakesNothing},
+      {"testAvailableCountsWhatLandsForAClaimThatCanWait", testAvailableCountsWhatLandsForAClaimThatCanWait},
       {"testGrowthRetakesFreeRoomBeyondLaneDemand", testGrowthRetakesFreeRoomBeyondLaneDemand},
       {"testNoPingPongWhileALaneGrows", testNoPingPongWhileALaneGrows},
       {"testDisplacementNeedsValueAboveCycle", testDisplacementNeedsValueAboveCycle},

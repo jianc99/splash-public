@@ -2042,6 +2042,32 @@ void testAnAdmissionPlacesTheNextCandidateAgain() {
               std::to_string(counts.resident) + " Resident, " + std::to_string(counts.spill) + " Spill");
 }
 
+// Placement counts what its start's claim frees before any victim
+// (design/M.md R5: R2's steps 0-2 as a dry run): the model's idle state
+// buffers beyond those a lane starts from, which cost nothing. A prompt of
+// 17 Full pages (1,700 bytes), in a room of 1,500 bytes beside 1,000 bytes
+// of idle buffers, starts Resident.
+void testPlacementCountsIdleStateBuffers() {
+  Spilling spill(Spilling::Governed{}, 1024, false);
+  spill.host.bookStates(spill.model);
+  spill.host.memory.hold("states", 1'000);
+  spill.model.heldStateBytes += 1'000;
+  spill.model.reclaimableIdleStateBytes = 1'000;
+  spill.limit(spill.held() + 1'500);
+  spill.engine.submit(Spilling::prompt(1, 1, 16, 1));
+  spill.runUntil(
+      [&] {
+        const SpillRequestsSnapshot started = spill.engine.snapshot().spill;
+        return started.resident + started.spill == 1;
+      },
+      "the prompt did not start");
+  spill.limit(Spilling::kGovernedLimitBytes);
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(counts.resident == 1 && counts.spill == 0 && spill.events.failedCount == 0,
+          "a prompt the room held beside the idle state buffers spilled");
+}
+
 // A start's Resident KV less what it holds already (design/M.md R5's
 // "- held"): the pages of the chain it restores that are in memory, which
 // its start takes in place (Cache::restoreRequest), are not room it must
@@ -2137,6 +2163,7 @@ std::span<const test::TestCase> spillTests() {
       {"testPlacementSpillsWhatTheLiveRoomCannotHold", testPlacementSpillsWhatTheLiveRoomCannotHold},
       {"testPlacementNeverSpillsWhenSpillTakesMore", testPlacementNeverSpillsWhenSpillTakesMore},
       {"testAnAdmissionPlacesTheNextCandidateAgain", testAnAdmissionPlacesTheNextCandidateAgain},
+      {"testPlacementCountsIdleStateBuffers", testPlacementCountsIdleStateBuffers},
       {"testPlacementCountsTheChainItRestoresInMemory", testPlacementCountsTheChainItRestoresInMemory},
       {"testSpillDecodeTermIsMeasured", testSpillDecodeTermIsMeasured},
       {"testUnwritableTierKeepsRequestsResident", testUnwritableTierKeepsRequestsResident},

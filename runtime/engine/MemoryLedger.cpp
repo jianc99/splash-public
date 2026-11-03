@@ -690,12 +690,22 @@ FreeResult MemoryLedger::freeFor(uint32_t id, const Need &need, uint64_t freeByt
   return result;
 }
 
+// R2's steps 0-2 as a dry run: the units that cost nothing and are sized
+// only when taken count as their sources size them now (peek), and for a
+// claim that can wait what lands and the copies its own request owes count
+// before victims, as free() counts them.
 uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_t freeBytes, bool critical,
                                  bool deficit) const {
-  const uint64_t held = spec.cls == ClaimClass::Host
-                            ? 0
-                            : plus(heldForGrowth(std::nullopt, spec.cls), heldByClaims(spec.rank, std::nullopt));
-  const uint64_t room = spec.cls == ClaimClass::Host ? 0 : freeBytes;
+  const bool host = spec.cls == ClaimClass::Host;
+  const uint64_t held =
+      host ? 0 : plus(heldForGrowth(std::nullopt, spec.cls), heldByClaims(spec.rank, std::nullopt));
+  uint64_t landing = 0;
+  if (!host && spec.timing == NeedTiming::CanWait && spec.cls != ClaimClass::Growth) {
+    landing = returning().landingBytes;
+    if (returningFor_ && spec.requestId)
+      landing = plus(landing, returningFor_(spec.requestId).owedBytes);
+  }
+  const uint64_t room = host ? 0 : plus(freeBytes, landing);
   if (less(room, held) >= enough)
     return enough;
   const VictimQuery query{.claim = &spec, .need = {.bytes = enough}, .critical = critical, .rates = &rates_,
