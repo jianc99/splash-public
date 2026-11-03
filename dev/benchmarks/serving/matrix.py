@@ -906,7 +906,10 @@ def gap_bound(status: dict, share: float) -> dict | None:
     """amend/V.md A09: the run's own decode gap bound max(G, u/share) with u
     the units term of its last prefill estimate, and that estimate's p95
     relative error (schema 7; None for older trees, and while the scheduler
-    reports no target: the contract renders it 0 until a scheduler sets it)."""
+    reports no target: the contract renders it 0 until a scheduler sets it).
+    The contended units' p95 is a LatencyHistogram quantile, its log2
+    bucket's upper edge (runtime/model/LatencyHistogram.hpp), so it is read
+    no higher than the largest unit."""
     scheduler = status.get("scheduler") or {}
     target, estimate = (
         scheduler.get("decode_gap_target_ms"),
@@ -922,11 +925,11 @@ def gap_bound(status: dict, share: float) -> dict | None:
         ),
         0.0,
     )
+    p95 = value(scheduler, "contended_prefill_ms.p95", 0.0)
     return {
         "bound_ms": max(target, unit / share),
         "e95": value(estimate, "relative_error.p95", 0.0),
-        "contended_p95_ms": value(scheduler, "contended_prefill_ms.p95", 0.0),
-        "decode_gap_p50_ms": value(status, "metrics.decode_gap_ms.p50", 0.0),
+        "contended_p95_ms": min(p95, value(scheduler, "contended_prefill_ms.max", p95)),
         "decode_gap_max_ms": value(status, "metrics.decode_gap_ms.max", 0.0),
     }
 
@@ -1055,11 +1058,23 @@ def g8_failures(run: Run, gates: dict) -> list[str]:
 
 def health(run: Run, machine: dict, gates: dict) -> dict:
     """One candidate run on its own: G4 from its client gaps and its own
-    status, G8 and G9, and the readouts verdict.md reports."""
+    status, G8 and G9, and the readouts verdict.md reports. G4b allows the
+    typical gap with no prefill unit between two tokens (amend/V.md A09) as
+    the median of the same client gaps, exact where metrics.decode_gap_ms'
+    p50 is a log2 bucket's upper edge."""
     gaps, client_max = run.client_gaps()
     ordered = sorted(gaps)
-    p99 = ordered[min(len(ordered) - 1, int(0.99 * len(ordered)))] if ordered else 0.0
-    facts = {"client_gap_max_s": client_max, "client_gap_p99_s": p99, "failures": []}
+
+    def quantile(q):
+        return ordered[min(len(ordered) - 1, int(q * len(ordered)))] if ordered else 0.0
+
+    p50, p99 = quantile(0.5), quantile(0.99)
+    facts = {
+        "client_gap_max_s": client_max,
+        "client_gap_p99_s": p99,
+        "client_gap_p50_s": p50,
+        "failures": [],
+    }
     if client_max >= machine["g4c_floor_s"]:
         facts["failures"].append(
             f"G4c: a client gap of {client_max:.2f} s, the floor is {machine['g4c_floor_s']} s"
@@ -1072,9 +1087,9 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
             facts["failures"].append(
                 f"G4a: contended prefill p95 {bound['contended_p95_ms']:.0f} ms over {limit:.0f} ms"
             )
-        if p99 * 1000 > limit + bound["decode_gap_p50_ms"]:
+        if p99 * 1000 > limit + p50 * 1000:
             facts["failures"].append(
-                f"G4b: client gap p99 {p99 * 1000:.0f} ms over {limit + bound['decode_gap_p50_ms']:.0f} ms"
+                f"G4b: client gap p99 {p99 * 1000:.0f} ms over {limit + p50 * 1000:.0f} ms"
             )
         facts["gap_causes"] = gap_causes(run, limit / 1000)
     last = run.last

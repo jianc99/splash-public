@@ -731,6 +731,73 @@ class GateTests(unittest.TestCase):
         self.assertEqual([f[:4] for f in facts["failures"]], ["G4b:"])
         self.assertAlmostEqual(facts["client_gap_p99_s"], 2.999)
 
+    def test_g4b_allows_the_runs_own_median_client_gap(self):
+        # G4b's allowance, the typical gap with no prefill unit between two
+        # tokens, is the median of the run's own client gaps between token
+        # events. metrics.decode_gap_ms.p50 is a log2 bucket's upper edge
+        # (runtime/model/LatencyHistogram.hpp), up to twice the gap it
+        # stands for: smoke-a-fn-churn-A1's read 524.288. Here a token event
+        # comes every 100 ms and 5 of the 297 gaps (1.7 %) are 1.2 s, over
+        # the 960 ms limit + the 100 ms median, under the limit + the 524 ms
+        # edge.
+        samples = [
+            self.schema7(0),
+            self.schema7(900, metrics__decode_gap_ms={"p50": 524.288, "max": 1200.0}),
+        ]
+        done = [
+            {
+                "tag": f"w{w}-r1",
+                "start": 0,
+                "t": 400,
+                "ttft": 5,
+                "decode_tps": 30,
+                "chunks_ms": [
+                    100 * event + 1100 * ((event + w) // 50) for event in range(100)
+                ],
+            }
+            for w in range(3)
+        ]
+        facts = matrix.health(
+            churn_run(self.directory, "edge", done, samples),
+            self.machine,
+            self.gates,
+        )
+        self.assertEqual(
+            facts["failures"], ["G4b: client gap p99 1200 ms over 1060 ms"]
+        )
+        self.assertAlmostEqual(facts["client_gap_p50_s"], 0.1)
+
+    def test_g4a_reads_no_quantile_above_the_largest_unit(self):
+        # LatencyHistogram reports a quantile as its log2 bucket's upper edge,
+        # never clamped to the largest value it holds: smoke-a-27b-churn-A1's
+        # decode_gap_ms p95 read 1048.576 with max 609.03. A contended p95
+        # read as 1048.576 whose largest unit took 900 ms is within the
+        # 960 ms limit.
+        samples = [
+            self.schema7(0),
+            self.schema7(
+                900, scheduler__contended_prefill_ms={"p95": 1048.576, "max": 900.0}
+            ),
+        ]
+        smooth = [
+            {
+                "tag": f"w{w}-r1",
+                "start": 0,
+                "t": 100,
+                "ttft": 5,
+                "decode_tps": 30,
+                "chunks_ms": [0, 100, 200],
+            }
+            for w in range(3)
+        ]
+        facts = matrix.health(
+            churn_run(self.directory, "edge", smooth, samples),
+            self.machine,
+            self.gates,
+        )
+        self.assertEqual(facts["failures"], [])
+        self.assertAlmostEqual(facts["g4"]["contended_p95_ms"], 900.0)
+
     def test_an_ample_run_starts_at_the_cap_on_a_host_without_pressure(self):
         # s-fn-churn-ample: ntie's recorded sNFa reads warning at Ready, right
         # after the load, in the engine's band state and in macOS's own level,
