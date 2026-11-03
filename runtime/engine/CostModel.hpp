@@ -81,8 +81,10 @@ public:
   // in one pass each, less their reads at that rate, give the line through
   // them of RowLayers and, at no rows, ChunkLayers (Units for a model that
   // reports no layers); the other terms, Units among them, start at zero.
-  // Each term's seed weighs as many units as measured it, at least one. A
-  // warm-up that reports no work measures nothing.
+  // Each term's seed weighs as many units as measured it, at least one;
+  // ChunkLayers' weighs on it and the warm-ups' Units together, whose
+  // turnaround the line's constant holds. A warm-up that reports no work
+  // measures nothing.
   void seed(std::span<const model::CommandSample> warmups, model::SsdReads load);
   // A unit's price, in milliseconds, for the work planning expects of it: the
   // model-estimated read bytes scaled by their realized share (stats), never
@@ -111,6 +113,10 @@ private:
   // and stays out of the system.
   std::array<CostVector, kCostTerms> normal_{};
   CostVector moment_{}, unit_{}, seedRates_{}, precision_{}, rates_{};
+  // The warm-ups' normalized Units per normalized ChunkLayers of theirs,
+  // which ChunkLayers' seed weighs on with it (solve); 0 where the seed's
+  // constant is Units'.
+  double seedUnits_ = 0.0;
   // Decayed realized and expected bytes of the two estimated terms.
   double realizedWeight_ = 0.0, expectedWeight_ = 0.0;
   double realizedSpilled_ = 0.0, expectedSpilled_ = 0.0;

@@ -1024,6 +1024,36 @@ void testPassesFollowCostOnAResidentTarget() {
   }
 }
 
+// Units of one pass over one chunk do not price the turnaround: a dense
+// prompt alone runs whole, each command's Units and ChunkLayers one apiece,
+// so its 20 commands running 8 % over the warm-ups (a GPU slower than at
+// startup) leave the turnaround at zero and the bound at G, and the next
+// contended command runs in passes of G (behaviour change 2: as today
+// while u is small).
+void testWholeCommandsLeaveTheTurnaroundAtZero() {
+  Sim sim(test::kDense27B, limits(kChunk, test::kDense27B.layers));
+  sim.seed();
+  sim.lane(1, 0, 20 * kChunk);
+  while (sim.scheduler.phase(1) == Phase::Prefill) {
+    const BatchPlan plan = sim.plan();
+    require(plan.items[0].tokenCount == kChunk && plan.passes == 1, "a lone dense command did not run whole");
+    sim.run(plan, 1.08);
+  }
+  require(sim.turnaround() < 1e-6 && sim.bound() == kGap,
+          "whole commands priced a turnaround of " + std::to_string(sim.turnaround()) + " ms, a bound of " +
+              std::to_string(sim.bound()) + " ms");
+  sim.lane(2, 0, 4 * kChunk);
+  BatchPlan plan = sim.plan();
+  while (plan.kind != WorkKind::Prefill) {
+    sim.run(plan);
+    plan = sim.plan();
+  }
+  for (uint32_t pass = 0; pass < plan.passes; ++pass)
+    require(sim.price(plan.items, pass, plan.passes) <= kGap * (1 + 1e-9),
+            "a contended dense command ran in " + std::to_string(plan.passes) + " passes of " +
+                std::to_string(sim.price(plan.items, pass, plan.passes)) + " ms, past G");
+}
+
 // Behaviour change 5: groups follow the fixed part a group saves: on a
 // store-less target a spill lane whose history reads cost a chunk's command
 // a third of G or more groups, a short one does not, nor a Resident lane.
@@ -1929,6 +1959,7 @@ constexpr test::TestCase kTests[] = {
     {"testTheBoundFollowsTheTurnaround", testTheBoundFollowsTheTurnaround},
     {"testPassesAddAtMostATenthOfTheCommand", testPassesAddAtMostATenthOfTheCommand},
     {"testPassesFollowCostOnAResidentTarget", testPassesFollowCostOnAResidentTarget},
+    {"testWholeCommandsLeaveTheTurnaroundAtZero", testWholeCommandsLeaveTheTurnaroundAtZero},
     {"testGroupRowsFollowTheFixedCost", testGroupRowsFollowTheFixedCost},
     {"testANearlyResidentStoreRunsChunks", testANearlyResidentStoreRunsChunks},
     {"testThePairBoundIsPerLayerAndOnlyRowsMeetIt", testThePairBoundIsPerLayerAndOnlyRowsMeetIt},

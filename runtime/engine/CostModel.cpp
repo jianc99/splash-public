@@ -52,6 +52,7 @@ void CostModel::seed(std::span<const model::CommandSample> warmups, model::SsdRe
   // measurement, the load's, prices a byte of either.
   seedRates_ = {};
   precision_.fill(1.0);
+  seedUnits_ = 0.0;
   const double perByte = load.bytes && timed(load.milliseconds) ? load.milliseconds / double(load.bytes) : 0.0;
   seedRates_[kWeightReads] = seedRates_[kSpilledReads] = perByte;
   // Each warm-up's time less its reads at that rate, against its rows'
@@ -65,8 +66,12 @@ void CostModel::seed(std::span<const model::CommandSample> warmups, model::SsdRe
   // so no contended unit would run in passes before samples of several
   // passes; at zero the bound is G, the base's slice, until such samples
   // price the turnaround (six commands do in
-  // testContendedTurnPassesByTurnaround). A model that reports no layers
-  // leaves it nowhere but Units.
+  // testContendedTurnPassesByTurnaround). The constant holds the warm-ups'
+  // one turnaround too, so ChunkLayers' seed weighs on it with their Units
+  // (solve): units of one pass over one chunk, whose Units and ChunkLayers
+  // move together, leave Units at zero whatever they cost, as a dense target
+  // runs every uncontended command (testWholeCommandsLeaveTheTurnaroundAtZero).
+  // A model that reports no layers leaves it nowhere but Units.
   std::vector<std::pair<double, double>> points;
   double chunkLayers = std::numeric_limits<double>::infinity();
   for (const model::CommandSample &warmup : warmups) {
@@ -107,6 +112,9 @@ void CostModel::seed(std::span<const model::CommandSample> warmups, model::SsdRe
     const size_t constant = chunkLayers > 0.0 ? kChunkLayers : kUnits;
     seedRates_[constant] = constant == kChunkLayers ? intercept / chunkLayers : intercept;
     precision_[constant] = double(points.size());
+    // Units' unit is 1.
+    if (constant == kChunkLayers)
+      seedUnits_ = unit_[kChunkLayers] / chunkLayers;
     seedRates_[kRowLayers] = slope;
     if (spread > 0.0)
       precision_[kRowLayers] = double(points.size());
@@ -184,8 +192,12 @@ void CostModel::observe(const model::CommandWork &realized, const model::Command
 }
 
 void CostModel::solve() {
-  // (N + diag κ) β = m + κ·ŝ over the terms with a unit, then again without
-  // the most negative rate, held at zero, until none is negative.
+  // (N + K) β = m + K·ŝ over the terms with a unit, then again without the
+  // most negative rate, held at zero, until none is negative. K is diag κ
+  // but while Units and ChunkLayers are both free: ChunkLayers' prior is then
+  // κ (β_c + s β_u − ŝ_c)², s = seedUnits_, the warm-ups' line at no rows
+  // with their turnaround, so β_u leaves its seed only as far as units of
+  // other passes or chunks than the warm-ups' show it.
   std::array<bool, kCostTerms> free{};
   for (size_t term = 0; term < kCostTerms; ++term)
     free[term] = unit_[term] > 0.0;
@@ -203,6 +215,13 @@ void CostModel::solve() {
           system[row][column] = normal_[row][column];
       system[row][row] += precision_[row];
       target[row] = moment_[row] + precision_[row] * seedRates_[row] * unit_[row];
+    }
+    if (free[kUnits] && free[kChunkLayers]) {
+      const double coupling = precision_[kChunkLayers] * seedUnits_;
+      system[kUnits][kChunkLayers] += coupling;
+      system[kChunkLayers][kUnits] += coupling;
+      system[kUnits][kUnits] += coupling * seedUnits_;
+      target[kUnits] += coupling * seedRates_[kChunkLayers] * unit_[kChunkLayers];
     }
     beta = splash::solve<kCostTerms>(system, target);
     size_t negative = kCostTerms;
