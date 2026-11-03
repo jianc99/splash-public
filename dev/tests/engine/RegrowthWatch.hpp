@@ -12,8 +12,8 @@
 // (MemoryAccountSnapshot::regrowthSeconds; into free room also while no claim
 // has taken any), and either the free room beyond the lanes' projected
 // growth, the waiting claims and every pending growth holds the unit while
-// no claim waits for memory or to retry what the host refused
-// (MemoryLedger::holdsFreeRoom: the room is the claim's), or
+// no request's claim waits for memory or to retry what the host refused
+// (MemoryLedger::holdsFreeRoom: the room is the request's), or
 // what it would displace beside that room costs less than its regrowth gains
 // (MemoryLedger::available), with the host's consent. A store that never
 // regrows into memory it could take (#645) fails the second; one held short

@@ -192,8 +192,8 @@ void requireBooks(Served &served, const std::string &when) {
 // before each episode within its normal level" is not A30's. At each normal
 // level a fed prompt's start waits; the store grew into free room meanwhile,
 // and the start took it back as its request went on past the need it waited
-// with, a regrow and take back repeating 12 s apart. While a claim waits, or
-// a request to retry what the host refused it, the pools no longer grow into
+// with, a regrow and take back repeating 12 s apart. While a request's claim
+// waits, or its request to retry what the host refused it, the pools no longer grow into
 // free room: requests first, fresh starts and resumes alike (coordinator
 // 11:00, MemoryLedger::holdsFreeRoom). A
 // critical level's drop within the horizon of a regrowth

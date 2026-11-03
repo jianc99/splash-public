@@ -367,9 +367,10 @@ public:
   // the host.
   [[nodiscard]] bool claimWaiting() const noexcept;
   [[nodiscard]] uint64_t hostRefusedWaitingBytes() const noexcept;
-  // Whether the pools hold off growing into free room (grow): a claim waits
-  // for memory, or its request to retry what the host refused it, and takes
-  // the memory that appears.
+  // Whether the pools hold off growing into free room (grow): a request's
+  // claim waits for memory, or its request to retry what the host refused
+  // it, and takes the memory that appears. A claim of no request never holds
+  // it (requests first).
   [[nodiscard]] bool holdsFreeRoom() const noexcept;
   // The units the pools gave back since the engine started.
   [[nodiscard]] uint64_t poolReleases() const noexcept;

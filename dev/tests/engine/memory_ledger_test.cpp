@@ -2382,6 +2382,43 @@ void testAPoolDoesNotGrowWhileAClaimWaits() {
   require(experts.units() == 4, "the store did not grow back once no claim waited:" + history);
 }
 
+// Requests first (owner): only a request's waiting claim holds the pools'
+// growth into free room; a claim of no request (the engine's own, a pool's
+// growth, the host) that waits never holds the store down. The engine at its
+// 16 GiB limit, the store a 1 GiB unit short of its cap, the engine's own
+// claim and a request's start each refused 43 MiB and waiting, then 1124 MiB
+// freed: while the start waits the store does not grow; once the start is
+// met and waits no more, the store grows back into the room beside the
+// engine's waiting claim within a few passes.
+void testOnlyARequestsWaitingClaimHoldsFreeRoom() {
+  Fixture fixture(host(32 * kGiB), 16 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 104, 3, 0.1, 51.4);
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addPool(experts);
+  fixture.memory.hold("weights", 11 * kGiB);
+  fixture.memory.hold("kv", 2 * kGiB);
+  const ClaimId own = ledger.open({});
+  require(!fixture.allocate(own, 43 * kMiB), "the engine's own claim was admitted at the engine's limit");
+  ledger.setWaiting(own, true);
+  const ClaimId start = ledger.open(request(10, RequestPriority::Normal, ClaimClass::Start));
+  require(!fixture.allocate(start, 43 * kMiB), "the start was admitted at the engine's limit");
+  ledger.setWaiting(start, true);
+  fixture.memory.release("kv", kGiB + 100 * kMiB);
+  static_cast<void>(fixture.pass(1.0));
+  require(experts.units() == 3, "the store grew into free room while a request's start waited");
+  require(fixture.allocateFreeing(start, 43 * kMiB), "the waiting start was not met once memory was freed");
+  ledger.update(start, request(10, RequestPriority::Normal, ClaimClass::InService));
+  ledger.setWaiting(start, false);
+  std::optional<double> grewAt;
+  for (double seconds = 1.5; seconds <= 3.0 && !grewAt; seconds += 0.5) {
+    static_cast<void>(fixture.pass(seconds));
+    if (experts.units() == 4)
+      grewAt = seconds;
+  }
+  require(grewAt.has_value(), "the store did not grow back within 4 passes of the start's wait ending, while only the "
+                              "engine's own claim waited: " + std::to_string(experts.units()) + " units");
+}
+
 // A lane that prefills into a store unit it took and then decodes alone has
 // the store grow the unit back right after its prefill (owner rule 12;
 // amend/V.md A30's regrowth lower bound, owner 11-03 03:55): its claim is in
@@ -3761,6 +3798,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testTheTakeRateDecaysWhileTheEngineIdles", testTheTakeRateDecaysWhileTheEngineIdles},
       {"testTheSnapshotShowsTheRegrowthItsRuleTests", testTheSnapshotShowsTheRegrowthItsRuleTests},
       {"testAPoolDoesNotGrowWhileAClaimWaits", testAPoolDoesNotGrowWhileAClaimWaits},
+      {"testOnlyARequestsWaitingClaimHoldsFreeRoom", testOnlyARequestsWaitingClaimHoldsFreeRoom},
       {"testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone",
        testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone},
       {"testGrowthPendsOnlyOnItsOwnVictims", testGrowthPendsOnlyOnItsOwnVictims},

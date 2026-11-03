@@ -260,7 +260,7 @@ bool MemoryLedger::claimWaiting() const noexcept {
 
 bool MemoryLedger::holdsFreeRoom() const noexcept {
   return std::ranges::any_of(claims_, [](const auto &entry) {
-    return entry.second.waiting || entry.second.hostRefusedWaiting;
+    return entry.second.spec.requestId && (entry.second.waiting || entry.second.hostRefusedWaiting);
   });
 }
 
@@ -847,14 +847,16 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 // from the host's footprint again (its credit), and what the room lacks
 // besides. Either way victims that free memory only once their transfers
 // land make the unit the pool's pending growth. The room is the pass's less
-// what the pass has grown. While a claim waits for memory, or its request
-// to retry what the host refused it, the pools do not grow into free room:
-// the claim takes the memory that appears, beyond the need it waits with
-// once its request goes on to its next allocation (pressure-serving: a
-// start's state buffer after its pages), and a unit grown into it meanwhile
-// would go back to it. Displacement, which leaves the room as it was, goes
-// on (amend/M.md B4: the band regrows the store beside the starts it
-// refuses).
+// what the pass has grown. While a request's claim waits for memory, or its
+// request to retry what the host refused it, the pools do not grow into
+// free room: the claim takes the memory that appears, beyond the need it
+// waits with once its request goes on to its next allocation
+// (pressure-serving: a start's state buffer after its pages), and a unit
+// grown into it meanwhile would go back to it. Requests first: a claim of
+// no request (the engine's own, a pool's growth, the host) that waits holds
+// only the need it waits with, never the store down. Displacement, which
+// leaves the room as it was, goes on (amend/M.md B4: the band regrows the
+// store beside the starts it refuses).
 bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
   bool acted = false;
   const bool waiting = holdsFreeRoom();
