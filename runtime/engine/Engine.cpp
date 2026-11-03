@@ -1428,11 +1428,6 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   const bool prefill = plan.kind == WorkKind::Prefill;
   const bool spill = config_.spill.capable;
   const PlanContext context{.prefill = prefill, .supersedes = supersedes, .now = now};
-  // However the command is left, the next one's lanes are not shaped yet.
-  struct Shaping final {
-    bool &shaped;
-    ~Shaping() { shaped = false; }
-  } const shaping{commandShaped_};
   // What the plan was made from that preparing it may change: each lane's
   // KV mode and whether its history held Index pages, and the command
   // between its passes.
@@ -1441,7 +1436,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
     shapes.emplace_back(request(item.requestId).kvMode, cache_.holdsIndexPages(item.requestId));
   const bool commandBetweenPasses = !plan.pass && passCommand_;
   const auto reshaped = [&] {
-    for (size_t index = 0; prefill && index < plan.items.size(); ++index) {
+    for (size_t index = 0; index < plan.items.size(); ++index) {
       const uint64_t id = plan.items[index].requestId;
       if (request(id).kvMode != shapes[index].first || (cache_.holdsIndexPages(id) && !shapes[index].second))
         return true;
@@ -1523,10 +1518,9 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   // (gainsIndexPages), as a pass streams what it holds then. It is reserved
   // once every lane has its KV, since a lane that converts to Spill moves the
   // landed pages of lanes admitted before it to the index form too
-  // (Cache::convertToSpill). A lane a refusal converts from here on keeps its
-  // pages Full in this command (commandShaped_); the plan is made again.
+  // (Cache::convertToSpill). A lane a refusal converts from here on spills
+  // its landed pages at once, and the plan is made again.
   if (spill) {
-    commandShaped_ = true;
     std::vector<BatchItem> kept;
     kept.reserve(admitted.size());
     for (const BatchItem &scheduled : admitted) {

@@ -872,8 +872,7 @@ private:
   // (`restoring`) counted; false when it cannot (no SSD cache, the tier
   // closed, its quota short, or a lane already Spill) or must not: a lane
   // of the command between its passes, which reads all its lanes' history
-  // from memory. Its pages whose copies landed spill at once, but in a
-  // command whose lanes' forms are reserved already (commandShaped_).
+  // from memory. Its pages whose copies landed spill at once.
   [[nodiscard]] bool convertToSpill(Request &request);
   // What a lane does about memory it could not get. Pending memory returns
   // by itself: the lane waits (the ledger finds it, its own lanes' owed
@@ -1129,11 +1128,6 @@ private:
   EngineEventSink &events_;
   Scheduler scheduler_;
   std::unordered_map<uint64_t, Request> requests_;
-  // Set while prepare() reserves the memory its lanes' KV forms need (the
-  // reads of spilled KV) and after: a lane that converts to Spill from then
-  // on keeps its pages Full in that command, which the next point between
-  // commands spills (spillLanded). False between commands.
-  bool commandShaped_ = false;
   // Pressure preempted work, a lane is still resident, and memory is still
   // short (the host admits no growth, or allocationFailed_), up to the
   // drain's end.

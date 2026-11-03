@@ -1821,6 +1821,62 @@ void testAConversionLeavesNoLaneWithoutItsFloor() {
           "the lanes did not complete after the conversion");
 }
 
+// A lane that converts while its command takes shape, after its own turn for
+// the reads of spilled KV, spills the pages whose copies landed at once, and
+// the command is planned again: it runs with the lane's Index pages and the
+// memory for their reads, never with Index pages read without it (DESIGN
+// section 7.8, M3b: S re-plans after every conversion). The neighbour
+// restored a spilled chain Resident and leads the decode command; the Spill
+// lane's floor is refused once, which converts the neighbour, and the
+// attempt after the conversion fits.
+void testAConversionWhileACommandTakesShapeSpillsAtOnce() {
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{16});
+  // An earlier turn leaves its chain spilled, its copies written through.
+  spill.engine.submit(Spilling::prompt(1, 1, 40, 1));
+  spill.runUntilIdle();
+  // The neighbour restores that chain into Full pages, its copies kept, as
+  // a request does while the SSD cache takes no writes.
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(2, 1, 48, 10000));
+  spill.runUntil([&] { return spill.events.outputs.contains(2); }, "the neighbour did not decode");
+  spill.tier.writableFile = true;
+  uint32_t asked = 0;
+  bool limited = false;
+  spill.model.spilledReadsRoom = [&](uint64_t id) {
+    if (id != 3 || ++asked == 1)
+      return true;
+    if (std::exchange(limited, true))
+      return true;
+    spill.limit(spill.held());
+    return static_cast<bool>(spill.host.reserve(16 * 100));
+  };
+  // The first command submitted once the neighbour has converted.
+  std::optional<bool> indexPages, floor;
+  uint64_t replansBefore = 0, replansAtConversion = 0;
+  spill.model.submitObserver = [&] {
+    const EngineSnapshot snapshot = spill.engine.snapshot();
+    if (indexPages)
+      return;
+    if (snapshot.spill.converted == 0) {
+      replansBefore = snapshot.replans;
+      return;
+    }
+    indexPages = spill.cache.holdsIndexPages(2);
+    floor = spill.model.spilledReadFloors.contains(2);
+    replansAtConversion = snapshot.replans;
+  };
+  spill.engine.submit(Spilling::prompt(3, 3, 20, 64));
+  spill.runUntil([&] { return indexPages.has_value(); }, "the neighbour did not convert");
+  require(*indexPages, "a lane converted while its command took shape kept its landed pages Full");
+  require(*floor && replansAtConversion > replansBefore,
+          "a lane converted while its command took shape ran without the plan made again for its reads");
+  spill.limit(Spilling::kGovernedLimitBytes);
+  spill.model.decodeFinishes = true;
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0 && spill.committedSlots() == 0,
+          "a request failed or kept its commitment");
+}
+
 // A Spill lane whose pages the SSD cache takes no more of keeps them Full.
 // Alone at the memory wall, a decoding lane then ends with Length, as at
 // the end of its context, and a prefilling one fails naming the SSD cache;
@@ -2209,6 +2265,7 @@ std::span<const test::TestCase> spillTests() {
       {"testALaneRefusedBeforeItsFirstCommandWritesItsChain", testALaneRefusedBeforeItsFirstCommandWritesItsChain},
       {"testAPageWaitingForItsCopyHoldsBackNoneAfterIt", testAPageWaitingForItsCopyHoldsBackNoneAfterIt},
       {"testAConversionLeavesNoLaneWithoutItsFloor", testAConversionLeavesNoLaneWithoutItsFloor},
+      {"testAConversionWhileACommandTakesShapeSpillsAtOnce", testAConversionWhileACommandTakesShapeSpillsAtOnce},
       {"testLoneSpillLaneEndsAtTheWall", testLoneSpillLaneEndsAtTheWall},
       {"testHotCacheGrowthIsNotTheEngines", testHotCacheGrowthIsNotTheEngines},
       {"testHostRefusedHotFloorTakesNoModelCache", testHostRefusedHotFloorTakesNoModelCache},

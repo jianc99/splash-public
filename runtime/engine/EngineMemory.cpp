@@ -396,7 +396,7 @@ void Engine::waitForDiskQuota(Request &active, double now) {
 bool Engine::convertToSpill(Request &active) {
   if (!config_.spill.capable || active.kvMode != KvMode::Resident || betweenPasses(active.request.id))
     return false;
-  if (!cache_.convertToSpill(active.request.id, spillPages(active, chainEnd(active)), !commandShaped_))
+  if (!cache_.convertToSpill(active.request.id, spillPages(active, chainEnd(active))))
     return false;
   active.kvMode = KvMode::Spill;
   ++counters_.spill.converted;
