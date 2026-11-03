@@ -1,0 +1,26 @@
+{
+  "source": "Studio ~/dev/vr16/churn/sNFa.status.jsonl (ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0): the 18 of its 327 prefill commands that ran alone and whole between two 2-s status samples, nothing in flight at either (amend/S.md S7): per command its number among the run's commands (scheduler.prefill_batches), the samples' deltas of model_timing.prefill.total_wall_ms, streamed_experts.prefill.read_bytes and kv_spill.history_stream.bytes, its lane's prompt_processed less its rows, its rows, and streamed_experts.resident at the first sample; expert_bytes is the least streamed_experts.arena_bytes / slots",
+  "experts": 24576,
+  "expert_bytes": 1382400,
+  "columns": ["command", "wall_ms", "weight_read_bytes", "spilled_kv_read_bytes", "position", "rows", "resident_experts"],
+  "commands": [
+    [22, 1149.327, 6616711168, 70287360, 9728, 512, 13488],
+    [45, 1122.69, 6331465728, 54312960, 8448, 256, 12712],
+    [51, 1076.452, 6123683840, 73482240, 9984, 256, 12712],
+    [83, 1123.811, 6384779264, 83066880, 10752, 256, 12712],
+    [96, 1149.563, 6494208000, 54312960, 8448, 256, 11936],
+    [97, 1130.946, 6333890560, 57507840, 8704, 256, 11936],
+    [117, 1433.853, 8221278208, 230031360, 22528, 512, 12712],
+    [118, 1408.994, 8092778496, 236421120, 23040, 512, 12712],
+    [119, 1403.788, 8020525056, 242810880, 23552, 512, 12712],
+    [120, 1410.547, 8063008768, 249200640, 24064, 512, 12712],
+    [180, 1633.524, 9622405120, 191692800, 19456, 1024, 12712],
+    [192, 1690.819, 9736241152, 408944640, 36864, 1024, 12712],
+    [204, 1213.137, 6943653888, 51118080, 8192, 512, 12712],
+    [308, 1547.776, 9128411136, 89456640, 11264, 1024, 12712],
+    [309, 1543.643, 9148399616, 102236160, 12288, 1024, 12712],
+    [312, 2289.948, 7901528064, 140574720, 15360, 1024, 12712],
+    [313, 1761.698, 9104441344, 153354240, 16384, 1024, 12712],
+    [317, 1659.458, 9659760640, 204472320, 20480, 1024, 12712]
+  ]
+}

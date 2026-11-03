@@ -42,7 +42,7 @@ std::string_view costTermName(CostTerm term) noexcept {
   return "";
 }
 
-CostModel::CostModel() noexcept {
+CostModel::CostModel(double decay) noexcept : decay_(decay) {
   precision_.fill(1.0);
   unit_[kUnits] = 1.0;
 }
@@ -161,7 +161,7 @@ void CostModel::observe(const model::CommandWork &realized, const model::Command
   errors_[errorCount_++ % kErrorSamples] = std::fabs(price(expected) - milliseconds) / milliseconds;
   // A command's passes decay the sums once together, and their bytes sum to
   // the command's.
-  const double decay = std::pow(kDecay, weight);
+  const double decay = std::pow(decay_, weight);
   realizedWeight_ = decay * realizedWeight_ + double(realized.weightReadBytes);
   expectedWeight_ = decay * expectedWeight_ + double(expected.weightReadBytes);
   realizedSpilled_ = decay * realizedSpilled_ + double(realized.spilledKvReadBytes);
@@ -190,6 +190,18 @@ void CostModel::observe(const model::CommandWork &realized, const model::Command
     moment_[row] = decay * moment_[row] + normalized[row] * time / weight;
   }
   ++samples_;
+  solve();
+}
+
+void CostModel::age(uint32_t commands) {
+  const double decay = std::pow(decay_, commands);
+  for (double *sum : {&realizedWeight_, &expectedWeight_, &realizedSpilled_, &expectedSpilled_})
+    *sum *= decay;
+  for (CostVector &row : normal_)
+    for (double &sum : row)
+      sum *= decay;
+  for (double &sum : moment_)
+    sum *= decay;
   solve();
 }
 

@@ -60,11 +60,21 @@ struct CostModelStats final {
 class CostModel final {
 public:
   // What each unit's sums keep against the next command's: a command decays
-  // them once, whatever its passes. 0.9 is DESIGN §4.3's value, not yet
-  // derived: amend/S.md A10 chooses it by replaying recorded commands
-  // (cost_model_test testDecayFitsRecordedCommands over V-tools' fixtures
-  // prefill_commands_*.json, which do not exist yet).
-  static constexpr double kDecay = 0.9;
+  // them once, whatever its passes. Chosen by replay (amend/S.md A10,
+  // cost_model_test testDecayFitsRecordedCommands): the 269 of the 1256
+  // prefill commands of eight Flash-Next churn runs on the M6, the Studio and
+  // the M5 Pro that ran alone and whole between two status samples
+  // (prefill_commands_*.json) replayed one engine command a step, the others
+  // aging the sums unobserved; the first two of a run seed the fit and each
+  // later one is priced from the store's expected reads before it trains it.
+  // Past each run's first four, the 237 prices err at P95 by 0.365, 0.347,
+  // 0.344, 0.335 and 0.345 at 0.75, 0.9, 0.95, 0.97 and 0.99: 0.95-0.99 lie
+  // within 0.01 of the least, which goes to the largest decay. The runs hold
+  // no shift of the rates that would tell those apart (0.995 and 1 would lie
+  // within it too), and their median errors favour smaller decays (0.056 at
+  // 0.75, 0.072 at 0.9, 0.082 at 0.99); at 0.99 the median is 0.03-0.15 on
+  // every run.
+  static constexpr double kDecay = 0.99;
   static constexpr size_t kErrorSamples = 256;
   // The second prefill warm-up's rows, beside the first's chunk: the second
   // size the seed puts its line through, as short as an agent's turn (300
@@ -73,7 +83,9 @@ public:
   // (accepted, DESIGN §0 O4).
   static constexpr uint32_t kSeedRows = 256;
 
-  CostModel() noexcept;
+  // `decay` is what the sums keep a command: kDecay, or each of the decays
+  // cost_model_test's replay of recorded commands compares.
+  explicit CostModel(double decay = kDecay) noexcept;
 
   // The startup measurements: the prefill warm-ups' samples (their work and
   // wall time) and the SSD reads of loading the weights. Both read terms
@@ -105,6 +117,10 @@ public:
   // realized work.
   void observe(const model::CommandWork &realized, const model::CommandWork &expected, double milliseconds,
                double weight);
+  // Commands that ran unobserved: the sums decay once for each, as for an
+  // observed unit's command (cost_model_test's replay passes those its
+  // records leave out).
+  void age(uint32_t commands);
   [[nodiscard]] CostModelStats stats() const noexcept;
 
 private:
@@ -127,6 +143,7 @@ private:
   std::array<double, kErrorSamples> errors_{};
   size_t errorCount_ = 0;
   uint64_t samples_ = 0, clamped_ = 0;
+  double decay_;
 };
 
 } // namespace splash::engine

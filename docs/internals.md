@@ -1510,8 +1510,8 @@ warm-ups, of a chunk's rows and of 256, the line of their times less those
 reads by their row-layers, whose intercept is a chunk-layer's cost, their
 turnaround in it; the turnaround starts at zero, where units of one pass over
 one chunk, which do not tell the two apart, leave it. Every unit that runs
-rows then trains it, a pass by its share of its command, each weighing nine
-tenths of the next, its time held
+rows then trains it, a pass by its share of its command, each weighing 0.99
+of the next, its time held
 within half and twice its price, in a fit that keeps every cost non-negative
 and a cost no unit's work varies at its seed; the bytes it prices are scaled
 by what units read over what the model expected of them. The status reports

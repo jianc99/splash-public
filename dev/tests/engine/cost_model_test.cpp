@@ -6,12 +6,18 @@
 #include "TestRegistry.hpp"
 #include "engine/CostModel.hpp"
 #include "model/Model.hpp"
+#include "model/WorkFormulas.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <random>
 #include <span>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -19,6 +25,12 @@ using namespace splash;
 using namespace splash::engine;
 
 namespace {
+
+// The recorded commands' fixtures (prefill_commands_*.json).
+std::string &fixtureDirectory() {
+  static std::string directory = "dev/tests/engine/fixtures";
+  return directory;
+}
 
 using test::require;
 
@@ -151,11 +163,13 @@ void testPriceIsLinearInReadBytes() {
 // (1) Varied units in passes of varied counts: the fit recovers what the
 // terms that vary most cost, and prices new units within S-P1's 15 % of the
 // truth, 5 % on average, with or without 3 % of noise. Over its
-// decayed window of some ten commands each seed still weighs a unit's worth:
-// Units, which only the passes' counts separate from the chunks' cost, and
-// SpilledKvReadBytes, seeded at the weights' rate, move from their seeds
-// toward the truth, not all the way. (IndexPairs, a two-hundredth of
-// AttentionPairs here and as deep, is not separated.)
+// decayed window of some hundred commands each seed weighs about a
+// hundredth: Units, which only the passes' counts separate from the chunks'
+// cost, and SpilledKvReadBytes, seeded at half its truth (the weights'
+// rate), come within a tenth of the truth too (at a decay of 0.9, whose
+// window of ten left each seed a unit's worth, only to 0.85 and 0.67 of it).
+// (IndexPairs, a two-hundredth of AttentionPairs here and as deep, is not
+// separated.)
 void testRecoversTheRatesVariedUnitsShow() {
   for (const double spread : {0.0, 0.03}) {
     CostModel cost = seeded();
@@ -196,8 +210,9 @@ void testRecoversTheRatesVariedUnitsShow() {
               "the fit did not recover " + std::string(costTermName(static_cast<CostTerm>(term))) + ":" + rates);
     require(relative(stats.rates[kWeightReads], kTruth[kWeightReads]) < 0.1,
             "the fit did not recover the weights' reads:" + rates);
-    require(stats.rates[kSpilledReads] > 1.2 * stats.seedRates[kSpilledReads] && stats.rates[0] > 0.25 * kTruth[0],
-            "the spilled reads or the turnaround did not move from their seeds toward the truth:" + rates);
+    require(relative(stats.rates[kSpilledReads], kTruth[kSpilledReads]) < 0.1 &&
+                relative(stats.rates[0], kTruth[0]) < 0.1,
+            "the spilled reads or the turnaround did not leave their seeds for the truth:" + rates);
   }
 }
 
@@ -353,6 +368,181 @@ void testRelativeErrorsAreTheLatestUnits() {
           "a unit at twice its price did not err by a half");
 }
 
+// A prefill command of a recorded churn run (V-tools' fixtures, amend/S.md
+// S7): its number among the run's commands, its wall, the experts and the
+// history it read, its one lane, and the experts the store held as it
+// started.
+struct RecordedCommand final {
+  uint32_t command = 0;
+  double wallMilliseconds = 0.0;
+  uint64_t weightReadBytes = 0, spilledKvReadBytes = 0;
+  uint32_t position = 0, rows = 0, residentExperts = 0;
+};
+
+// prefill_commands_<run>.json: the store's experts and bytes of one, and the
+// commands of the run it kept, in order, one array of its seven columns
+// each.
+struct RecordedRun final {
+  uint32_t experts = 0;
+  uint64_t expertBytes = 0;
+  std::vector<RecordedCommand> commands;
+};
+
+RecordedRun recordedRun(const std::string &run) {
+  const std::string path = fixtureDirectory() + "/prefill_commands_" + run + ".json";
+  std::ifstream file(path);
+  require(file.good(), "cannot read " + path);
+  std::stringstream text;
+  text << file.rdbuf();
+  const std::string json = text.str();
+  const auto number = [&](const std::string &key) {
+    const size_t at = json.find("\"" + key + "\":");
+    require(at != std::string::npos, path + " lacks " + key);
+    return std::strtod(json.c_str() + at + key.size() + 3, nullptr);
+  };
+  RecordedRun result{.experts = static_cast<uint32_t>(number("experts")),
+                     .expertBytes = static_cast<uint64_t>(number("expert_bytes"))};
+  const size_t list = json.find('[', json.find("\"commands\""));
+  require(list != std::string::npos, path + " lists no commands");
+  for (size_t at = json.find_first_of("[]", list + 1); at != std::string::npos && json[at] == '[';
+       at = json.find_first_of("[]", json.find(']', at) + 1)) {
+    std::array<double, 7> columns{};
+    const char *cursor = json.c_str() + at + 1;
+    for (double &column : columns) {
+      char *end = nullptr;
+      column = std::strtod(cursor, &end);
+      require(end != cursor, path + ": a command lacks a column");
+      cursor = end + 1;
+    }
+    result.commands.push_back({.command = static_cast<uint32_t>(columns[0]),
+                               .wallMilliseconds = columns[1],
+                               .weightReadBytes = static_cast<uint64_t>(columns[2]),
+                               .spilledKvReadBytes = static_cast<uint64_t>(columns[3]),
+                               .position = static_cast<uint32_t>(columns[4]),
+                               .rows = static_cast<uint32_t>(columns[5]),
+                               .residentExperts = static_cast<uint32_t>(columns[6])});
+  }
+  require(result.commands.size() > 10, path + " holds too few commands");
+  return result;
+}
+
+// Flash-Next's work for a command of one lane, as its runtime counts it
+// (RuntimeArenas.hpp prefillCommandWork, Qwen4Exp.hpp): its 48 layers, the
+// 12 that attend block-sparse (every key up to 512 blocks of 4 tokens, then
+// 512 of them), whose block index scores each chunk's part of the rows apart.
+model::CommandWork flashNextWork(const RecordedCommand &command) {
+  constexpr uint32_t kAttending = kLayers / 4, kBlockTokens = 4, kTopBlocks = 512;
+  constexpr model::AttentionReach reach{.denseHistoryTokens = kTopBlocks * kBlockTokens,
+                                        .selectedTokens = kTopBlocks * kBlockTokens,
+                                        .blockTokens = kBlockTokens};
+  uint64_t scores = 0;
+  for (uint32_t done = 0; done < command.rows;) {
+    const uint32_t part = std::min(command.rows - done, kChunk - done % kChunk);
+    scores += model::indexPairs(uint64_t{command.position} + done, part, kBlockTokens, kTopBlocks);
+    done += part;
+  }
+  const uint64_t pairs = model::attentionPairs(reach, command.position, command.rows);
+  return {.lanes = 1,
+          .rows = command.rows,
+          .chunks = (command.rows + kChunk - 1) / kChunk,
+          .layers = kLayers,
+          .attentionPairs = kAttending * pairs,
+          .layerAttentionPairs = pairs,
+          .indexPairs = kAttending * scores,
+          .weightReadBytes = command.weightReadBytes,
+          .spilledKvReadBytes = command.spilledKvReadBytes};
+}
+
+// What the store expects the command to read (ExpertStore::
+// expectedPrefillReadBytes): in each of Flash-Next's blocks of 512 experts,
+// the distinct experts uniform routing gives its rows (10 a row), those of
+// them not resident, at the bytes of an expert.
+model::CommandWork expectedWork(const RecordedRun &run, const RecordedCommand &command) {
+  constexpr uint32_t kBlockExperts = 512, kTopK = 10;
+  model::CommandWork work = flashNextWork(command);
+  work.weightReadBytes = static_cast<uint64_t>(model::expectedDistinctExperts(command.rows, kTopK, kBlockExperts) *
+                                               (run.experts - command.residentExperts) / kBlockExperts *
+                                               double(run.expertBytes));
+  return work;
+}
+
+// The share-quantile of `values`, as CostModelStats takes it.
+double quantile(std::vector<double> values, double share) {
+  std::ranges::sort(values);
+  return values[static_cast<size_t>(std::ceil(share * double(values.size()))) - 1];
+}
+
+// A run's commands replayed in order through a price whose sums decay by
+// `decay` a command: its first two seed it as a startup's two warm-ups would
+// (no load was recorded, so the read terms start at zero; seeded at each
+// run's own fitted rate instead, the P95 testDecayFitsRecordedCommands
+// compares stay as they are); before each later one the sums age by the
+// commands the run ran since the last kept one, and it is a whole command of
+// weight 1 whose expected weight reads are the store's, priced before it
+// trains the price. The errors are those prices' relative errors but the
+// first two's, priced from sums of no command or one.
+std::vector<double> replay(const RecordedRun &run, double decay) {
+  CostModel cost(decay);
+  const std::array warmups{sample(flashNextWork(run.commands[0]), run.commands[0].wallMilliseconds),
+                           sample(flashNextWork(run.commands[1]), run.commands[1].wallMilliseconds)};
+  cost.seed(warmups, {});
+  std::vector<double> errors;
+  for (size_t index = 2; index < run.commands.size(); ++index) {
+    const RecordedCommand &command = run.commands[index];
+    cost.age(command.command - run.commands[index - 1].command - 1);
+    const model::CommandWork expected = expectedWork(run, command);
+    if (index > 3)
+      errors.push_back(std::fabs(cost.price(expected) - command.wallMilliseconds) / command.wallMilliseconds);
+    cost.observe(flashNextWork(command), expected, command.wallMilliseconds, 1.0);
+  }
+  return errors;
+}
+
+// kDecay, chosen by replay (amend/S.md A10): the recorded commands of eight
+// Flash-Next churn runs on the M6, the Studio and the M5 Pro, replayed one
+// engine command at a time at each decay, err least at P95 over all runs'
+// commands (a run's own, over 14 to 47 errors, is its largest one to three)
+// at the configured one, a decay within 0.01 of the least counting as least
+// and the largest such winning; at it the median error is within S-P1's 15 %
+// on every run.
+void testDecayFitsRecordedCommands() {
+  constexpr std::array<const char *, 8> runs{"m6-pFa",      "m6-pFb",      "m6-mSMa", "studio-smA",
+                                             "studio-sFNa", "studio-sNFa", "m5-pNTa", "m5-pSMa"};
+  constexpr std::array<double, 5> decays{0.75, 0.9, 0.95, 0.97, 0.99};
+  std::array<std::vector<double>, decays.size()> pooled;
+  std::string table;
+  for (const char *run : runs) {
+    const RecordedRun recorded = recordedRun(run);
+    table += std::string("\n") + run + " (P50/P95):";
+    for (size_t index = 0; index < decays.size(); ++index) {
+      const std::vector<double> errors = replay(recorded, decays[index]);
+      pooled[index].insert(pooled[index].end(), errors.begin(), errors.end());
+      char cell[48];
+      std::snprintf(cell, sizeof cell, " %.2f %.3f/%.3f", decays[index], quantile(errors, 0.5),
+                    quantile(errors, 0.95));
+      table += cell;
+      if (decays[index] == CostModel::kDecay)
+        require(quantile(errors, 0.5) <= 0.15, std::string(run) + "'s median error exceeds 0.15:" + table);
+    }
+  }
+  std::array<double, decays.size()> p95{};
+  for (size_t index = 0; index < decays.size(); ++index)
+    p95[index] = quantile(pooled[index], 0.95);
+  const double least = *std::ranges::min_element(p95);
+  double chosen = 0.0;
+  table += "\nP95 of all runs' errors:";
+  for (size_t index = 0; index < decays.size(); ++index) {
+    if (p95[index] <= least + 0.01)
+      chosen = decays[index];
+    char cell[24];
+    std::snprintf(cell, sizeof cell, " %.2f %.4f", decays[index], p95[index]);
+    table += cell;
+  }
+  require(chosen == CostModel::kDecay,
+          "the recorded commands choose a decay of " + std::to_string(chosen) + ", not kDecay " +
+              std::to_string(CostModel::kDecay) + ":" + table);
+}
+
 constexpr test::TestCase kTests[] = {
     {"testTheSeedReproducesAnExactAffineTruth", testTheSeedReproducesAnExactAffineTruth},
     {"testSeedReadRatesComeFromTheLoad", testSeedReadRatesComeFromTheLoad},
@@ -368,11 +558,18 @@ constexpr test::TestCase kTests[] = {
     {"testWarmupsDoNotCalibrate", testWarmupsDoNotCalibrate},
     {"testTheTermsAreNamed", testTheTermsAreNamed},
     {"testRelativeErrorsAreTheLatestUnits", testRelativeErrorsAreTheLatestUnits},
+    {"testDecayFitsRecordedCommands", testDecayFitsRecordedCommands},
 };
 
 } // namespace
 
+// cost-model [FIXTURE_DIRECTORY] [--list] [--filter ...]
 int main(int argc, char **argv) {
+  if (argc > 1 && argv[1][0] != '-') {
+    fixtureDirectory() = argv[1];
+    --argc;
+    ++argv;
+  }
   const test::TestGroup groups[] = {{"cost", kTests}};
   return test::runTests("cost-model", groups, argc, argv);
 }
