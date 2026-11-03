@@ -608,6 +608,31 @@ void testAReplayPointBesideACheckpointIsReservedInAClaim() {
               std::to_string(passes.model.heldStateBytes));
 }
 
+// amend/M.md B8 (S-9): the ledger prices a byte the expert store misses in a
+// prefill at the scheduler's fitted rate of a byte read, not at what an
+// expected byte adds to a prefill's price, which the share of expected
+// bytes units read scales. On the M6 profile, its prefills reading half the
+// expert bytes they expect (amend/I.md F1: 0.46-0.59), the rate the control
+// pass gives the ledger is the fitted rate, not half of it.
+void testAMissedExpertByteIsPricedAtTheFittedRate() {
+  test::EngineHarness harness({.pages = 1024, .memory = test::FakeMemory::Config{}, .timing = &test::kM6FlashNextQ2});
+  test::seedAsStartup(harness.engine, harness.model, test::kM6FlashNextQ2);
+  harness.model.prefillReadShare = 0.5;
+  EngineRequest prompt = harness.request(1, std::vector<uint32_t>(8 * 2048, 1));
+  prompt.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(prompt));
+  harness.runUntilIdle();
+  harness.engine.refreshMemoryRates(harness.now());
+  const CostTermSnapshot weights =
+      harness.engine.snapshot().scheduler.prefillEstimate.terms[static_cast<size_t>(CostTerm::WeightReadBytes)];
+  const double priced = harness.governor->ledger().rates().weightReadSecondsPerByte * 1000.0;
+  require(std::abs(weights.realizedPerExpected - 0.5) < 0.01, "the prefills did not read half the expected bytes");
+  require(weights.millisecondsPerUnit > 0.0 && std::abs(priced - weights.millisecondsPerUnit) <
+                                                   1e-6 * weights.millisecondsPerUnit,
+          "a missed expert byte was priced " + std::to_string(priced * 1e9) + " ms per GB against the fitted " +
+              std::to_string(weights.millisecondsPerUnit * 1e9) + " ms per GB of bytes read");
+}
+
 // Each engine built on a governor gives its ledger the cache once, and its
 // own lanes only while it lives: a second engine over the same cache, as
 // backend_benchmark builds one beside the bootstrap's, leaves the cache's
@@ -763,6 +788,7 @@ std::span<const test::TestCase> rulesTests() {
        testALaneBelowAWaitingClaimTakesWhatItLacksBeyondTheHeldPages},
       {"testARestoredStateIsPromotedInAClaim", testARestoredStateIsPromotedInAClaim},
       {"testAReplayPointBesideACheckpointIsReservedInAClaim", testAReplayPointBesideACheckpointIsReservedInAClaim},
+      {"testAMissedExpertByteIsPricedAtTheFittedRate", testAMissedExpertByteIsPricedAtTheFittedRate},
       {"testEnginesOnOneGovernorOfferTheCacheOnce", testEnginesOnOneGovernorOfferTheCacheOnce},
       {"testAJunctionTakesNothingWorthMoreThanItSaves", testAJunctionTakesNothingWorthMoreThanItSaves},
       {"testCacheReuseFollowsTheRecentProbes", testCacheReuseFollowsTheRecentProbes},

@@ -1087,16 +1087,14 @@ void Engine::refreshMemoryRates(double now) {
   if (pending_)
     throw std::logic_error("memory rates refreshed while a command is in flight");
   MemoryLedger &ledger = governor().ledger();
-  // The scheduler's prices: a chunk's prefill per row, and a byte the
-  // expert store misses in a prefill (Scheduler::prefillMilliseconds).
+  // The scheduler's prices: a chunk's prefill per row
+  // (Scheduler::prefillMilliseconds), and a byte the expert store misses in
+  // a prefill (Scheduler::weightReadMillisecondsPerByte).
   constexpr uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
-  constexpr uint64_t gib = 1ULL << 30;
   const model::PrefillLane lane{.rows = chunk};
   MemoryRates rates;
   rates.prefillSecondsPerRow = scheduler_.prefillMilliseconds(model_.prefillWork({&lane, 1}, 0, 1)) / chunk / 1000.0;
-  rates.weightReadSecondsPerByte =
-      std::max(0.0, scheduler_.prefillMilliseconds({.weightReadBytes = gib}) - scheduler_.prefillMilliseconds({})) /
-      double(gib) / 1000.0;
+  rates.weightReadSecondsPerByte = scheduler_.weightReadMillisecondsPerByte() / 1000.0;
   rates.spilledReadMillisecondsPerLaneCommand = spilledReadMilliseconds();
   rates.decodeTokensPerLaneCommand = scheduler_.decodeTokensPerLaneCommand();
   // The KV tier's reads once it has read, else the weights' load from the

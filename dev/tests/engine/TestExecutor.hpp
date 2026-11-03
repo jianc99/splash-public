@@ -1107,6 +1107,10 @@ public:
   // take the profile's time and sample its work; with a clock too, each
   // completes once the clock reaches its end (TimedTicket).
   std::optional<TimedWork> timing;
+  // With timing: the share of a prefill's expected expert bytes its
+  // commands read and sample, as the M6 target's units read about half
+  // (amend/I.md F1: 0.46-0.59).
+  double prefillReadShare = 1.0;
   std::function<double()> clock;
   // Runs as each command that takes those times (or commandTimes') is
   // submitted.
@@ -1223,7 +1227,8 @@ private:
         lanes.push_back({.position = static_cast<uint32_t>(item.logicalPosition),
                          .rows = item.tokenCount,
                          .indexPages = item.pageSources ? item.pageSources->indexPages() : 0});
-      const model::CommandWork work = timing->prefillWork(lanes, plan.pass, plan.passes);
+      model::CommandWork work = timing->prefillWork(lanes, plan.pass, plan.passes);
+      work.weightReadBytes = static_cast<uint64_t>(double(work.weightReadBytes) * prefillReadShare);
       times = prefillTimes(profile, work);
       if (experts) {
         const auto routed = static_cast<uint64_t>(work.layers * distinctExperts(profile, work.rows));

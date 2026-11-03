@@ -132,8 +132,8 @@ struct UnitCost final {
 // The rates units are priced at, set once per control pass (setRates).
 struct MemoryRates final {
   double prefillSecondsPerRow = 0.0;      // Scheduler::prefillMilliseconds of a 2048-row command, per row
-  // Scheduler::prefillMilliseconds({.weightReadBytes = b}) less that of no
-  // work, per byte: what a byte the expert store misses in a prefill costs.
+  // Scheduler::weightReadMillisecondsPerByte, per second: what a byte the
+  // expert store misses in a prefill costs.
   double weightReadSecondsPerByte = 0.0;
   // The engine's decayed mean of a decode command's hot-block read time
   // (CommandSample::spilledKvReadMilliseconds) per lane with Index pages;
