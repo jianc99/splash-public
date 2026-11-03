@@ -2084,8 +2084,16 @@ void testHigherTierCommandsDoNotAgeALowerTier() {
 
 // --- Superseding a command between its passes --------------------------------------------------------------
 
-// D2: a same-priority arrival abandons a command between its passes iff the
-// summed completion falls: |A|(K' + W) + |O| W < |J| R.
+// The scale of its profile's time at which pass `plan.pass` of `plan` runs
+// twice the unit's bound by its price: past it, a plan of the command's
+// priority may cut or drop the rows it started (Scheduler::ranPastItsBound).
+double pastTheBound(const Sim &sim, const BatchPlan &plan) {
+  return 2.0 * sim.bound() / sim.price(plan.items, plan.pass, plan.passes);
+}
+
+// D2: a same-priority arrival abandons a command between its passes whose
+// last pass ran past its unit's bound iff the summed completion falls:
+// |A|(K' + W) + |O| W < |J| R.
 void testASameTierArrivalSupersedesOnlyWhenTheSumFalls() {
   for (const bool other : {false, true}) {
     for (const double share : {0.5, 1.5}) {
@@ -2094,7 +2102,8 @@ void testASameTierArrivalSupersedesOnlyWhenTheSumFalls() {
       sim.lane(1, 0, 3 * 8192);
       const BatchPlan command = sim.plan();
       require(command.passes > 2, "the long command did not run in passes");
-      sim.run(command);
+      require(sim.run(command, pastTheBound(sim, command)) > sim.bound(),
+              "the long command's pass did not run past its bound");
       if (other)
         sim.lane(3, 0, 6 * 8192);
       sim.lane(2, 8192, 300);
@@ -2170,6 +2179,57 @@ void testARegroupHappensOnlyWhenTheSumFalls() {
     require((gain > 0.0) == early, "the case does not straddle the rule");
     const bool abandons = sim.scheduler.abandonsPasses(sim.plan(), sim.in());
     require(abandons == early, "a regroup did not follow the summed completion");
+  }
+}
+
+// T6 (owner 11-03): a plan of the command's priority does not cut or drop
+// the rows a command between its passes started; its lanes wait for the
+// command's end and batch in the next. A 9,500-row prompt leads a 6144-row
+// command in passes (about 12 s); a 300-row turn of its priority arrives
+// after W of it and leads a plan with the long lane's last 1308 rows, which
+// the summed completion takes after W = 3 s and 8 s alike, though 8192 rows
+// of the long lane's would run again after it (smoke b: 5-6.7 s of the M6's
+// prefill thrown away). Only a command whose last pass ran past its unit's
+// bound is re-cut as before (testEveryContendedUnitWithinItsBound).
+void testASameTierArrivalLeavesTheRowsACommandStarted() {
+  for (const double elapsed : {3000.0, 8000.0}) {
+    for (const bool past : {false, true}) {
+      Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
+      sim.seed();
+      sim.lane(1, 0, 9500);
+      const BatchPlan command = sim.plan();
+      require(command.width() == 1 && command.items[0].tokenCount == 6144 && command.passes > 2,
+              "the long prompt did not lead a command of 6144 rows in passes");
+      double wall = sim.run(command);
+      while (sim.passes && sim.passes->elapsedMilliseconds < elapsed)
+        wall = sim.run(sim.passes->plan);
+      if (past && sim.passes)
+        wall = sim.run(sim.passes->plan, pastTheBound(sim, sim.passes->plan));
+      require(sim.passes.has_value(), "the command ended before W");
+      const std::string after = "after W " + std::to_string(sim.passes->elapsedMilliseconds) + " ms, its last pass " +
+                                std::to_string(wall) + " ms, its bound " + std::to_string(sim.bound()) + " ms: ";
+      require((wall > sim.bound()) == past, after + "the case does not straddle the bound");
+      sim.lane(2, 8192, 300);
+      const BatchPlan fresh = [&] {
+        const PassProgress kept = *sim.passes;
+        sim.passes.reset();
+        const BatchPlan result = sim.plan();
+        sim.passes = kept;
+        return result;
+      }();
+      require(fresh.items == std::vector<BatchItem>{{2, 300, 8192}, {1, 1308, 0}},
+              after + "the turn did not lead a plan with the long lane's sparing rows");
+      const bool abandons = sim.scheduler.abandonsPasses(sim.plan(), sim.in());
+      require(abandons == past, after + "the turn did " + (abandons ? "" : "not ") + "supersede the command");
+      if (past)
+        continue;
+      while (sim.passes)
+        sim.step();
+      const BatchPlan next = sim.plan();
+      require(next.kind == WorkKind::Prefill && std::ranges::count(next.items, 2u, &BatchItem::requestId) == 1 &&
+                  sim.scheduler.snapshot().abandonedPassCommands == 0,
+              after + "the turn did not run in the command after the long lane's");
+    }
   }
 }
 
@@ -2279,7 +2339,10 @@ void testAnAbandonmentDoesNotMakeALaneOverdue() {
     sim.seed();
     sim.lane(1, 0, 3 * 8192);
     const BatchPlan command = sim.plan();
-    sim.run(command);
+    // Its pass ran past its bound, so its priority's arrival may drop its
+    // rows (testASameTierArrivalLeavesTheRowsACommandStarted).
+    require(sim.run(command, pastTheBound(sim, command)) > sim.bound(),
+            "the command's pass did not run past its bound");
     sim.lane(2, 8192, 300);
     const BatchPlan fresh = [&] {
       const PassProgress kept = *sim.passes;
@@ -2411,16 +2474,17 @@ void testOnlyAHeldStartLiftsTheCommand() {
   }
 }
 
-// D2: under 300-row turns arriving every 5 s, each superseding the long
-// lane's command partway through its passes, the long lane's abandoned
-// commands and the turns' units count as its wait until it has waited K
-// times its expected remaining cost, after which it leads to its end: its
-// first token within K times that cost (its price, at its highest over the
-// run), its own time alone and a unit. Without its abandoned time in its
-// wait it is overdue only once the turns' units alone reach that, which
-// here doubles the wait. (A turn takes 2.5-2.8 s on the profile: turns 3 s
-// apart would leave the long lane a few tenths of a second a cycle, so its
-// abandoned time would barely count.)
+// D2: under 300-row turns arriving every 5 s, which supersede the long
+// lane's command partway through its passes only where a pass of it ran
+// past its bound (testASameTierArrivalLeavesTheRowsACommandStarted), the
+// long lane's abandoned commands and the turns' units count as its wait
+// until it has waited K times its expected remaining cost, after which it
+// leads to its end: its first token within K times that cost (its price, at
+// its highest over the run), its own time alone and a unit. Without its
+// abandoned time in its wait it is overdue only once the turns' units alone
+// reach that, which here doubles the wait. (A turn takes 2.5-2.8 s on the
+// profile: turns 3 s apart would leave the long lane a few tenths of a
+// second a cycle, so its abandoned time would barely count.)
 void testRepeatedSupersedesEndOnceTheLongLaneIsOverdue() {
   const auto alone = [] {
     Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
@@ -2465,7 +2529,6 @@ void testRepeatedSupersedesEndOnceTheLongLaneIsOverdue() {
     });
   }
   const SchedulerSnapshot counts = sim.scheduler.snapshot();
-  require(counts.abandonedPassCommands > 3, "the turns did not supersede the long lane's command");
   require(sim.scheduler.phase(1) != Phase::Prefill && sim.now <= 3.0 * priced + alone + longest,
           "the long lane's prompt ended after " + std::to_string(sim.now) + " ms, past K times its " +
               std::to_string(priced) + " ms priced and its " + std::to_string(alone) + " ms alone, after " +
@@ -2517,7 +2580,11 @@ void testAnAbandonedCommandsRowsCountOnce() {
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   sim.seed();
   sim.lane(1, 0, 3 * 8192);
-  sim.run(sim.plan());
+  // Its pass runs past its bound, so the turn may drop its rows
+  // (testASameTierArrivalLeavesTheRowsACommandStarted).
+  const BatchPlan first = sim.plan();
+  require(sim.run(first, pastTheBound(sim, first)) > sim.bound(),
+          "the long command's pass did not run past its bound");
   require(sim.passes.has_value(), "the long command did not run in passes");
   sim.lane(2, 8192, 300);
   require(sim.scheduler.abandonsPasses(sim.plan(), sim.in()), "the turn did not supersede the long command");
@@ -2821,6 +2888,7 @@ constexpr test::TestCase kTests[] = {
     {"testASameTierArrivalSupersedesOnlyWhenTheSumFalls", testASameTierArrivalSupersedesOnlyWhenTheSumFalls},
     {"testAHigherTierAbandonCountsLanesWaitingBehindBoth", testAHigherTierAbandonCountsLanesWaitingBehindBoth},
     {"testARegroupHappensOnlyWhenTheSumFalls", testARegroupHappensOnlyWhenTheSumFalls},
+    {"testASameTierArrivalLeavesTheRowsACommandStarted", testASameTierArrivalLeavesTheRowsACommandStarted},
     {"testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt", testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt},
     {"testAnOverdueLaneIsNeverAbandoned", testAnOverdueLaneIsNeverAbandoned},
     {"testAnAbandonmentDoesNotMakeALaneOverdue", testAnAbandonmentDoesNotMakeALaneOverdue},

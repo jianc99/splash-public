@@ -1561,8 +1561,14 @@ about as long as the one planned again, whose fixed part outweighs a few short
 prompts' rows. Requests that arrive during a command's first pass, as an
 agent's concurrent turns do, so end their prompts together, a pass and a
 command after the first arrived; prompts ready late in its passes, or with
-rows that make the command planned again much longer, wait for its end. A
-prompt of a higher priority supersedes the command by the same rule once that
+rows that make the command planned again much longer, wait for its end. An
+arrival of no higher priority cuts or drops none of the rows the command
+started: where its plan would give a lane of the command fewer rows, or none,
+it waits for the command's end and batches in the next, unless the command's
+last pass ran past its unit's bound (max(G, turnaround / 0.1), or that pass's
+price where a lane holds the model's fewest rows), which a re-cut brings back
+within it. A prompt of a higher priority supersedes the command by the same
+rule once that
 prompt's command runs, the command's lanes losing the passes they ran. That
 trades the higher priority's first token for the lower one's work: a
 Foreground prompt that arrives late in a Background command's passes waits for

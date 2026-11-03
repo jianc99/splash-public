@@ -175,7 +175,9 @@ struct SchedulerSnapshot final {
 // what it adds to the others is less than what it saves (summed
 // completion). The command between its
 // passes runs its later passes before any other prefill but a plan whose
-// summed completion of the lanes concerned is shorter (supersedes). Decode
+// summed completion of the lanes concerned is shorter (supersedes); an
+// arrival of no higher priority cuts or drops none of the rows the command
+// started unless its last pass ran past its unit's bound. Decode
 // takes the ready lanes of one priority and stage, constrained or not,
 // without waiting for more, so it runs only the four real M8/M16/M24/M32
 // shapes, between a command's passes too.
@@ -370,8 +372,17 @@ private:
   // Whether abandoning the command between its passes for `plan` shortens
   // the summed completion of the lanes concerned (gain), with no lane of the
   // command overdue once abandoned and none of the plan left out of its first
-  // pass.
+  // pass. A plan of no higher priority than the command's with a lane it
+  // does not hold (an arrival) that would give a lane of it fewer rows, or
+  // none, waits for its end and batches in the next command, unless the
+  // command ran past its bound (ranPastItsBound).
   [[nodiscard]] bool supersedes(const BatchPlan &plan, const PlanInputs &in) const;
+  // Whether the last pass of the command between its passes ran past its
+  // unit's bound, max(G, turnaround / kPassOverheadShare), or where a lane
+  // of it holds the fewest rows the model's faster path takes, past the
+  // price of that pass, which planning lets exceed the bound: a re-cut
+  // brings its passes back within it (testEveryContendedUnitWithinItsBound).
+  [[nodiscard]] bool ranPastItsBound(const PlanInputs &in) const;
   // What abandoning the command between its passes for a plan of `lanes`
   // (and `starts` more lanes not yet resident) of `priority` saves the
   // lanes of the command, of the plan, and the ready lanes of their
@@ -424,6 +435,9 @@ private:
   // commands' wall time has worked it off.
   double decodeDebtMilliseconds_ = 0.0;
   std::optional<WorkKind> lastCommittedKind_;
+  // The rows' time of the prefill pass that ran last: for a command between
+  // its passes, that of its last pass (ranPastItsBound).
+  double lastPassMilliseconds_ = 0.0;
   SchedulerSnapshot counters_;
   model::FineLatencyHistogram contendedPrefill_;
 };

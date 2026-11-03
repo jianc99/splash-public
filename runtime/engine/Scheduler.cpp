@@ -421,9 +421,30 @@ bool Scheduler::supersedes(const BatchPlan &plan, const PlanInputs &in) const {
   for (const BatchItem &item : plan.items)
     if (!holds(command.plan.items, item.requestId))
       joiners.push_back(item);
-  return supersedeGain(plan.items, 0, get(plan.items.front().requestId).spec.priority,
+  // An arrival of no higher priority leaves the command the rows it started:
+  // where its plan gives a lane of it that did not end fewer rows, or none,
+  // it waits for the command's end and batches in the next command.
+  const RequestPriority priority = get(plan.items.front().requestId).spec.priority;
+  const auto cut = [&](const BatchItem &item) {
+    const auto held = std::ranges::find(plan.items, item.requestId, &BatchItem::requestId);
+    return held == plan.items.end() ? !shapeOf(item.requestId, in).ended : held->tokenCount < item.tokenCount;
+  };
+  if (!joiners.empty() && priority >= get(command.plan.items.front().requestId).spec.priority &&
+      std::ranges::any_of(command.plan.items, cut) && !ranPastItsBound(in))
+    return false;
+  return supersedeGain(plan.items, 0, priority,
                        passesMilliseconds(prefillLanes(plan.items, in), 0, plan.passes),
                        passesMilliseconds(prefillLanes(joiners, in), 0, plan.passes), in) > 0.0;
+}
+
+bool Scheduler::ranPastItsBound(const PlanInputs &in) const {
+  const BatchPlan &command = in.passes->plan;
+  double limit = bound();
+  if (std::ranges::any_of(command.items,
+                          [&](const BatchItem &item) { return item.tokenCount <= config_.limits.minimumUnitRows; }))
+    limit = std::max(limit, cost_.price(work_.prefillWork(prefillLanes(command.items, in), command.pass - 1,
+                                                          command.passes)));
+  return lastPassMilliseconds_ > limit;
 }
 
 double Scheduler::supersedeGain(std::span<const BatchItem> lanes, uint32_t starts, RequestPriority priority,
@@ -863,6 +884,7 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
     ++counters_.prefillUnits;
     const double rowsMilliseconds =
         wallMilliseconds - std::clamp(sample.imageEncodeMilliseconds, 0.0, std::max(wallMilliseconds, 0.0));
+    lastPassMilliseconds_ = timed ? rowsMilliseconds : 0.0;
     if (timed) {
       if (activeContended_)
         contendedPrefill_.add(static_cast<uint64_t>(wallMilliseconds * 1e6));
