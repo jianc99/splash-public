@@ -952,16 +952,19 @@ def floor_unit(run: Run) -> dict | None:
     """The ANE row floor (AMENDMENTS, owner 11-03 03:10): where the Neural
     Engine's FFN split is on, a contended unit is never cut below the split's
     threshold (ane_ffn.minimum_rows, model::CommandLimits::minimumUnitRows;
-    the engine keeps it after the split stops), so a unit of those rows may
-    take longer than max(G, u/share): as long as the engine prices it. That
-    price, from the run's samples: of each interval whose prefill commands,
-    with those of the interval before, averaged fewer than twice the floor's
-    rows (a prompt's last rows go to one unit or two even ones, Scheduler
-    planPrefill), the price per gap of the prefill units the decode gaps
-    past the bound waited on (metrics.decode_gap_causes: prefill_predicted_ms
-    over prefill_unit.gaps); the longest, over `intervals` of them, as
-    unit_ms (None where none shows). None where the split was never on
-    (state off, or no ane_ffn: 1.5.0), so those runs keep max(G, u/share)."""
+    the engine keeps it after the split stops), and a prompt's last rows,
+    fewer than twice it, run as one unit or two even ones (Scheduler
+    planPrefill), so the floor's units may take longer than max(G, u/share):
+    as long as the engine prices them. That price, from the run's samples:
+    of each interval whose prefill commands, with those since the longest
+    contended unit before its start (the commands its gaps waited on began
+    then at the earliest) and at least those of the interval before,
+    averaged fewer than twice the floor's rows, the price per gap of the
+    prefill units the decode gaps past the bound waited on
+    (metrics.decode_gap_causes: prefill_predicted_ms over prefill_unit.gaps);
+    the longest, over `intervals` of them, as unit_ms (None where none
+    shows). None where the split was never on (state off, or no ane_ffn:
+    1.5.0), so those runs keep max(G, u/share)."""
     split = [
         value(s["status"], "ane_ffn")
         for s in run.samples
@@ -971,11 +974,17 @@ def floor_unit(run: Run) -> dict | None:
     if rows <= 1:
         return None
     statuses = [s["status"] for s in run.samples]
+    times = [s["t"] for s in run.samples]
+    longest = value(run.last, "scheduler.contended_prefill_ms.max", 0.0) / 1000
     prices = []
     for i in range(1, len(statuses)):
-        first, earlier, later = statuses[max(0, i - 2)], statuses[i - 1], statuses[i]
+        first = max(
+            (j for j in range(i - 1) if times[j] <= times[i - 1] - longest), default=0
+        )
+        earlier, later = statuses[i - 1], statuses[i]
         commands, committed = (
-            value(later, f"scheduler.{path}", 0) - value(first, f"scheduler.{path}", 0)
+            value(later, f"scheduler.{path}", 0)
+            - value(statuses[first], f"scheduler.{path}", 0)
             for path in ("prefill_batches", "prefill_rows")
         )
         gaps, priced = (

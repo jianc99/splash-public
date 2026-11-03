@@ -926,7 +926,9 @@ class GateTests(unittest.TestCase):
         self.assertEqual(facts["failures"], [])
         self.assertAlmostEqual(facts["g4"]["contended_p95_ms"], 900.0)
 
-    def ane_floor_run(self, label, ane_ffn, contended_max=1408.0, wide=0):
+    def ane_floor_run(
+        self, label, ane_ffn, contended_max=1408.0, wide=0, tail=None, long_gaps=0
+    ):
         # smoke-b-27b-churn-A1 (M6, f0724a9d; results/smoke-b-m6-mini.md
         # checks 4 and 9): the 27B with the Neural Engine's FFN split, at
         # share 0.735 for chunks of 512 rows or more. G 500 ms, the units
@@ -934,16 +936,22 @@ class GateTests(unittest.TestCase):
         # 1178-1408 ms each, the longest 1408 ms (p95 read 2097.152, its
         # bucket's edge); client gaps p50 119 ms, p99 1509 ms. Each 2 s
         # interval here: first 18 of the first prompt alone (a 2048-row
-        # command each, no gap), then 86 of one contended
-        # command each, waited on by both decoders' gaps and priced 1 %
-        # under the smoke's unit means (e95 0.0228), the last `wide` of them
-        # 2048-row commands priced 2.8 s, then decodes alone to 240 s.
+        # command each, no gap), then 86 of one contended command each,
+        # waited on by both decoders' gaps and priced 1 % under the smoke's
+        # unit means (the smoke records no prices: an assumption within its
+        # e95 0.0228), the last `wide` of them 2048-row commands priced
+        # 2.8 s, then decodes alone to 240 s. `tail`: the prices of two even
+        # 750-row units (the scheduler's share of a prompt's last 1500 rows)
+        # after them, each longer than the 2 s between samples: committed at
+        # 210 s and 214 s, their gaps ending at 214 s and 218 s. `long_gaps`
+        # client gaps of 2480 ms replace as many of 1509 ms.
         estimate = {
             "terms": [{"quantity": "units", "ms_per_unit": 0.0}],
             "relative_error": {"p50": 0.01, "p95": 0.0228},
         }
         samples, rows, commands, gaps, priced = [], 0, 0, 0, 0.0
         for interval in range(121):
+            price = None
             if 0 < interval <= 18:
                 commands += 1
                 rows += 2048
@@ -952,8 +960,15 @@ class GateTests(unittest.TestCase):
                 broad = k >= 86 - wide
                 commands += 1
                 rows += 2048 if broad else 512
+                price = 2800.0 if broad else 0.99 * (1178 + 230 * k / 85)
+            elif tail and interval in (105, 107):
+                commands += 1
+                rows += 750
+            if tail and interval in (107, 109):
+                price = tail[(interval - 107) // 2]
+            if price is not None:
                 gaps += 2
-                priced += 2 * (2800.0 if broad else 0.99 * (1178 + 230 * k / 85))
+                priced += 2 * price
             samples.append(
                 self.schema7(
                     2 * interval,
@@ -965,9 +980,9 @@ class GateTests(unittest.TestCase):
                         "max": contended_max,
                     },
                     metrics__decode_gap_causes={
-                        "prefill_unit": {"gaps": gaps, "ms": 0.0},
+                        "prefill_unit": {"gaps": gaps, "ms": priced / 0.99},
                         "prefill_predicted_ms": priced,
-                        "prefill_ms": 0.0,
+                        "prefill_ms": priced / 0.99,
                     },
                     **({} if ane_ffn is None else {"ane_ffn": ane_ffn}),
                 )
@@ -980,7 +995,10 @@ class GateTests(unittest.TestCase):
                 "ttft": 36,
                 "decode_tps": 25,
                 "chunks_ms": [
-                    sum(1509 if g % 10 == 9 else 119 for g in range(event))
+                    sum(
+                        (2480 if g // 10 < long_gaps else 1509) if g % 10 == 9 else 119
+                        for g in range(event)
+                    )
                     for event in range(100)
                 ],
             }
@@ -992,8 +1010,8 @@ class GateTests(unittest.TestCase):
         # The owner's ANE row floor (AMENDMENTS, 11-03 03:10) lets a contended
         # unit exceed G where the split is on: its bound is max(G, u/0.1, the
         # longest price of a unit of the floor's rows), 1408 * 0.99 ms here,
-        # its limit that times 1 + e95: 1427.5 ms, over the 1408 ms unit; G4b
-        # 1427.5 + 119 ms over the 1509 ms p99. Before it, G4a/G4b failed:
+        # its limit that times 1 + e95: 1425.7 ms, over the 1408 ms unit; G4b
+        # 1425.7 + 119 ms over the 1509 ms p99. Before it, G4a/G4b failed:
         # "contended prefill p95 1408 ms over 511 ms", "client gap p99 1509 ms
         # over 630 ms" (the smoke's own check output). A split that stopped
         # while serving keeps the floor the engine started with.
@@ -1012,6 +1030,31 @@ class GateTests(unittest.TestCase):
             floor = facts["g4"]["floor"]
             self.assertEqual((floor["minimum_rows"], floor["intervals"]), (512, 85))
             self.assertAlmostEqual(floor["unit_ms"], 0.99 * 1408)
+
+    def test_g4_allows_a_prompts_last_rows_the_floor_shares(self):
+        # A prompt's last 1500 rows run as two even 750-row units (fewer than
+        # twice the floor's rows: Scheduler planPrefill), priced 2300 and
+        # 2400 ms and the longest taking 2440 ms, longer than the 2 s between
+        # samples. The second one's gaps end two intervals after its commit,
+        # with no command since: its price counts through the commands since
+        # the longest unit before its interval. Its limit, 2400 * 1.0228 =
+        # 2454.7 ms, holds the 2440 ms unit; G4b 2454.7 + 119 ms the six
+        # 2480 ms client gaps of the p99. Through the interval before alone,
+        # the bound would be the first one's price, its limit 2352.4 ms.
+        split = {"state": "split", "share": 0.735, "minimum_rows": 512}
+        facts = matrix.health(
+            self.ane_floor_run(
+                "tail", split, contended_max=2440.0, tail=(2300.0, 2400.0), long_gaps=2
+            ),
+            self.machine,
+            self.gates,
+        )
+        self.assertEqual(facts["failures"], [])
+        self.assertAlmostEqual(facts["client_gap_p99_s"], 2.48)
+        floor = facts["g4"]["floor"]
+        # 2440 ms reaches back three samples: the first two contended
+        # intervals' windows hold the alone prompt's 2048-row commands.
+        self.assertEqual((floor["intervals"], floor["unit_ms"]), (86, 2400.0))
 
     def test_g4_fails_a_unit_past_the_ane_row_floors_price(self):
         # A unit of the floor's rows that took 1.9 s, past its price's
@@ -1034,7 +1077,7 @@ class GateTests(unittest.TestCase):
         )
         self.assertEqual([f[:4] for f in uncut["failures"]], ["G4a:", "G4b:"])
         floor = uncut["g4"]["floor"]
-        self.assertEqual(floor["intervals"], 39)
+        self.assertEqual(floor["intervals"], 38)
         self.assertLess(floor["unit_ms"], 1300)
 
     def test_g4_judges_a_run_without_the_split_as_before(self):
