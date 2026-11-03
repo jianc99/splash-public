@@ -1089,6 +1089,7 @@ private:
   [[nodiscard]] LeafGoes leafGoes(uint64_t block, ReclaimTiming timing, bool landed = false) const;
   [[nodiscard]] LeafGoes leafGoesUncopied(uint64_t block, ReclaimTiming timing, bool landed) const;
   void stateOut(uint64_t block, bool inUse);
+  void demotionLands(uint64_t block);
   [[nodiscard]] uint32_t takeState(uint64_t block, bool inUse);
   [[nodiscard]] uint32_t trimTail(uint64_t block);
   [[nodiscard]] bool pinnedBesides(uint64_t block) const;
@@ -1128,7 +1129,8 @@ private:
   // those of the tails states unpin, into the free Slim pages left.
   std::unordered_set<uint32_t> trimmed_;
   uint32_t slimRoom_ = 0;
-  std::unordered_set<uint64_t> leftRam_, demoting_, diskParents_, statesOut_, statesDropped_, copyingAhead_;
+  std::unordered_set<uint64_t> leftRam_, demoting_, diskParents_, statesOut_, statesDropped_, copyingAhead_,
+      heldDemotions_;
   std::unordered_map<uint64_t, uint64_t> recency_;
   // The unit being weighed: what it costs, whether it holds a victim of
   // certain reuse or in use, and a state written as it goes; where it
@@ -1175,12 +1177,15 @@ Cache::ReclaimPlan::ReclaimPlan(const Cache &owner, const Walk &plan, const Memo
   }
   // What goes once the transfers in flight land: the parent of a page a
   // demotion frees (freesOnLanding), and a leaf whose copy ahead is in
-  // flight.
+  // flight. A demotion whose page a child or a state in RAM holds frees it
+  // once they leave (demotionLands).
   for (const Write &write : cache.writes_) {
     if (cache.freesOnLanding(write))
       demoting_.insert(write.block);
     else if (write.write == WriteClass::Persist)
       copyingAhead_.insert(write.block);
+    else if (write.write == WriteClass::Reclaim)
+      heldDemotions_.insert(write.block);
   }
   for (const Write &write : cache.writes_) {
     if (cache.freesOnLanding(write))
@@ -1282,11 +1287,14 @@ std::optional<engine::Victim> Cache::ReclaimPlan::weigh(Weighed weighed) {
                                                 walk.keeps(kv::PageForm::Full));
     reusable_ -= std::min(reusable_, completed * extentPages_);
   }
-  return engine::Victim{.bytes = weighed.bytes + (walk.device ? laterBytes(weighed.landing) : 0),
+  // Bytes that land free later, also those of demotions in flight that
+  // its victims let free their pages (demotionLands).
+  const uint64_t later = walk.device ? laterBytes(weighed.landing) : 0;
+  return engine::Victim{.bytes = weighed.bytes + later,
                         .pages = weighed.pages,
                         .form = walk.form,
                         .stateBuffers = weighed.states,
-                        .later = demotions_ > weighed.demotions || written_ || unitTakes_.now.has_value(),
+                        .later = later || demotions_ > weighed.demotions || written_ || unitTakes_.now.has_value(),
                         .certainReuse = certain_,
                         .cls = inUse_ ? ReclaimClass::InUse : ReclaimClass::Ordinary,
                         .cost = cost_};
@@ -1877,6 +1885,25 @@ void Cache::ReclaimPlan::stateOut(uint64_t block, bool inUse) {
   } else if (!states.onDisk(block)) {
     statesDropped_.insert(block);
   }
+  demotionLands(block);
+}
+
+// A demotion in flight on a block that was no resident leaf, or kept a
+// state in RAM, frees its page as it lands once the block's last resident
+// child or its state left RAM (Cache::freesOnLanding): for a claim that can
+// wait, the page lands, and the parent goes once it has.
+void Cache::ReclaimPlan::demotionLands(uint64_t block) {
+  const KvCache &kv = cache.kv_;
+  if (timing() == ReclaimTiming::Immediate || !heldDemotions_.contains(block) || ramState(block) ||
+      cache.pool_.pageActive(kv.page(block)) ||
+      std::ranges::any_of(kv.children(block), [&](uint64_t child) {
+        return kv.page(child) != KvCache::noPage && !leftRam_.contains(child);
+      }))
+    return;
+  heldDemotions_.erase(block);
+  demoting_.insert(block);
+  ++landing_[static_cast<size_t>(cache.pool_.form(kv.page(block)))];
+  joinParent(block);
 }
 
 // A state goes, and its leaf joins the leaves; one that leaves the cache
@@ -1975,6 +2002,7 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::takeLeaf(uint64_t block, LeafGoes g
   } else {
     freePage(page);
     leftRam_.insert(block);
+    demotionLands(parent);
   }
   if (goes == LeafGoes::Copy) {
     if (parent)
@@ -2046,6 +2074,8 @@ std::vector<uint32_t> Cache::trimmedBy(const Walk &walk) const {
 }
 
 uint64_t Cache::landedSince(const Walk &walk, const std::array<uint32_t, 3> &before) const noexcept {
+  if (walk.timing == ReclaimTiming::Immediate)
+    return 0;
   const std::array<uint32_t, 3> landing = demotedPages();
   uint64_t bytes = 0;
   for (const kv::PageForm form : {kv::PageForm::Full, kv::PageForm::Slim, kv::PageForm::Index}) {

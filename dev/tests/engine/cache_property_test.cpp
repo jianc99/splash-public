@@ -492,26 +492,35 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 
 // The same runs with the walk's units for a device need weighed and taken
 // beside the other steps: no unit frees less than the walk weighed.
+// Windowed seeds 2484 and 9349 run too: in them a unit's evictions take the
+// last resident child of a block whose demotion is in flight, whose page
+// then frees as it lands, for a claim that cannot wait (2484) and one that
+// can (9349).
 void testPeekNeverOverstates(uint32_t plainSeeds, uint32_t windowedSeeds) {
   uint64_t exact = 0, unsure = 0, landing = 0;
-  for (const bool windowed : {false, true})
-    for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed) {
-      Run run(seed, windowed, true);
-      try {
-        for (int step = 0; step < 600; ++step)
-          run.step();
-        run.endRequests();
-        run.drain();
-      } catch (const std::exception &error) {
-        throw std::runtime_error(std::string(windowed ? "peek windowed " : "peek ") + "seed " + std::to_string(seed) +
-                                 ": " + error.what());
-      }
-      exact += run.exactUnits;
-      unsure += run.unsureUnits;
-      landing += run.landingUnits;
+  const auto check = [&](uint32_t seed, bool windowed) {
+    Run run(seed, windowed, true);
+    try {
+      for (int step = 0; step < 600; ++step)
+        run.step();
+      run.endRequests();
+      run.drain();
+    } catch (const std::exception &error) {
+      throw std::runtime_error(std::string(windowed ? "peek windowed " : "peek ") + "seed " + std::to_string(seed) +
+                               ": " + error.what());
     }
-  std::cout << "cache peek runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds << " windowed; " << exact
-            << " units released what they were weighed at, " << unsure << " after a copy or a write, " << landing
+    exact += run.exactUnits;
+    unsure += run.unsureUnits;
+    landing += run.landingUnits;
+  };
+  for (const bool windowed : {false, true})
+    for (uint32_t seed = 1; seed <= (windowed ? windowedSeeds : plainSeeds); ++seed)
+      check(seed, windowed);
+  check(2484, true);
+  check(9349, true);
+  std::cout << "cache peek runs ok: " << plainSeeds << " plain seeds, " << windowedSeeds
+            << " windowed and windowed seeds 2484 and 9349; " << exact << " units released what they were weighed at, "
+            << unsure << " after a copy or a write, " << landing
             << " freeing extents as their copies land, never more than taken\n";
 }
 

@@ -1273,7 +1273,7 @@ private:
                                        std::optional<uint32_t> demoting = std::nullopt) const;
   // The bytes of the extents the pages of the demotions started since
   // `before` pages were landing, by form, complete as they land, past the
-  // runway the walk keeps.
+  // runway the walk keeps; none for a walk that cannot wait.
   [[nodiscard]] uint64_t landedSince(const Walk &walk, const std::array<uint32_t, 3> &before) const noexcept;
   // For a shortfall of pages of the form in a cache that spills or trims:
   // the empty extents of the other forms beyond the runway each keeps, and
