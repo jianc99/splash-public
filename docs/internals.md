@@ -1244,8 +1244,11 @@ displacing cheaper cache once a pass (`/status`: `memory_governor.accounts`,
 growth). Claims take a pool's units at its measured rate, which falls over
 idle time too, or, while a request that took them prefills or shares the
 engine with another, at that request's own rate since it began, whichever is
-higher: a store chunk a long prompt took comes back right after the prompt
-when it decodes alone, and not while other requests keep taking chunks. A
+higher; what the host's claim, another pool's growth or the engine's own
+claims take while such a request runs (or a request waits for what the host
+refused it) counts as theirs, at its rate since the first of those takes: a
+store chunk a long prompt took comes back right after the prompt when it
+decodes alone, and not while other requests keep taking chunks. A
 temporary SSD cache copies ahead only on
 demand, while a recent claim reached cache a copy would have let go at once,
 and only until the uncopied units at the head of the order hold about twice

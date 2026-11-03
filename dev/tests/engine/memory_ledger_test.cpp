@@ -3122,6 +3122,178 @@ void testTheM6HostPatternTakesNoRegrownUnitBack() {
               history);
 }
 
+// The M6's 64K prompt beside two decoders as smoke b recorded it
+// (smoke-b-long64k: Flash-Next Q2_0 with DFlash2 at default memory, server
+// log 06:34:43-56, seconds from Ready). The store holds its 1023 MiB chunk
+// above its floor, worth about 3.4 s over the horizon against a cycle of
+// 0.129 s, as in testTheM6HostPatternTakesNoRegrownUnitBack; its 179 MiB
+// chunk, which it gives back first, had gone before (the host's first take
+// is of the 1023 MiB one) and plays no part. Request 2 prefills beside
+// request 1, which decodes: both are in demand. At 66.4 s the host lacks
+// 5.0 MiB of its margin, and its claim takes the 1023 MiB chunk; at 71.4 s
+// other applications give back 5.5 MiB, and the host admits the chunk beside
+// its margin again; at 79.5 s request 3, the 64K prompt, starts and needs
+// 263.7 MiB. The store grew the chunk back at 71.5 s at its own take rate
+// (0.0154 a second keeps 0.40 of what the chunk saves), the host refused the
+// start, and its claim took the chunk back for the 263.2 MiB the start then
+// lacked, 8 s after the chunk grew (amend/V.md A30: no unit regrown is taken
+// back within the horizon; matrix.py's store churn counts it). What the
+// host's claim takes while lanes are in demand it takes for them: no unit the
+// store grows back goes back within the horizon, the start is admitted at
+// once, and once the requests end at 120 s the store grows the chunk back
+// within two passes and keeps it.
+void testTheM6LongPromptHostPatternTakesNoRegrownUnitBack() {
+  constexpr uint64_t kLarge = 1023 * kMiB, kFloor = 7210 * kMiB, kLanes = 600 * kMiB;
+  constexpr uint64_t kStart = 276'509'491;  // 263.7 MiB
+  constexpr uint64_t kEngine = kFloor + kLarge + kLanes;
+  Fixture fixture(host(kEngine + kHostMarginBytes + 100 * kMiB, MemoryPressure::Normal,
+                       {at(66400.0, kEngine + kHostMarginBytes - 5 * kMiB),
+                        at(71400.0, kEngine + kHostMarginBytes + kMiB / 2)}));
+  ChunkedStore store(fixture.memory, kFloor, {{.bytes = kLarge, .releaseMilliseconds = 51.4}}, {0},
+                     24576ULL * 1382000, 1382000, 0.1);
+  fixture.memory.hold("kv", kLanes);
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addPool(store);
+  // Its scans make the 1023 MiB chunk worth about 3.4 s over the horizon.
+  ledger.setRates({.weightReadSecondsPerByte = 1.65e-10});
+  std::map<uint64_t, ClaimId> lanes;
+  for (const uint64_t id : {1, 2}) {
+    lanes[id] = ledger.open(request(id, RequestPriority::Normal, ClaimClass::InService, 60.0));
+    ledger.setInDemand(lanes[id], true);
+  }
+  constexpr double kEnded = 120.0;
+  std::optional<double> started;
+  uint64_t retaken = 0;
+  std::optional<double> regrown;
+  std::string history;
+  uint64_t before = store.currentBytes();
+  for (int step = 1; step <= 480; ++step) {
+    const double seconds = step * 0.5;
+    if (seconds < kEnded) {
+      store.scanReadBytes += 4'000'000'000;
+      ledger.setLanes(0, RequestPriority::Normal);
+    }
+    if (seconds == 79.5)
+      lanes[3] = ledger.open(request(3, RequestPriority::Normal, ClaimClass::Start, 60.0));
+    if (lanes.contains(3) && !started) {
+      // The engine retries the start each pass. Refused by the host, its
+      // request waits for what the host refused, which the host's deficit
+      // counts (Engine::syncClaims); placed, its lane prefills.
+      const bool placed = static_cast<bool>(fixture.allocateFreeing(lanes[3], kStart));
+      ledger.setHostRefusedWaiting(lanes[3], !placed);
+      if (placed) {
+        started = seconds;
+        ledger.update(lanes[3], request(3, RequestPriority::Normal, ClaimClass::InService, 60.0));
+        ledger.setInDemand(lanes[3], true);
+      }
+    }
+    if (seconds == kEnded) {
+      for (const auto &[id, claim] : lanes)
+        ledger.close(claim);
+      lanes.clear();
+      fixture.memory.release("kv", kLanes + (started ? kStart : 0));
+      ledger.setLanes(0, std::nullopt);
+    }
+    static_cast<void>(fixture.pass(seconds, seconds < kEnded));
+    const uint64_t after = store.currentBytes();
+    if (after > before) {
+      regrown = seconds;
+      history += " grew to " + std::to_string(after / kMiB) + " MiB at " + std::to_string(seconds) + " s;";
+    } else if (after < before) {
+      if (regrown && seconds - *regrown <= kValueHorizonSeconds)
+        ++retaken;
+      history += " gave back to " + std::to_string(after / kMiB) + " MiB at " + std::to_string(seconds) + " s;";
+    }
+    before = after;
+  }
+  require(retaken == 0, "the host took back " + std::to_string(retaken) + " units within the horizon of a regrowth:" +
+                            history);
+  require(started && *started == 79.5, "the 64K prompt's start was not admitted at once:" + history);
+  require(regrown && *regrown >= kEnded && *regrown <= kEnded + 2 * 0.5 + kHostSettleMilliseconds / 1000.0 &&
+              store.currentBytes() == kFloor + kLarge,
+          "the store did not grow the 1023 MiB chunk back within two passes of the requests' end, or did not keep "
+          "it:" +
+              history);
+}
+
+// A lane that prefills alone while a claim of no request takes a store unit
+// for it: the host's claim, for the margin other applications took
+// (`host`), or the engine's own in-service claim, which closes as it decides
+// (Engine::allocate: the Slim extents' trim, the Index runway), for room
+// under the engine's limit. The unit is the lane's demand as a unit its own
+// claim took would be: it does not grow back while the lane prefills, and
+// once the lane decodes alone the store grows it back within a pass (owner
+// rule 12; amend/V.md A30's regrowth lower bound). A store whose 1 GiB unit
+// is worth 2.5 cycles over the horizon in decode ghost hits (as in
+// testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone); a 30K-token prompt
+// prefills from 10 s to 50 s; 600 MiB are taken at 10.5 s and 30 s and given
+// back at 12 s and 40 s, and the first take takes the unit. At the store's
+// own rate the unit grew back at 16-17 s and the second take took it back at
+// 30 s; counted as the lane's from the take, it stays short until the
+// prefill ends.
+void aUnitTakenForALoneLaneGrowsBackOnceItDecodes(bool host) {
+  constexpr uint64_t kTaken = 600 * kMiB;
+  constexpr double kPrefilled = 50.0;
+  // The engine holds 16 GiB. With the host the limit has room for the
+  // unit and the host 512 MiB past its margin, which the 600 MiB taken
+  // leave short; without it the host has room, and the limit none.
+  const uint64_t engine = 16 * kGiB, headroom = engine + kHostMarginBytes + 512 * kMiB;
+  Fixture fixture(
+      host ? test::FakeMemory::Config(::host(headroom, MemoryPressure::Normal,
+                                             {at(10500.0, headroom - kTaken), at(12000.0, headroom),
+                                              at(30000.0, headroom - kTaken), at(40000.0, headroom)}))
+           : ::host(engine + 8 * kGiB),
+      host ? 20 * kGiB : engine);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 104, 4, 0.1, 51.4);
+  experts.keyBytes = 1382000;
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addPool(experts);
+  serve(ledger, experts, 5380.0, 0.0, 10.0);
+  fixture.memory.hold("weights", 11 * kGiB);
+  fixture.memory.hold("kv", kGiB);
+  ledger.setLanes(0, RequestPriority::Normal);
+  const ClaimId prompt = ledger.open(request(1, RequestPriority::Normal, ClaimClass::InService, 60.0));
+  // The engine's own claim of 600 MiB, under the engine's limit.
+  const auto engineTakes = [&] {
+    const ClaimId claim = ledger.open({.cls = ClaimClass::InService, .timing = NeedTiming::Immediate});
+    require(fixture.allocateFreeing(claim, kTaken), "the engine's own claim was refused");
+    ledger.close(claim);
+  };
+  uint64_t retaken = 0;
+  std::optional<double> regrown;
+  std::string history;
+  uint32_t before = experts.units();
+  for (double seconds = 10.5; seconds <= 150.0; seconds += 0.5) {
+    experts.served(0, 2690, 0, 0);
+    ledger.setInDemand(prompt, seconds < kPrefilled);
+    if (!host && (seconds == 10.5 || seconds == 30.0))
+      engineTakes();
+    else if (!host && (seconds == 12.0 || seconds == 40.0))
+      fixture.memory.release("kv", kTaken);
+    static_cast<void>(fixture.pass(seconds));
+    const uint32_t after = experts.units();
+    if (after > before) {
+      regrown = seconds;
+      history += " grew at " + std::to_string(seconds) + " s;";
+    } else if (after < before) {
+      if (regrown && seconds - *regrown <= kValueHorizonSeconds)
+        ++retaken;
+      history += " gave back at " + std::to_string(seconds) + " s;";
+    }
+    before = after;
+  }
+  const std::string taker = host ? "the host" : "the engine's own claim";
+  require(retaken == 0,
+          taker + " took back " + std::to_string(retaken) + " units within the horizon of a regrowth:" + history);
+  require(regrown && *regrown >= kPrefilled && *regrown <= kPrefilled + 0.5 && experts.units() == 4,
+          "the store did not grow back the unit " + taker + " took within a pass of the prefill's end, or did not "
+          "keep it:" + history);
+}
+void testAUnitTheHostTookForALoneLaneGrowsBackOnceItDecodes() { aUnitTakenForALoneLaneGrowsBackOnceItDecodes(true); }
+void testAUnitTheEngineTookForALoneLaneGrowsBackOnceItDecodes() {
+  aUnitTakenForALoneLaneGrowsBackOnceItDecodes(false);
+}
+
 // A claim pays the release a pool's unit takes of the engine thread (the
 // store's compaction, amend/M.md D4): an optional claim worth one state's
 // read, 5 ms, takes the copied state that costs that, not a store chunk
@@ -3281,6 +3453,11 @@ std::span<const test::TestCase> ledgerTests() {
       {"testGrowthLeavesTheHostWhatTheLanesGrowInto", testGrowthLeavesTheHostWhatTheLanesGrowInto},
       {"testThe35BPressurePatternTakesNoRegrownUnitBack", testThe35BPressurePatternTakesNoRegrownUnitBack},
       {"testTheM6HostPatternTakesNoRegrownUnitBack", testTheM6HostPatternTakesNoRegrownUnitBack},
+      {"testTheM6LongPromptHostPatternTakesNoRegrownUnitBack", testTheM6LongPromptHostPatternTakesNoRegrownUnitBack},
+      {"testAUnitTheHostTookForALoneLaneGrowsBackOnceItDecodes",
+       testAUnitTheHostTookForALoneLaneGrowsBackOnceItDecodes},
+      {"testAUnitTheEngineTookForALoneLaneGrowsBackOnceItDecodes",
+       testAUnitTheEngineTookForALoneLaneGrowsBackOnceItDecodes},
       {"testAClaimPaysForAPoolUnitsRelease", testAClaimPaysForAPoolUnitsRelease},
       {"testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes",
        testABytesNeedBesideBuffersNoStateGivesFreesTheirBytes},

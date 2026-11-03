@@ -164,6 +164,8 @@ void MemoryLedger::setRates(const MemoryRates &rates) noexcept { rates_ = rates;
 
 void MemoryLedger::observePools(double nowSeconds, bool commandsRan) {
   nowSeconds_ = nowSeconds;
+  if (lanesTakes_ && !lanesInDemand())
+    lanesTakes_.reset();
   for (Account &account : accounts_) {
     if (!account.pool)
       continue;
@@ -283,18 +285,48 @@ uint64_t MemoryLedger::pendingGrowthBytes() const noexcept {
 // through the first 30 s, so the units it regrew 14 and 36 s after Ready went
 // back 13 and 4 s later. A lane that decodes alone grows little: its takes
 // count in the pool's rate only, and the store regrows right after its
-// prefill (owner rule 12).
+// prefill (owner rule 12). The claims of no request, the host's, a pool's
+// growth's and the engine's own, close as they decide; what they take while
+// the lanes are in demand, the lanes' growth and starts would take
+// otherwise, and counts as one claim's in demand that opened with the first
+// of those takes. Smoke b, the M6's 64K prompt beside two decoders: the
+// host's claim took the store's 1023 MiB chunk for the 5 MiB of its margin a
+// prompt prefilling beside a decoder left it, the store grew the chunk back
+// 5 s later at its own rate of 0.015 a second, and the host's claim took it
+// back 8 s after that for the next prompt's start.
 double MemoryLedger::takesPerSecond(size_t account) const noexcept {
+  const AccountId pool{static_cast<uint8_t>(account)};
+  const auto rate = [&](double openedSeconds, const std::vector<AccountId> &takes) {
+    const auto units = std::ranges::count(takes, pool);
+    if (!units)
+      return 0.0;
+    return nowSeconds_ > openedSeconds ? double(units) / (nowSeconds_ - openedSeconds)
+                                       : std::numeric_limits<double>::infinity();
+  };
   double inDemand = 0.0;
-  for (const auto &[id, state] : claims_) {
-    if (!state.inDemand)
-      continue;
-    const auto units = std::ranges::count(state.poolTakes, AccountId{static_cast<uint8_t>(account)});
-    if (units)
-      inDemand += nowSeconds_ > state.openedSeconds ? double(units) / (nowSeconds_ - state.openedSeconds)
-                                                     : std::numeric_limits<double>::infinity();
-  }
+  for (const auto &[id, state] : claims_)
+    if (state.inDemand)
+      inDemand += rate(state.openedSeconds, state.poolTakes);
+  if (lanesTakes_ && lanesInDemand())
+    inDemand += rate(lanesTakes_->openedSeconds, lanesTakes_->poolTakes);
   return std::max(accounts_[account].rate.takesPerSecond(), inDemand);
+}
+
+bool MemoryLedger::lanesInDemand() const noexcept {
+  return std::ranges::any_of(claims_, [](const auto &entry) {
+    return entry.second.inDemand || entry.second.hostRefusedWaiting;
+  });
+}
+
+void MemoryLedger::took(ClaimState *claim, AccountId pool) {
+  if (!claim)
+    return;
+  claim->poolTakes.push_back(pool);
+  if (claim->spec.requestId || !lanesInDemand())
+    return;
+  if (!lanesTakes_)
+    lanesTakes_ = LanesTakes{.openedSeconds = claim->openedSeconds};
+  lanesTakes_->poolTakes.push_back(pool);
 }
 
 uint64_t MemoryLedger::poolReleases() const noexcept {
@@ -557,8 +589,7 @@ FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, Claim
       Account &account = accounts_[index];
       if (choice.pending) {
         ++account.taken;
-        if (claim)
-          claim->poolTakes.push_back(*choice.pool);
+        took(claim, *choice.pool);
         account.pendingGrowth = account.pendingLaterBytes = 0;
         result.nowBytes = plus(result.nowBytes, choice.victim.bytes);
         continue;
@@ -570,8 +601,7 @@ FreeResult MemoryLedger::take(const DryRun &run, const VictimQuery &query, Claim
       if (bytes) {
         ++account.taken;
         ++account.shrinks;
-        if (claim)
-          claim->poolTakes.push_back(*choice.pool);
+        took(claim, *choice.pool);
       }
       released[index] = plus(released[index], bytes);
       result.nowBytes = plus(result.nowBytes, bytes);
