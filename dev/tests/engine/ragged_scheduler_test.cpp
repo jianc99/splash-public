@@ -1685,12 +1685,18 @@ void testARegroupHappensOnlyWhenTheSumFalls() {
 // and costs nothing (K_J = price(C'|J)), so restarting it would only redo the
 // pass: (|B| + |O|)(R - K') < 0, and the command goes on to its prompt's end
 // while an older 64K prompt of its tier waits. Priced as a command of no
-// rows, the joiners cost the plan's P' turnarounds, which outweigh twice a
-// pass here at the 150 ms profile's learned 24 ms in 48 passes, as in the
-// M6 smoke's 24 passes at 53-72 ms, and the command abandoned itself after
-// every pass.
+// rows, the joiners cost the plan's P' turnarounds, and the command
+// abandoned itself after every pass where those outweighed 2 (K' - R): on
+// the M6 smoke, 24 passes at a learned u of 53-72 ms. Whether they do here
+// follows from the turnaround the fit learns, so each case requires that
+// they would. The 150 ms profile learns 24.3 ms and the 225 ms one 68.8 ms,
+// inside the smoke's band, each in 48 passes (no lanes priced 1165.6 and
+// 3301.8 ms against 791.8 and 941.8); at 5 and 60 ms the fit learns none,
+// so the old price of no lanes is nothing as well and those profiles cannot
+// tell the prices apart.
 void testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt() {
-  for (const test::TimingProfile &profile : atEveryTurnaround({&test::kM6FlashNextQ2})) {
+  for (const double turnaround : {150.0, 225.0}) {
+    const test::TimingProfile profile = withTurnaround(test::kM6FlashNextQ2, turnaround);
     Sim sim(profile, limits(8192, 48));
     sim.seed();
     // The turnaround learned as testPassesAddAtMostATenthOfTheCommand
@@ -1718,7 +1724,23 @@ void testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt() {
             at(profile) + ": the 23K prompt did not lead a command in passes alone");
     const uint64_t abandoned = sim.scheduler.snapshot().abandonedPassCommands;
     sim.run(command);
-    require(!sim.scheduler.abandonsPasses(nextPrefill(), sim.in()),
+    const BatchPlan next = nextPrefill();
+    const PassProgress kept = *sim.passes;
+    sim.passes.reset();
+    const BatchPlan restart = sim.plan();
+    sim.passes = kept;
+    require(restart.kind == WorkKind::Prefill && restart.items == command.items,
+            at(profile) + ": the 23K prompt did not plan its own rows again");
+    // Kept, lane 1 ends at R and lane 3 waits R + K_J; restarted, both wait
+    // K'. So the old K_J, no lanes' P' turnarounds, abandons over 2 (K' - R).
+    const double rest = sim.passesPrice(command.items, 1, command.passes);
+    const double again = sim.passesPrice(restart.items, 0, restart.passes);
+    const double noLanes = sim.passesPrice({}, 0, restart.passes);
+    require(noLanes > 2.0 * (again - rest),
+            at(profile) + ": the case does not straddle the rule: no lanes' " + std::to_string(restart.passes) +
+                " passes priced " + std::to_string(noLanes) + " ms, not over twice the " +
+                std::to_string(again - rest) + " ms a restart adds to the rest");
+    require(!sim.scheduler.abandonsPasses(next, sim.in()),
             at(profile) + ": a restart of its own rows superseded the command after the first of its " +
                 std::to_string(command.passes) + " passes, the turnaround learned " +
                 std::to_string(sim.turnaround()) + " ms");
