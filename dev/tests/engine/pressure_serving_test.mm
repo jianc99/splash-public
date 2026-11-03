@@ -189,12 +189,13 @@ void requireBooks(Served &served, const std::string &when) {
 // repeating within the horizon; coordinator 09:20), and it is never short of
 // its cap for more than two settled passes
 // while its next unit would grow by the rule's terms. B4's "back at its size
-// before each episode within its normal level" is not A30's: the fed
-// prompts' starts wait for memory at each normal level, and a unit grown into
-// free room then would go back to the start (MemoryLedger::grow holds it while
-// a start waits); the store grows back once none waits, after the episodes.
-// Without that hold it regrew and was taken back in each episode, 12 s apart:
-// an oscillation. A critical level's drop within the horizon of a regrowth
+// before each episode within its normal level" is not A30's. At each normal
+// level the store regrows into free room while a fed prompt's start waits,
+// and the start takes it back as its request goes on past the need it waited
+// with: a regrow and take back repeating 12 s apart, an oscillation this check
+// fails (open: A30 against amend/M.md B2, under which a resume, which comes
+// back as a start, takes back what the store grew into while it waited). A
+// critical level's drop within the horizon of a regrowth
 // counts as a take back here too. Every request completes or ends for capacity;
 // Metal stays healthy.
 void testEpisodesKeepTheBooksAndRegrow() {
