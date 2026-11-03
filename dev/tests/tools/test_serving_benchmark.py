@@ -2985,9 +2985,10 @@ class GateTests(unittest.TestCase):
     def test_a_cell_without_prices_still_judges_each_candidate_run(self):
         # p-35b-churn-18g: p-35b-price-pass-1 measured every size, then its
         # run.py failed (no DONE), and it has no rerun, so the cell has no
-        # prices. Its work gates are INCONCLUSIVE beside the prices', and the
-        # rest are judged: cand-A1's engine restarted, which fails G8, and
-        # cand-B1's requests took 1.5 times r150's.
+        # prices. Its work gates are INCONCLUSIVE beside the prices', the
+        # SSD rule's too (bytes per unit of work), and the rest are judged:
+        # cand-A1's engine restarted, which fails G8 and leaves it unused, and
+        # cand-A2's and cand-B1's requests took 1.5 times r150's in each order.
         spec = matrix.load_spec(SPEC)
         cell = next(c for c in spec["cells"] if c["name"] == "p-35b-churn-18g")
         spec = {**spec, "cells": [cell]}
@@ -3031,14 +3032,18 @@ class GateTests(unittest.TestCase):
             ]
 
         for label, latency, restarts in (
+            ("p35R150a", 100, 0),
             ("p35R150b", 100, 0),
+            ("p35MNa", 100, 0),
             ("p35MNb", 100, 0),
             ("p-35b-churn-18g-cand-B1", 150, 0),
             ("p-35b-churn-18g-cand-A1", 100, 1),
+            ("p-35b-churn-18g-cand-A2", 150, 0),
         ):
             churn_run(self.directory, label, done(latency), samples(restarts))
         for label, order in (
             ("p-35b-churn-18g-cand-A1", [2, 0, 1]),
+            ("p-35b-churn-18g-cand-A2", [2, 0, 1]),
             ("p-35b-churn-18g-cand-B1", [0, 1, 2]),
         ):
             (self.directory / f"{label}.meta.json").write_text(
@@ -3074,10 +3079,13 @@ class GateTests(unittest.TestCase):
             (stats.INCONCLUSIVE, "n/a"),
         )
         self.assertEqual(verdicts["G2 cand vs r150"]["verdict"], stats.FAIL)
-        self.assertEqual(
-            {verdicts[f"SSD {c}"]["numbers"] for c in matrix.ssd_counters_of(cell)},
-            {"no sigma"},
-        )
+        for counter in matrix.ssd_counters_of(cell):
+            ssd = verdicts[f"SSD {counter}"]
+            self.assertEqual(ssd["verdict"], stats.INCONCLUSIVE)
+            self.assertEqual(
+                {ssd["numbers"][reference]["ratio"] for reference in cell["ssd"]},
+                {"n/a"},
+            )
 
     def test_a_job_without_history_is_late_at_twice_the_minutes_it_states(self):
         # M5 19-122b-yarn states 75 minutes and no yarn job finished before:
