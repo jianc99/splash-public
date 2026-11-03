@@ -160,9 +160,10 @@ struct SpillRequestsSnapshot final {
 // The decode gaps past the scheduler's bound (Scheduler::bound) that lanes
 // saw between two of their token events, each by the first cause that held
 // in it (AMENDMENTS Borrowed 4): a prefill unit ran, the lane's claim waited
-// for memory, a decode command read spilled K/V from the SSD, a pool gave a
-// unit back, a plan was made again, or none of these. Of the gaps a prefill
-// unit caused, the time the engine priced those units at and theirs.
+// for memory, the decode command that ended it read from the SSD (experts
+// the store missed, spilled K/V), a pool gave a unit back, a plan was made
+// again, or none of these. Of the gaps a prefill unit caused, the time
+// the engine priced those units at and theirs.
 enum class GapCause : uint8_t { PrefillUnit, ClaimWait, SsdRead, PoolRelease, Replan, Other };
 inline constexpr size_t kGapCauses = 6;
 struct DecodeGapCausesSnapshot final {
@@ -471,7 +472,7 @@ private:
     // Its last token event, and since then what a decode gap past the bound
     // may be due to (decodeGap): the prefill units that ran (the engine's
     // price of them and their time), whether its claim waited and a decode
-    // command of it read spilled K/V, and the pools' releases and the
+    // command of it read from the SSD, and the pools' releases and the
     // replans as they stood then.
     std::optional<double> lastTokenMilliseconds;
     struct GapSince final {

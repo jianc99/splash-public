@@ -487,8 +487,11 @@ TtftPart Engine::holderOf(const Request &active) const {
                    });
   if (own && pending_->plan.kind == WorkKind::Prefill)
     return TtftPart::OwnPrefill;
-  if (active.claim.id && governor().ledger().claim(active.claim.id).waiting)
-    return TtftPart::ClaimWait;
+  if (active.claim.id) {
+    const ClaimState &claim = governor().ledger().claim(active.claim.id);
+    if (claim.waiting || claim.hostRefusedWaiting)
+      return TtftPart::ClaimWait;
+  }
   if (pending_)
     return pending_->plan.kind == WorkKind::Decode ? TtftPart::Decode : TtftPart::OtherPrefill;
   return TtftPart::Rest;
@@ -502,7 +505,9 @@ void Engine::firstTokens(Request &active) {
 
 void Engine::decodeGap(Request &active, const model::CommandSample &sample, double now) {
   Request::GapSince &since = active.gapSince;
-  if (sample.spilledKvReadMilliseconds > 0.0 && cache_.holdsIndexPages(active.request.id))
+  // The command waited on the SSD, every lane of it alike: for the experts
+  // the store missed, or the hot blocks a lane with Index pages read.
+  if (sample.work.weightReadBytes || sample.spilledKvReadMilliseconds > 0.0)
     since.ssdRead = true;
   const uint64_t releases = governor().ledger().poolReleases();
   if (active.lastTokenMilliseconds && now - *active.lastTokenMilliseconds > scheduler_.bound()) {

@@ -829,6 +829,41 @@ void testTtftPartsSumToTtft() {
   }
 }
 
+// AMENDMENTS Borrowed 7: a request that waits to retry a start the host
+// refused waits on its claim, as one whose claim waits for memory on its
+// way back does: the time counts as its claim's wait, not as the decode
+// commands' that ran beside it. With the M6 profile, a short prompt whose
+// lane's state takes buffers of its own arrives while a lane decodes, the
+// host's headroom short of the margin; other applications give memory back
+// 2 s later, and the prompt then starts.
+void testAHostRefusedStartWaitsOnItsClaim() {
+  test::EngineHarness harness({.pages = 256, .memory = test::FakeMemory::Config{}, .timing = &test::kM6FlashNextQ2});
+  harness.model.decodeFinishes = false;
+  harness.model.laneFootprintBytes = 64 << 10;
+  EngineRequest decoder = harness.request(1, std::vector<uint32_t>(40, 1));
+  decoder.maxNewTokens = 100'000;
+  decoder.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(decoder));
+  harness.runUntil([&] { return harness.events.outputs.contains(1); }, "the decoder did not decode");
+  const test::GovernorLimits limits;
+  const uint64_t other = harness.memory->hostBytes() - limits.hostSpareReserveBytes - harness.memory->total();
+  harness.memory->setHost(other - kHostMarginBytes + (1ULL << 20), MemoryPressure::Normal);
+  const double arrived = harness.now();
+  EngineRequest prompt = harness.request(2, std::vector<uint32_t>(300, 2));
+  prompt.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(prompt));
+  harness.runUntil([&] { return harness.now() >= arrived + 2000.0; }, "the clock did not move");
+  require(!harness.events.tokenTimes.contains(2), "the host admitted a start short of its margin");
+  harness.memory->setHost(other - 4 * kHostMarginBytes, MemoryPressure::Normal);
+  const double released = harness.now();
+  harness.runUntil([&] { return harness.events.tokenTimes.contains(2); }, "the prompt did not answer");
+  const TtftParts &parts = harness.events.ttftParts.at(2);
+  require(parts[static_cast<size_t>(TtftPart::ClaimWait)] > 0.5 * (released - arrived),
+          "a start the host refused waited " + std::to_string(released - arrived) + " ms, of which " +
+              std::to_string(parts[static_cast<size_t>(TtftPart::ClaimWait)]) + " ms counted as its claim's wait and " +
+              std::to_string(parts[static_cast<size_t>(TtftPart::Decode)]) + " ms as decode commands'");
+}
+
 // AMENDMENTS Borrowed 4: a decode gap past the scheduler's bound counts
 // once, under the first cause that held in it, and a gap within the bound
 // nowhere. On the harness clock with the M6 profile a lane decodes alone,
@@ -866,6 +901,44 @@ void testADecodeGapNamesItsCause() {
     require(!counted.gaps[at(cause)], "a decode gap counted under a cause that did not hold in it");
 }
 
+// AMENDMENTS Borrowed 4 (plan R3: an SSD wait is a history-stream or
+// expert-read wait in the sample): a decode command that reads experts the
+// store missed waits on the SSD, and a gap past the bound it ends counts as
+// an SSD wait, for every lane of it, whether or not the lane holds Index
+// pages. With the M6 profile and a store that holds a 32nd of the experts,
+// four Resident lanes decode in one command past the bound, each command
+// reading the experts its rows route that the store lacks.
+void testADecodeGapOnExpertReadsIsAnSsdWait() {
+  test::EngineHarness harness({.pages = 1024, .memory = test::FakeMemory::Config{}, .timing = &test::kM6FlashNextQ2});
+  test::FakeElasticPool experts("experts", *harness.memory, 1ULL << 20, 1, 1, 32, 1, 2.5, 0.0);
+  harness.model.experts = &experts;
+  test::seedAsStartup(harness.engine, harness.model, test::kM6FlashNextQ2);
+  harness.model.decodeFinishes = false;
+  for (uint64_t id = 1; id <= 4; ++id) {
+    EngineRequest decoder = harness.request(id, std::vector<uint32_t>(40, static_cast<uint32_t>(id)));
+    decoder.maxNewTokens = 64;
+    decoder.deadlineMilliseconds = 1e9;
+    harness.engine.submit(std::move(decoder));
+  }
+  harness.runUntilIdle();
+  const EngineSnapshot snapshot = harness.engine.snapshot();
+  const DecodeGapCausesSnapshot &counted = snapshot.decodeGapCauses;
+  const auto at = [](GapCause cause) { return static_cast<size_t>(cause); };
+  const double bound = std::max(
+      snapshot.scheduler.decodeGapTargetMilliseconds,
+      snapshot.scheduler.prefillEstimate.terms[static_cast<size_t>(CostTerm::Units)].millisecondsPerUnit /
+          kPassOverheadShare);
+  require(harness.longestDecodeGap() > bound && snapshot.scheduler.decodeBatchesByWidth[3] > 1,
+          "four lanes did not decode in commands longer than the bound, " + std::to_string(bound) + " ms");
+  require(counted.gaps[at(GapCause::SsdRead)] > 0 && !counted.gaps[at(GapCause::Other)] &&
+              !counted.gaps[at(GapCause::Replan)] && !counted.gaps[at(GapCause::PoolRelease)],
+          "decode gaps past the bound that commands reading missed experts ended counted " +
+              std::to_string(counted.gaps[at(GapCause::SsdRead)]) + " times as an SSD wait, " +
+              std::to_string(counted.gaps[at(GapCause::PoolRelease)]) + " as a pool release, " +
+              std::to_string(counted.gaps[at(GapCause::Replan)]) + " as a replan and " +
+              std::to_string(counted.gaps[at(GapCause::Other)]) + " under no cause");
+}
+
 } // namespace
 
 std::span<const test::TestCase> rulesTests() {
@@ -886,7 +959,9 @@ std::span<const test::TestCase> rulesTests() {
       {"testAJunctionTakesNothingWorthMoreThanItSaves", testAJunctionTakesNothingWorthMoreThanItSaves},
       {"testCacheReuseFollowsTheRecentProbes", testCacheReuseFollowsTheRecentProbes},
       {"testTtftPartsSumToTtft", testTtftPartsSumToTtft},
+      {"testAHostRefusedStartWaitsOnItsClaim", testAHostRefusedStartWaitsOnItsClaim},
       {"testADecodeGapNamesItsCause", testADecodeGapNamesItsCause},
+      {"testADecodeGapOnExpertReadsIsAnSsdWait", testADecodeGapOnExpertReadsIsAnSsdWait},
   };
   return kTests;
 }
