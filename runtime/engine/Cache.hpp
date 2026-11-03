@@ -714,9 +714,12 @@ public:
   // there. What goes only once another transfer lands, a parent whose
   // resident children's copies are on their way, a leaf whose demotion the
   // tier refuses while transfers are in flight, a leaf whose copy ahead is
-  // in flight, comes after what goes now of its class, as later steps of a
-  // unit, which the pages a unit's own demotions free as they land help
-  // empty an extent; take() takes a unit's victims up to its first later
+  // in flight, a block no request holds whose restore is in flight, comes
+  // after what goes now of its class, as later steps of a unit, those that
+  // wait for fewer landings first, which the pages a unit's own
+  // demotions free as they land help empty an extent (a restored leaf's
+  // page helps, but frees nothing a unit is weighed at: restores free
+  // nothing); take() takes a unit's victims up to its first later
   // step and tries that one's demotion, and the claim's retries take the
   // rest as landings allow (design/M.md section 3.4, R2). In a windowed
   // cache a state that leaves the cache unpins its tail, whose trim into
