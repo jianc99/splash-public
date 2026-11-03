@@ -223,16 +223,16 @@ class StreamingServer:
     """A server on 127.0.0.1 streaming each chat completion, status 200, as
     server.py does: the role chunk, then the events answer(body) returns
     (KEEPALIVE: server.py's keepalive, 0.05 s after the last write), then
-    [DONE]; /status idle."""
+    [DONE]; /status what status() returns, idle."""
 
-    def __init__(self, answer):
+    def __init__(self, answer, status=dict):
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
 
             def do_GET(self):
                 models = {"data": [{"id": "m"}]}
-                document = models if self.path == "/v1/models" else {}
+                document = models if self.path == "/v1/models" else status()
                 data = json.dumps(document).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(data)))
@@ -367,6 +367,60 @@ class ErrorEventTests(unittest.TestCase):
                 clients.RequestFailed, "warm 300 suffix 0: 200 .*internal_server_error"
             ):
                 clients.run_warm(fake.port, self.directory, "w", [300], 0, settle=0)
+
+
+class TtftRoundTests(unittest.TestCase):
+    def test_each_round_records_the_largest_memory_claims_it_saw(self):
+        # m6-fn-ttft cand at N=2: in round 0 the second start waits 0.3 s for
+        # memory, a memory-staggered round (amend/M.md A62/A65); round 1's
+        # starts take theirs at once. A tree before schema 7 reports none.
+        usage = {
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 2000,
+                "completion_tokens": 1,
+                "prompt_tokens_details": {"cached_tokens": 1900},
+            },
+        }
+        claims = {"waiting": 0, "bytes": 0, "oldest_ms": 0}
+
+        def answer(body):
+            if "Round 0." in body and "Conversation 2.1." in body:
+                claims.update(waiting=1, bytes=3 << 30, oldest_ms=250)
+                time.sleep(0.3)
+                claims.update(waiting=0, bytes=0, oldest_ms=0)
+            return [content_event("OK"), usage]
+
+        def rounds(status):
+            with (
+                tempfile.TemporaryDirectory() as directory,
+                StreamingServer(answer, status) as fake,
+            ):
+                clients.run_ttft(
+                    fake.port,
+                    directory,
+                    "t-n2",
+                    2,
+                    rounds=2,
+                    settle=0,
+                    poll_seconds=0.02,
+                    text=synthetic_corpus(),
+                )
+                events = (Path(directory) / "t-n2.events.jsonl").read_text()
+            return [
+                event["memory_governor.claims"]
+                for event in map(json.loads, events.splitlines())
+                if event["kind"] == "round"
+            ]
+
+        self.assertEqual(
+            rounds(lambda: {"memory_governor": {"claims": dict(claims)}}),
+            [
+                {"waiting": 1, "bytes": 3 << 30, "oldest_ms": 250},
+                {"waiting": 0, "bytes": 0, "oldest_ms": 0},
+            ],
+        )
+        self.assertEqual(rounds(dict), [None, None])
 
 
 class DeadlineTests(unittest.TestCase):

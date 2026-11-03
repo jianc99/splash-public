@@ -215,16 +215,16 @@ class Recorder:
 
 
 def poll_status(
-    port: int, recorder: Recorder, until, period: float, reduce=None
+    port: int, recorder: Recorder, until, period: float, observe=None
 ) -> None:
     """Records /status every `period` seconds until until() is true; with
-    `reduce`, also an event of what it returns for each sample."""
+    `observe`, also hands it each sample."""
     while not until():
         try:
             status = get_json(port, "/status", timeout=30)
             recorder.sample(status)
-            if reduce is not None:
-                recorder.emit("status", **reduce(status))
+            if observe is not None:
+                observe(status)
         except Exception as error:  # recorded: a run with gaps in its samples says so
             recorder.emit("status_error", error=str(error)[:200])
         time.sleep(period)
@@ -467,6 +467,10 @@ TTFT_GAUGES = (
     "state.entries",
     "kv.pages_cache",
 )
+# memory_governor.claims' fields a round reports at their largest over the
+# /status samples taken while it ran (amend/M.md A62/A65: a round whose
+# starts waited for memory is memory-staggered).
+TTFT_CLAIMS = ("waiting", "bytes", "oldest_ms")
 
 
 def ttft_corpus() -> str:
@@ -593,6 +597,16 @@ def counter_deltas(before: dict, after: dict) -> dict:
     return out
 
 
+def largest_claims(claims: list) -> dict | None:
+    """Each TTFT_CLAIMS field at its largest over these
+    memory_governor.claims, None where no sample had any (a tree before
+    schema 7)."""
+    claims = [c for c in claims if c]
+    if not claims:
+        return None
+    return {field: max(c.get(field, 0) for c in claims) for field in TTFT_CLAIMS}
+
+
 def ttft_request_record(stream: Stream, recorder: Recorder) -> dict:
     lat = stream.metrics.get("request_latency") or {}
     first = stream.first or stream.ended
@@ -634,9 +648,15 @@ def run_ttft(
     model = served_model(port)
     recorder = Recorder(directory, label)
     done = threading.Event()
+    # The memory claims of the samples since the round began.
+    claims: list = []
+
+    def observe(status):
+        claims.append(dig(status, "memory_governor.claims"))
+
     poller = threading.Thread(
         target=poll_status,
-        args=(port, recorder, done.is_set, poll_seconds),
+        args=(port, recorder, done.is_set, poll_seconds, observe),
         daemon=True,
     )
     poller.start()
@@ -664,6 +684,7 @@ def run_ttft(
             for messages in requests:
                 digest.update(json.dumps(messages).encode())
             before = wait_idle(port, settle)
+            claims.clear()
             barrier, streams = threading.Barrier(n), [None] * n
 
             def send(i, requests=requests, barrier=barrier, streams=streams):
@@ -718,6 +739,9 @@ def run_ttft(
                 "prompt": [x["prompt"] for x in ranked],
                 "prefilled": [x["prefilled"] for x in ranked],
                 **counter_deltas(before, after),
+                "memory_governor.claims": largest_claims(
+                    [*claims, dig(after, "memory_governor.claims")]
+                ),
             }
             recorder.emit("round", **record)
             records.append(record)
