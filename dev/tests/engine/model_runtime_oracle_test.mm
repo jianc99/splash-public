@@ -3825,9 +3825,10 @@ struct SpillRecord final {
 // alone, its state kept, its retry giving the same step; a request that
 // ends with its streamed prompt, or is suspended once its next command
 // reserved the staging, gives the staging back, and one that leaves while
-// another lane's command runs gives it back before the next command; and a
-// verify over Index pages without block lists, of rows that read their page
-// table, is refused.
+// another lane's command runs gives it back before the next command; a
+// command in passes keeps its staging until its last pass, whatever another
+// prompt reserved between them; and a verify over Index pages without block
+// lists, of rows that read their page table, is refused.
 void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::LoadedModel &model,
                                       const ops::ExecutionPlans &operators, const metal::AllocationAdmission &admission,
                                       kv::Format format, ops::GdnStateFormat stateFormat, const SpillOptions &options) {
@@ -4063,6 +4064,32 @@ void requireSpilledKvMatchesResident(metal::MetalBackend &backend, const model::
   require(!spill.historyStream().stats().stagingBytes,
           "the next command kept the staging of a request that left while a command ran");
   spill.end(beside);
+
+  // A command in passes streams its history through the staging it reserved
+  // before its first pass, whatever another prompt reserved between its
+  // passes: one that reserved it and then was suspended, or ended, leaves
+  // it, and the command gives what it gives in one pass. The staging goes
+  // once both left.
+  for (const bool suspends : {true, false}) {
+    SpillRequest streaming{.id = 4027u + 2 * suspends, .stateLane = 0, .spills = true, .prompt = prompts[0]};
+    SpillRequest other{.id = 4028u + 2 * suspends, .stateLane = 1, .spills = false, .prompt = prompts[1]};
+    spill.begin(streaming);
+    spill.begin(other);
+    size_t command = 0;
+    while (!streaming.holdsIndexPages()) static_cast<void>(spill.prefill(streaming, ends[0][command++]));
+    const SpillStep step = spill.prefill(streaming, ends[0][command], 2, [&] {
+      require(runtime.reserveHistoryStaging(other.id, 1).granted(), "a prompt's staging was refused");
+      if (suspends) runtime.suspend(other.id);
+      else spill.end(other);
+    });
+    require(step == resident.steps[0][command],
+            std::string("a command in passes whose staging another prompt reserved between them and ") +
+                (suspends ? "was suspended" : "ended") + " gave another step than one whose K/V stayed");
+    spill.end(streaming);
+    if (suspends) spill.end(other);
+    require(!spill.historyStream().stats().stagingBytes,
+            "the staging stayed once every request it was reserved for left");
+  }
 
   // Rows that read their page table read only Full pages
   // (SparseKvShape::denseHistoryTokens), so a verify over Index pages

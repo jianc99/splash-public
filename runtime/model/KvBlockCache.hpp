@@ -96,6 +96,9 @@ public:
   [[nodiscard]] uint64_t releaseAboveFloor();
   // The bytes of one extent, what the cache grows and gives back at a time.
   [[nodiscard]] uint64_t extentBytes() const noexcept;
+  // The bytes of one slot of a layer: what a missed block is read into, and
+  // what each block a layer gave up lately would take again.
+  [[nodiscard]] uint64_t slotBytes() const noexcept;
 
   // After `layer`'s block lists: a host step that resolves the entries of
   // lane l's list, whose pages' sources are lanes[l] (null for a lane none
