@@ -1701,6 +1701,40 @@ void testKvGrowthReclaimsCachedStateWhenBudgetIsShared() {
           "grown request leaked its active resources");
 }
 
+// What the ledger frees now for a lane that waits for the rest does not
+// cost the lane its wait: alone and short of pages, its free() gives back
+// the pool's idle buffers and starts demotions; the attempt those buffers
+// let it make again still lacks the pages, and the lane waits for them and
+// runs once they land.
+void testWhatFreesNowKeepsALaneWaitingForTheRest() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  tier.capacity = 8;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  Events events;
+  engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, executor, events);
+  guardReleases(storage, engine);
+  // Two pages free beside the cached blocks, and no extent more.
+  cacheBlocksUnderDiskStates(cache, 6);
+  require(pool.freePageCount() == 2 && pool.snapshot().pagesAllocated == 8, "fixture storage geometry changed");
+  storage.growthBlocked = true;
+  executor.reclaimableIdleStateBytes = State().bytes();
+  engine.submit(request(1, std::vector<uint32_t>(161, 7)));
+  static_cast<void>(engine.tick(1));
+  require(executor.reclaimedIdleStateBytes == State().bytes() && tier.demotions == 3 &&
+              executor.prefillRows == 0 && events.failedCount == 0,
+          "a lane that freed idle buffers did not wait for the pages on their way back");
+  for (uint32_t step = 2; step < 40 && !idle(engine); ++step) {
+    tier.complete();
+    static_cast<void>(engine.tick(step));
+  }
+  require(idle(engine) && executor.prefillRows == 161 && executor.suspensions == 0 && events.failedCount == 0,
+          "the lane did not run on the pages the demotions gave back");
+}
+
 void testRequiredWorkDoesNotReserveAnExtraPage() {
   for (uint32_t promptTokens : {1U, 24U}) {
     test::TestKvStorage storage(2, 4096, 1);
@@ -6291,6 +6325,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testLaneAdmittedBeforeARefusalHoldsTheWaitOpen", testLaneAdmittedBeforeARefusalHoldsTheWaitOpen},
       {"testKvPressureNarrowsTheRealBatch", testKvPressureNarrowsTheRealBatch},
       {"testKvGrowthReclaimsCachedStateWhenBudgetIsShared", testKvGrowthReclaimsCachedStateWhenBudgetIsShared},
+      {"testWhatFreesNowKeepsALaneWaitingForTheRest", testWhatFreesNowKeepsALaneWaitingForTheRest},
       {"testRequiredWorkDoesNotReserveAnExtraPage", testRequiredWorkDoesNotReserveAnExtraPage},
       {"testAdmissionPinsDesiredStateAndCountsOnlySuccess", testAdmissionPinsDesiredStateAndCountsOnlySuccess},
       {"testAdmissionCanDropItsOwnCachePinToMakeProgress", testAdmissionCanDropItsOwnCachePinToMakeProgress},

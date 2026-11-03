@@ -99,8 +99,9 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
   // attempt runs again once that is met or memory left now. A refusal that
   // lacks nothing the ledger counts, that the host refuses after exempting
   // the claim (critical pressure), or that lacks what it lacked when the
-  // ledger met a need of this allocation before, is not for want of what the
-  // ledger frees.
+  // ledger freed for a need of this allocation before, is not for want of
+  // what the ledger frees now: the claim waits if the ledger's latest
+  // decision was to wait for the rest of what it lacks.
   std::vector<Need> met;
   const auto metBefore = [&](const Need &need) {
     return std::ranges::any_of(met, [&](const Need &before) {
@@ -122,10 +123,10 @@ auto Engine::allocate(Attempt &&attempt, const ClaimSpec &spec, bool frees)
     const bool exempt = ledger.claim(claim.id).hostExempt;
     const FreeResult freed = governor.free(claim.id, need);
     ++ledgerChanges_;
+    denial.pending = freed.outcome == FreeOutcome::Pending;
     // What it freed now, the units that cost nothing among them, the
     // attempt may fit in.
     if (freed.outcome != FreeOutcome::Met && !freed.nowBytes) {
-      denial.pending = freed.outcome == FreeOutcome::Pending;
       // A conversion frees later, and at once the pages whose copies landed
       // before (Cache::convertToSpill), which one more attempt may fit in.
       if (freed.laterBytes)
