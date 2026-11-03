@@ -2322,6 +2322,66 @@ void testTheSnapshotShowsTheRegrowthItsRuleTests() {
               std::to_string(grown.regrowthSeconds) + " s");
 }
 
+// A claim that waits for memory takes the memory that appears, so a pool
+// unit grown into free room while it waits goes back to it (amend/V.md A30:
+// no unit regrown is taken back within the horizon). pressure-serving's
+// synthetic 35B: request 10's start waited 8 s for 42.8 MiB under the
+// engine's limit while the store was a 1022.6 MiB unit short; once the host's
+// pass freed cache, the store grew the unit back into the room beside the
+// 42.8 MiB the claim held, and 10 ms later the request's in-service claim
+// took it back for the 14.5 MiB state buffer its start then needed beyond
+// that refusal. Here the engine at its 16 GiB limit, the store a 1 GiB unit
+// short of its cap, a start refused 43 MiB that waits, then 1074 MiB freed:
+// while the claim waits the store does not grow, the request's 43 MiB and 15
+// MiB are met from the room, and once it ends and nothing waits the unit
+// grows back.
+void testAPoolDoesNotGrowWhileAClaimWaits() {
+  Fixture fixture(host(32 * kGiB), 16 * kGiB);
+  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 4, 104, 3, 0.1, 51.4);
+  MemoryLedger &ledger = fixture.ledger();
+  ledger.addPool(experts);
+  fixture.memory.hold("weights", 11 * kGiB);
+  fixture.memory.hold("kv", 2 * kGiB);
+  const ClaimId start = ledger.open(request(10, RequestPriority::Normal, ClaimClass::Start));
+  require(!fixture.allocate(start, 43 * kMiB), "the start was admitted at the engine's limit");
+  ledger.setWaiting(start, true);
+  fixture.memory.release("kv", kGiB + 50 * kMiB);
+  std::string history;
+  uint32_t before = experts.units();
+  std::optional<double> grewAt;
+  uint32_t retaken = 0;
+  const auto track = [&](double seconds) {
+    const uint32_t after = experts.units();
+    if (after > before) {
+      grewAt = seconds;
+      history += " grew at " + std::to_string(seconds) + " s;";
+    } else if (after < before) {
+      retaken += grewAt && seconds - *grewAt <= kValueHorizonSeconds;
+      history += " gave back at " + std::to_string(seconds) + " s;";
+    }
+    before = after;
+  };
+  static_cast<void>(fixture.pass(1.0));
+  track(1.0);
+  // The request's retry: its start's 43 MiB, then the 15 MiB of a state
+  // buffer its in-service claim needs.
+  require(fixture.allocateFreeing(start, 43 * kMiB), "the waiting start was not met once memory was freed");
+  ledger.update(start, request(10, RequestPriority::Normal, ClaimClass::InService));
+  ledger.setWaiting(start, false);
+  require(fixture.allocateFreeing(start, 15 * kMiB), "the started request's state buffer was refused");
+  track(1.01);
+  static_cast<void>(fixture.pass(1.5));
+  track(1.5);
+  require(retaken == 0 && experts.units() == 3,
+          "a store unit grown while a claim waited was taken back within the horizon:" + history);
+  // The request ends; nothing waits, and the unit grows back.
+  ledger.close(start);
+  fixture.memory.release("kv", 58 * kMiB);
+  static_cast<void>(fixture.pass(2.0));
+  track(2.0);
+  require(experts.units() == 4, "the store did not grow back once no claim waited:" + history);
+}
+
 // A lane that prefills into a store unit it took and then decodes alone has
 // the store grow the unit back right after its prefill (owner rule 12;
 // amend/V.md A30's regrowth lower bound, owner 11-03 03:55): its claim is in
@@ -3700,6 +3760,7 @@ std::span<const test::TestCase> ledgerTests() {
       {"testTheStoreRegrowsBeforeTheWarningPassTakesItsCache", testTheStoreRegrowsBeforeTheWarningPassTakesItsCache},
       {"testTheTakeRateDecaysWhileTheEngineIdles", testTheTakeRateDecaysWhileTheEngineIdles},
       {"testTheSnapshotShowsTheRegrowthItsRuleTests", testTheSnapshotShowsTheRegrowthItsRuleTests},
+      {"testAPoolDoesNotGrowWhileAClaimWaits", testAPoolDoesNotGrowWhileAClaimWaits},
       {"testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone",
        testAUnitAPrefillTookGrowsBackOnceItsLaneDecodesAlone},
       {"testGrowthPendsOnlyOnItsOwnVictims", testGrowthPendsOnlyOnItsOwnVictims},

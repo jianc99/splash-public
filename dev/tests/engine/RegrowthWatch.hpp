@@ -11,7 +11,9 @@
 // rule's own terms: its regrowth gains at the rate claims take its units
 // (MemoryAccountSnapshot::regrowthSeconds; into free room also while no claim
 // has taken any), and either the free room beyond the lanes' projected
-// growth, the waiting claims and every pending growth holds the unit, or
+// growth, the waiting claims and every pending growth holds the unit while
+// no claim waits for memory or to retry what the host refused
+// (MemoryLedger::holdsFreeRoom: the room is the claim's), or
 // what it would displace beside that room costs less than its regrowth gains
 // (MemoryLedger::available), with the host's consent. A store that never
 // regrows into memory it could take (#645) fails the second; one held short
@@ -90,8 +92,9 @@ public:
                               std::to_string(room >> 20) + " MiB of room beyond " + std::to_string(held >> 20) +
                               " MiB held, a unit of " + std::to_string(unit >> 20) + " MiB";
     if (room >= unit)
-      return pool->takesPerSecond == 0.0 || pool->regrowthSeconds >= 0.0 ? std::optional(terms + " (free room)")
-                                                                          : std::nullopt;
+      return !ledger.holdsFreeRoom() && (pool->takesPerSecond == 0.0 || pool->regrowthSeconds >= 0.0)
+                 ? std::optional(terms + " (free room)")
+                 : std::nullopt;
     if (pool->regrowthSeconds <= 0.0)
       return std::nullopt;
     const engine::ClaimSpec growth{.cls = engine::ClaimClass::Growth,

@@ -258,6 +258,12 @@ bool MemoryLedger::claimWaiting() const noexcept {
   return std::ranges::any_of(claims_, [](const auto &entry) { return entry.second.waiting; });
 }
 
+bool MemoryLedger::holdsFreeRoom() const noexcept {
+  return std::ranges::any_of(claims_, [](const auto &entry) {
+    return entry.second.waiting || entry.second.hostRefusedWaiting;
+  });
+}
+
 uint64_t MemoryLedger::hostRefusedWaitingBytes() const noexcept {
   uint64_t bytes = 0;
   for (const auto &[id, state] : claims_)
@@ -841,9 +847,17 @@ uint64_t MemoryLedger::available(const ClaimSpec &spec, uint64_t enough, uint64_
 // from the host's footprint again (its credit), and what the room lacks
 // besides. Either way victims that free memory only once their transfers
 // land make the unit the pool's pending growth. The room is the pass's less
-// what the pass has grown.
+// what the pass has grown. While a claim waits for memory, or its request
+// to retry what the host refused it, the pools do not grow into free room:
+// the claim takes the memory that appears, beyond the need it waits with
+// once its request goes on to its next allocation (pressure-serving: a
+// start's state buffer after its pages), and a unit grown into it meanwhile
+// would go back to it. Displacement, which leaves the room as it was, goes
+// on (amend/M.md B4: the band regrows the store beside the starts it
+// refuses).
 bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
   bool acted = false;
+  const bool waiting = holdsFreeRoom();
   uint64_t waitingBytes = 0;
   for (const auto &[id, state] : claims_)
     if (state.waiting)
@@ -944,7 +958,7 @@ bool MemoryLedger::grow(uint64_t freeBytes, const GrowthHost &host) {
     return less(less(freeBytes, grownBytes), plus(plus(pendingGrowthBytes(), waitingBytes), laneDemandBytes_));
   };
   for (Candidate &next : candidates) {
-    while (next.unit && room() >= next.unit && host.admits(next.unit) &&
+    while (!waiting && next.unit && room() >= next.unit && host.admits(next.unit) &&
            value::growsIntoFreeRoom(takesPerSecond(next.account), next.benefit, next.cycle) &&
            growUnit(next.account, 0, "into free room")) {
       acted = true;

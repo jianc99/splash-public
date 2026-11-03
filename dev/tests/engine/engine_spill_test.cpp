@@ -663,12 +663,13 @@ void testSpillResumeTakesItsReplaysPagesAsItRuns() {
 }
 
 // A Resident request suspended for a higher priority resumes with the KV it
-// held, all Full, at once. Memory the expert store grew into while it waited
-// is memory its resume, a claim in service, takes back (amend/M.md B2): it
-// resumes Resident and decodes its whole output. Where its KV lives was
-// placement's decision at its start (B13); a resume converts no lane of its
-// own, a conversion being a victim of an admitted lane (B7).
-void testAResumeTakesBackTheMemoryItsKvHeld() {
+// held, all Full, at once. While its resume waits for memory the pools do not
+// grow into the room it waits for (requests first, coordinator 11-03 11:00;
+// under amend/M.md B2 the store grew into it and the resume took it back): it
+// resumes Resident without a take back and decodes its whole output. Where its
+// KV lives was placement's decision at its start (B13); a resume converts no
+// lane of its own, a conversion being a victim of an admitted lane (B7).
+void testAWaitingResumeFindsTheMemoryItsKvHeldFree() {
   Spilling spill(Spilling::Governed{}, 1024, false);
   test::FakeElasticPool experts("experts", spill.host.memory, 1'000, 0, 16, 16, 0, 1.0, 0.0);
   static_cast<void>(spill.host.governor.ledger().addPool(experts));
@@ -691,18 +692,20 @@ void testAResumeTakesBackTheMemoryItsKvHeld() {
   spill.engine.submit(Spilling::prompt(2, 2, 1, 1));
   spill.runUntil([&] { return spill.events.completedCount == 1; },
                  "the Normal request did not run");
-  // A critical pass releases what the cache held, and the control pass then
-  // grows the store into the room.
+  // A critical pass releases what the cache held; the control pass then
+  // leaves the room to the resume that waits for it.
   static_cast<void>(test::criticalPass(spill.host.governor));
   static_cast<void>(spill.host.governor.controlPass(spill.now));
-  require(experts.units() == 16, "the store did not grow into the room the cache left");
+  require(experts.units() == 0, "the store grew " + std::to_string(experts.units()) +
+                                    " units into the room a waiting resume waits for");
+  const uint64_t shrinks = experts.shrinks;
   spill.model.resumeDenied = false;
   spill.runUntilIdle();
   const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
   require(counts.resident == 2 && counts.converted == 0 && spill.events.failedCount == 0 &&
               spill.events.completedCount == 2 && spill.events.usage.at(1).second == 4'096 &&
-              spill.model.resumptions == 1 && experts.shrinks != 0,
-          "a Resident request's resume did not take back the memory the store grew into");
+              spill.model.resumptions == 1 && experts.shrinks == shrinks,
+          "a Resident request's resume did not run on the room it waited for without a take back");
 }
 
 // A decoding lane whose history holds Index pages reads them through the hot
@@ -2722,7 +2725,7 @@ std::span<const test::TestCase> spillTests() {
       {"testSpillResumeBoundLeavesOutputPastItsAnchor", testSpillResumeBoundLeavesOutputPastItsAnchor},
       {"testSpillResumeInItsPromptHoldsNoAnchor", testSpillResumeInItsPromptHoldsNoAnchor},
       {"testSpillResumeTakesItsReplaysPagesAsItRuns", testSpillResumeTakesItsReplaysPagesAsItRuns},
-      {"testAResumeTakesBackTheMemoryItsKvHeld", testAResumeTakesBackTheMemoryItsKvHeld},
+      {"testAWaitingResumeFindsTheMemoryItsKvHeldFree", testAWaitingResumeFindsTheMemoryItsKvHeldFree},
       {"testDecodeLeavesOutALaneRefusedItsHotFloor", testDecodeLeavesOutALaneRefusedItsHotFloor},
       {"testARefusedDecodeTakesThePrefillLanesMemory", testARefusedDecodeTakesThePrefillLanesMemory},
       {"testRefusedModelMemoryTakesWhatGivesMemoryBack", testRefusedModelMemoryTakesWhatGivesMemoryBack},

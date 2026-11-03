@@ -190,11 +190,12 @@ void requireBooks(Served &served, const std::string &when) {
 // its cap for more than two settled passes
 // while its next unit would grow by the rule's terms. B4's "back at its size
 // before each episode within its normal level" is not A30's. At each normal
-// level the store regrows into free room while a fed prompt's start waits,
-// and the start takes it back as its request goes on past the need it waited
-// with: a regrow and take back repeating 12 s apart, an oscillation this check
-// fails (open: A30 against amend/M.md B2, under which a resume, which comes
-// back as a start, takes back what the store grew into while it waited). A
+// level a fed prompt's start waits; the store grew into free room meanwhile,
+// and the start took it back as its request went on past the need it waited
+// with, a regrow and take back repeating 12 s apart. While a claim waits, or
+// a request to retry what the host refused it, the pools no longer grow into
+// free room: requests first, fresh starts and resumes alike (coordinator
+// 11:00, MemoryLedger::holdsFreeRoom). A
 // critical level's drop within the horizon of a regrowth
 // counts as a take back here too. Every request completes or ends for capacity;
 // Metal stays healthy.
