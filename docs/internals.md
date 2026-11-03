@@ -1246,7 +1246,7 @@ idle time too, or, while a request that took them prefills or shares the
 engine with another, at that request's own rate since it began, whichever is
 higher; what the host's claim, another pool's growth or the engine's own
 claims take while such a request runs (or a request waits for what the host
-refused it) counts as theirs, at its rate since the first of those takes: a
+refused it) counts as theirs, each take at least one in the time since it: a
 store chunk a long prompt took comes back right after the prompt when it
 decodes alone, and not while other requests keep taking chunks. A
 temporary SSD cache copies ahead only on

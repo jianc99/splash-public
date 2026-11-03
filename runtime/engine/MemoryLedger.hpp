@@ -396,8 +396,8 @@ private:
   [[nodiscard]] uint64_t pendingGrowthBytes() const noexcept;
   // The units of the pool `account` claims take per second: its measured
   // rate, or, if more, that of the claims in demand that took its units,
-  // each its units since it opened, and that of the units claims of no
-  // request took for the lanes (lanesInDemand) since the first of them.
+  // each its units since it opened, and of the units claims of no request
+  // took for the lanes (lanesInDemand), the highest rate since any of them.
   [[nodiscard]] double takesPerSecond(size_t account) const noexcept;
   // Whether the engine's lanes may yet need what a claim of no request (the
   // host's, a pool's growth, the engine's own) takes: a request's claim is
@@ -434,15 +434,15 @@ private:
   std::function<void(std::string_view)> log_;
   double nowSeconds_ = 0.0;
   std::optional<double> uncopiedReachedSeconds_;
-  // The units claims of no request took while the lanes were in demand, as
-  // one claim's that opened with the first of them; none once the lanes are
+  // The units claims of no request took while the lanes were in demand,
+  // each with when its claim opened, oldest first; none once the lanes are
   // not (observePools). Those claims close as they decide, and what they
   // take the lanes' growth and starts would take otherwise.
-  struct LanesTakes final {
-    double openedSeconds = 0.0;
-    std::vector<AccountId> poolTakes;
+  struct LanesTake final {
+    double seconds = 0.0;
+    AccountId pool;
   };
-  std::optional<LanesTakes> lanesTakes_;
+  std::vector<LanesTake> lanesTakes_;
 };
 
 } // namespace splash::engine
