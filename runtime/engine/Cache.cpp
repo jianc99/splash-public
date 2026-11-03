@@ -1107,6 +1107,8 @@ private:
   void joinParent(uint64_t block);
   // The blocks.
   [[nodiscard]] uint64_t recencyOf(uint64_t block) const;
+  [[nodiscard]] uint64_t erasedRecency(uint64_t block) const;
+  [[nodiscard]] bool hasResidentChild(uint64_t block) const;
   [[nodiscard]] bool needed(uint64_t block) const;
   [[nodiscard]] bool stateBelow(uint64_t block) const;
   [[nodiscard]] bool leaf(uint64_t block, bool onceLanded = false) const;
@@ -1805,6 +1807,47 @@ uint64_t Cache::ReclaimPlan::recencyOf(uint64_t block) const {
   return inherited != recency_.end() ? inherited->second : cache.kv_.lastUsed(block);
 }
 
+// The recency an Erase leaves the leaf as it drops the leaf's disk-only
+// subtree (dropDiskSubtree): in KvCache::subtree's order each block erased
+// passes its recency to its parent (KvCache::inherit), the leaf at every
+// child and a disk-only parent at its last. A block the reclaims before
+// erased has left with its subtree; one they dropped through its copy is
+// disk-only.
+uint64_t Cache::ReclaimPlan::erasedRecency(uint64_t block) const {
+  const KvCache &kv = cache.kv_;
+  const auto erased = [&](uint64_t below) {
+    for (; below != block; below = kv.key(below).parent)
+      if (leftRam_.contains(below) && !kv.slot(below))
+        return true;
+    return false;
+  };
+  uint64_t recency = recencyOf(block);
+  // What the last child erased so far gives each disk-only parent, which
+  // comes after its children.
+  std::unordered_map<uint64_t, uint64_t> passed;
+  for (const uint64_t below : kv.subtree(block)) {
+    if (erased(below))
+      continue;
+    const auto child = passed.find(below);
+    const uint64_t own = child == passed.end() ? recencyOf(below) : std::max(recencyOf(below), child->second);
+    const uint64_t parent = kv.key(below).parent;
+    if (parent == block)
+      recency = std::max(recency, own);
+    else
+      passed[parent] = own;
+  }
+  return recency;
+}
+
+// A child of the block holds a page the reclaims before left (KvCache's
+// resident children).
+bool Cache::ReclaimPlan::hasResidentChild(uint64_t block) const {
+  const KvCache &kv = cache.kv_;
+  return std::ranges::any_of(kv.children(block), [&](uint64_t child) {
+    return kv.page(child) != KvCache::noPage && !leftRam_.contains(child);
+  });
+}
+
 bool Cache::ReclaimPlan::needed(uint64_t block) const {
   // Only a state restores a disk-only chain, through its own block and
   // every block above: one the reclaims dropped restores nothing.
@@ -1989,9 +2032,7 @@ void Cache::ReclaimPlan::stateOut(uint64_t block, bool inUse) {
 void Cache::ReclaimPlan::demotionLands(uint64_t block) {
   const KvCache &kv = cache.kv_;
   if (timing() == ReclaimTiming::Immediate || !heldDemotions_.contains(block) || ramState(block) || used(block) ||
-      std::ranges::any_of(kv.children(block), [&](uint64_t child) {
-        return kv.page(child) != KvCache::noPage && !leftRam_.contains(child);
-      }))
+      hasResidentChild(block))
     return;
   heldDemotions_.erase(block);
   demoting_.insert(block);
@@ -2103,6 +2144,14 @@ Cache::ReclaimPlan::Step Cache::ReclaimPlan::takeLeaf(uint64_t block, LeafGoes g
   } else {
     freePage(page);
     leftRam_.insert(block);
+    // As KvCache::dropPage and erase do (KvCache::inherit), the parent takes
+    // the leaf's recency once it holds no resident child, a leaf the walk
+    // takes or not, before a demotion of its own lands; an Erase first gives
+    // the leaf what dropping its disk-only subtree passes up.
+    if (goes == LeafGoes::Erase && (kv.hasDiskChildren(block) || diskParents_.contains(block)))
+      recency_[block] = erasedRecency(block);
+    if (parent && !hasResidentChild(parent) && !cache.pool_.pageActive(kv.page(parent)))
+      recency_[parent] = std::max(recencyOf(parent), recencyOf(block));
     demotionLands(parent);
   }
   if (goes == LeafGoes::Copy) {
