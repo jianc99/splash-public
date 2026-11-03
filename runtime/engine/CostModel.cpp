@@ -146,6 +146,8 @@ double CostModel::price(const model::CommandWork &expected) const noexcept {
 
 double CostModel::turnaround() const noexcept { return rates_[kUnits]; }
 
+double CostModel::weightReadRate() const noexcept { return rates_[kWeightReads]; }
+
 double CostModel::fixed(const model::CommandWork &expected) const noexcept {
   return rates_[kUnits] +
          rates_[kWeightReads] * scale(CostTerm::WeightReadBytes) * double(expected.weightReadBytes) +

@@ -92,6 +92,10 @@ public:
   [[nodiscard]] double price(const model::CommandWork &expected) const noexcept;
   // The rate of Units: what every command or pass costs whatever its work.
   [[nodiscard]] double turnaround() const noexcept;
+  // The rate of WeightReadBytes: what a byte of weights a unit read costs,
+  // which price charges the expected bytes at once scaled by their realized
+  // share.
+  [[nodiscard]] double weightReadRate() const noexcept;
   // The part of a unit's price fewer rows do not shorten: its Units and
   // read terms.
   [[nodiscard]] double fixed(const model::CommandWork &expected) const noexcept;

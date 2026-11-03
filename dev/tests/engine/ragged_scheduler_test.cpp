@@ -799,6 +799,37 @@ void testAPrefillsPriceIsTheCostModels() {
           "more rows did not cost more");
 }
 
+// A byte of weights a prefill read costs the rate the fit learned of the
+// bytes units read, what the memory ledger prices the bytes a pool's prefill
+// reads at (MemoryRates::weightReadSecondsPerByte). The prefill price
+// charges a model's expected bytes that rate scaled by the share of them
+// units read, so on the M6 target, its units reading half the bytes its
+// model expects (amend/I.md F1: 0.46-0.59), the bytes a turn reads cost what
+// its price charges for the bytes it expects, not half of that.
+void testAWeightReadByteIsPricedAsRead() {
+  Sim sim(test::kM6FlashNextQ2);
+  sim.seed();
+  sim.lane(1, 0, 8 * kChunk);
+  for (uint32_t command = 0; command < 8; ++command) {
+    const BatchPlan plan = sim.plan();
+    model::CommandWork read = sim.work.prefillWork(sim.lanes(plan.items), plan.pass, plan.passes);
+    read.weightReadBytes /= 2;
+    completePrefill(sim, plan, test::sampleOf(test::prefillTimes(sim.work.profile(), read)));
+  }
+  const CostTermSnapshot weights =
+      sim.scheduler.snapshot().prefillEstimate.terms[static_cast<size_t>(CostTerm::WeightReadBytes)];
+  require(std::abs(weights.realizedPerExpected - 0.5) < 1e-9, "the units did not read half the expected bytes");
+  const model::PrefillLane turn{8192, 300, 0};
+  const model::CommandWork expected = sim.work.prefillWork({&turn, 1}, 0, 1);
+  model::CommandWork noReads = expected;
+  noReads.weightReadBytes = 0;
+  const double charged = sim.scheduler.prefillMilliseconds(expected) - sim.scheduler.prefillMilliseconds(noReads);
+  const double priced = sim.scheduler.weightReadMillisecondsPerByte() * 0.5 * double(expected.weightReadBytes);
+  require(charged > 0.0 && std::abs(priced - charged) < 1e-6 * charged,
+          "the bytes a turn reads were priced " + std::to_string(priced) + " ms against the " +
+              std::to_string(charged) + " ms its expected bytes are charged");
+}
+
 // S-P5: a cold start's first contended agent turn is never underpriced, as
 // the base's host-wait seed prices it (1119.9 ms for a 3226.8 ms turn), and
 // is priced within twice its time, so its first sample trains unclamped
@@ -1988,6 +2019,7 @@ constexpr test::TestCase kTests[] = {
     {"testUntimedOrAuxiliaryUnitsTrainNothing", testUntimedOrAuxiliaryUnitsTrainNothing},
     {"testACommandHoldsOneLanePastAChunk", testACommandHoldsOneLanePastAChunk},
     {"testAPrefillsPriceIsTheCostModels", testAPrefillsPriceIsTheCostModels},
+    {"testAWeightReadByteIsPricedAsRead", testAWeightReadByteIsPricedAsRead},
     {"testColdSeedPricesTheFirstContendedTurn", testColdSeedPricesTheFirstContendedTurn},
     {"testEstimateConvergesUnderUniformContendedCommands", testEstimateConvergesUnderUniformContendedCommands},
     {"testALoneDenseCommandRunsWhole", testALoneDenseCommandRunsWhole},

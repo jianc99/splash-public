@@ -858,6 +858,8 @@ double Scheduler::prefillMilliseconds(const model::CommandWork &work) const noex
   return cost_.price(work);
 }
 
+double Scheduler::weightReadMillisecondsPerByte() const noexcept { return cost_.weightReadRate(); }
+
 double Scheduler::decodeTokenMilliseconds() const noexcept {
   return decodeTokenWeight_ > 0.0 ? decodeTokenTime_ / decodeTokenWeight_ : 0.0;
 }

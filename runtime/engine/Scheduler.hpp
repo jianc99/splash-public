@@ -229,8 +229,16 @@ public:
   // The command between its passes was abandoned: each of its lanes counts
   // the time its passes took as time it waited.
   void abandoned(const PassProgress &command);
-  // The price, in milliseconds, of a prefill command or pass doing `work`.
+  // The price, in milliseconds, of a prefill command or pass doing `work`,
+  // the work a model expects (PrefillWorkSource): its read bytes count at
+  // the share of them units realized.
   [[nodiscard]] double prefillMilliseconds(const model::CommandWork &work) const noexcept;
+  // The price, in milliseconds, of a byte of weights a prefill read from the
+  // SSD, as the expert store counts its reads (ExpertStore::readBytes): the
+  // cost model's rate. prefillMilliseconds charges an expected byte that
+  // rate times the share of expected bytes units read, so a difference of
+  // its prices is what an expected byte costs, not a byte read.
+  [[nodiscard]] double weightReadMillisecondsPerByte() const noexcept;
   // The wall time of a decode command per token it committed per lane, in
   // milliseconds: the mean over the decode commands completed, each weighing
   // kDecodeTokenDecay of the next; 0 before the first.
