@@ -1650,6 +1650,60 @@ void testAConversionCountsNoIndexPagesTheWalkMayEvictAndRelease() {
   require(spill.events.failedCount == 0, "a request failed");
 }
 
+// Nor, under macOS's critical pressure, the free Index pages of an extent
+// the walk may empty by its evictions when they are fewer than an extent's:
+// the critical walk keeps no runway, evicts the cache that costs nothing and
+// releases the Index extent that empties. An earlier critical pass released
+// the runway; an ended Spill request leaves the one page of its chain past
+// its dense history and before its window in an Index extent whose other
+// three pages are free; a Resident lane holds 16 pages. A critical host pass
+// offers no conversion and takes what it found.
+void testACriticalPassCountsNoIndexPagesItsWalkMayEmpty() {
+  Spilling spill(Spilling::Governed{}, 1024, true, Spilling::Extent{4});
+  spill.engine.submit(Spilling::prompt(1, 1, 3, 1));
+  spill.runUntilIdle();
+  for (uint32_t step = 0; step < 8 && spill.cache.reclaimOneState(StateClass::Ordinary, false); ++step) {
+    spill.tier.complete();
+    static_cast<void>(spill.cache.pollTransfers());
+  }
+  require(spill.pool.freePageCount(kv::PageForm::Index) == 7 && spill.cache.snapshot().stateCache.bytes == 0,
+          "the ended request did not leave its spilled page beside three free ones and the runway, its states "
+          "on disk: " +
+              std::to_string(spill.pool.freePageCount(kv::PageForm::Index)) + " free Index pages");
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(4, 4, 16, 10000));
+  spill.runUntil([&] { return spill.events.outputs.contains(4) && !spill.engine.commandInFlight(); },
+                 "the lane did not decode");
+  spill.tier.writableFile = true;
+  {
+    const test::ClaimScope start(spill.host.governor, ClaimClass::Floor);
+    require(static_cast<bool>(spill.pool.fillRunway(kv::PageForm::Full)), "the Full extent was not allocated");
+  }
+  // The earlier critical pass's release of the Index runway.
+  static_cast<void>(spill.pool.reclaimEmptyExtents(false, 1, kv::PageForm::Index));
+  require(spill.pool.freePageCount(kv::PageForm::Index) == 3,
+          "the runway's release did not leave the three free pages beside the spilled one: " +
+              std::to_string(spill.pool.freePageCount(kv::PageForm::Index)) + " free Index pages");
+  MemoryLedger &ledger = spill.host.governor.ledger();
+  std::string decisions;
+  ledger.setDecisionLog([&](std::string_view line) { decisions += std::string(line) + "\n"; });
+  const ClaimSpec spec{
+      .cls = ClaimClass::Host, .reach = ReclaimClass::InUse, .holdSeconds = kValueHorizonSeconds};
+  static_cast<void>(ledger.dropToFloors());
+  const uint64_t found = ledger.available(spec, std::numeric_limits<uint64_t>::max(), 0, true, true);
+  const ClaimId claim = ledger.open(spec);
+  const FreeResult taken = ledger.free(claim, {.bytes = found}, 0, true, true);
+  ledger.close(claim);
+  require(taken.nowBytes + taken.laterBytes >= found && spill.engine.snapshot().spill.converted == 0,
+          "a critical host pass took " + std::to_string(taken.nowBytes) + " bytes now and " +
+              std::to_string(taken.laterBytes) + " later of the " + std::to_string(found) + " it found, " +
+              std::to_string(spill.engine.snapshot().spill.converted) +
+              " lanes converted: it priced a conversion on Index pages its walk may empty and release\n" + decisions);
+  spill.model.decodeFinishes = true;
+  spill.runUntilIdle();
+  require(spill.events.failedCount == 0, "a request failed");
+}
+
 // Where no Index extent is empty, as where memory refused the runway's
 // refill (Engine::spillLanded), a conversion lands into the free Index pages
 // there are up to an extent's: the claim's walk gathers the free pages of
@@ -2687,6 +2741,7 @@ std::span<const test::TestCase> spillTests() {
        testAConversionCountsOnlyTheIndexPagesItsClaimsReclaimsLeave},
       {"testAConversionCountsNoIndexPagesTheWalkMayEvictAndRelease",
        testAConversionCountsNoIndexPagesTheWalkMayEvictAndRelease},
+      {"testACriticalPassCountsNoIndexPagesItsWalkMayEmpty", testACriticalPassCountsNoIndexPagesItsWalkMayEmpty},
       {"testAConversionLandsIntoTheFreeIndexPagesUpToAnExtent", testAConversionLandsIntoTheFreeIndexPagesUpToAnExtent},
       {"testALaneGrowsOnTheStoreWhenItsConversionLandsTooLittle",
        testALaneGrowsOnTheStoreWhenItsConversionLandsTooLittle},
