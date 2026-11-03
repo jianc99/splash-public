@@ -6404,6 +6404,65 @@ void testParentTakesTheRecencyOfTheChildThatLeavesLast() {
   spill.cache.checkInvariants();
 }
 
+// A leaf that goes passes its recency to a parent it leaves without a
+// resident child (KvCache::inherit) before the parent's own demotion lands,
+// and the parent passes it on as it leaves. Here P's demotion started while
+// P was a leaf, and a request then added the leaf L below it, so P's page
+// frees once L has gone and P's copy has landed. P's parent G then goes at
+// L's recency: after Q, newer than P and older than L, whose demotion the
+// tier takes only once P's has landed. The walk gives Q, weighed at its two
+// pages of prefill, before G, as the claim's retry takes them.
+void testGrandparentTakesTheRecencyOfTheLeafThatLeftItsChild() {
+  test::TestKvStorage storage{16, 100, 4};
+  KvPool pool{storage, 16};
+  test::TestKvTier tier;
+  tier.transferLimit = 8;
+  // One demotion at a time.
+  tier.writeLimits[static_cast<size_t>(WriteClass::Reclaim)] = 1;
+  auto budget = std::make_shared<model::DiskBudget>(64 * 100);
+  tier.budget = budget;
+  engine::Cache cache(pool, &tier, budget);
+  const auto toDisk = [&](uint64_t block) {
+    auto control = std::make_shared<TransferControl>();
+    control->ready = true;
+    cache.publishCompositeState(block, std::make_shared<TieredState>(control), false);
+    require(cache.reclaimOneState(StateClass::Ordinary, false) && cache.pollTransfers(), "a state was not written");
+  };
+  const auto [prompt, chain] = cacheChain(cache, 1, 2);
+  toDisk(chain[1]);
+  require(cache.reclaimOne(CacheReclaimMode::KeepExtents, ReclaimClass::Ordinary).madeProgress &&
+              tier.demotions == 1,
+          "P's demotion did not start");
+  // A request resumes from P's state and publishes L below P while P's copy
+  // is written; Q comes meanwhile.
+  CacheLookup lookup = cache.lookup(prompt, {});
+  cache.beginRequest(2);
+  require(lookup.state && admitRestore(cache, 2, lookup).granted(), "the request did not resume from P");
+  std::vector<uint32_t> longer(prompt.begin(), prompt.begin() + 2 * KvCache::pageTokens);
+  for (uint32_t row = 0; row <= KvCache::pageTokens; ++row)
+    longer.push_back(7000 + row);
+  require(admitTokens(cache, 2, 3 * KvCache::pageTokens).granted(), "L's page was denied");
+  cache.publishCommittedBlocks(2, longer, 3 * KvCache::pageTokens, {});
+  toDisk(cacheChain(cache, 3, 2).second[1]);
+  lookup = {};
+  cache.endRequest(2);
+  const MemoryRates rates{.prefillSecondsPerRow = 1.0, .reuse = 1.0};
+  const ClaimSpec claim{.cls = ClaimClass::InService};
+  const VictimQuery query{.claim = &claim, .need = {.pages = 1}, .rates = &rates};
+  const double page = KvCache::pageTokens * rates.prefillSecondsPerRow;
+  // L, then Q.
+  std::vector<double> costs = unitCosts(cache, query);
+  require(costs.size() >= 2 && costs[1] == 2 * page,
+          "the grandparent's later step came before a leaf older than the leaf that left its child");
+  const std::optional<engine::Victim> unit = cache.peek(query, nullptr);
+  require(unit && cache.take(query, *unit).outcome == FreeOutcome::Met, "L did not go");
+  tier.complete();
+  static_cast<void>(cache.pollTransfers());
+  costs = unitCosts(cache, query);
+  require(!costs.empty() && costs[0] == 2 * page, "the retry did not take Q first");
+  cache.checkInvariants();
+}
+
 // What a request may wait for counts only the free pages beyond those
 // waiting claims above it hold: with growth refused, a demotion in flight
 // freeing one page leaves the request short of the three pages held ones
@@ -6925,6 +6984,7 @@ int main() {
     testDeviceNeedKeepsKvBesideTheIndexRunway();
     testDeviceNeedPassesOverLeavesOfFormsOutOfReach();
     testParentTakesTheRecencyOfTheChildThatLeavesLast();
+    testGrandparentTakesTheRecencyOfTheLeafThatLeftItsChild();
     testHeldPagesAreNoRoomToWaitFor();
     testImmediateWalksOfferWhatLandsLaterInItsPlace();
     testImmediateDeviceWalkOffersWhatAWriteFreesFirst();

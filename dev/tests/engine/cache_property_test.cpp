@@ -509,15 +509,17 @@ void testRandomRuns(uint32_t plainSeeds, uint32_t windowedSeeds) {
 // Windowed seed 1836083 and plain seed 396221: in them a leaf that goes
 // passes its recency to its parent as the cache does, with what an Erase of
 // its disk-only subtree gave it (1836083), and to a parent whose demotion
-// then lands, which passes it on (396221). Plain seeds 10248, 15837, 24025,
-// 105144, 386046, 470525, 482345, 247559 and 364835: in them the resume
-// point lies below a poisoned block whose subtree goes as the first
-// transfers land, and the retries keep the newest state left, most often
-// one the walk left waiting for the write slot. Windowed seeds 55544, 63544,
-// 546782, 1061965, 1748006 and 2429048, and plain seeds 415497, 478646 and
-// 483524: in them a retry first releases a Full extent the plan placed
-// elsewhere, as a leaf goes once the state write that kept it lands, a
-// write the quota refuses drops its state, a demotion counted unsure
+// then lands, which passes it on (396221; with the reach per form it passes
+// without that rule too, which engine-cache's
+// testGrandparentTakesTheRecencyOfTheLeafThatLeftItsChild pins). Plain seeds
+// 10248, 15837, 24025, 105144, 386046, 470525, 482345, 247559 and 364835: in
+// them the resume point lies below a poisoned block whose subtree goes as
+// the first transfers land, and the retries keep the newest state left, most
+// often one the walk left waiting for the write slot. Windowed seeds 55544,
+// 63544, 546782, 1061965, 1748006 and 2429048, and plain seeds 415497,
+// 478646 and 483524: in them a retry first releases a Full extent the plan
+// placed elsewhere, as a leaf goes once the state write that kept it lands,
+// a write the quota refuses drops its state, a demotion counted unsure
 // starts, landings complete an extent with the free pages a unit leaves, or
 // Spill writes land copies through which blocks no request holds go; the
 // Slim and Index units after it reach as far as their own form's pages, and
