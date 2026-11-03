@@ -2031,6 +2031,173 @@ class GateTests(unittest.TestCase):
             causes(["claim wait"], times=(80.0, 90.0, 100.0)), {"unattributed": 1}
         )
 
+    def test_compressed_and_unbooked_engine_memory(self):
+        # Borrowed items 2 and 9 on s-fn-churn-18g cand. At Ready the
+        # engine's phys_footprint is 512 MiB over its accounts; with 8,500
+        # tokens live, 912 MiB over them (400 MiB more, past the amendment's
+        # ~256 MiB) and 1 GiB of it compressed; idle again, 612 MiB. A tree
+        # before M3a reports neither.
+        mib = 1 << 20
+
+        def sample(t, footprint, booked, compressed, lanes=()):
+            return status(
+                t,
+                ready=True,
+                memory_governor__host_telemetry={
+                    "phys_footprint_bytes": footprint * mib,
+                    "compressed_bytes": compressed * mib,
+                    "file_backed_bytes": 0,
+                    "inactive_bytes": 0,
+                    "filecache_min_bytes": 0,
+                },
+                memory_governor__accounts=[
+                    {"name": "kv", "current_bytes": (booked - 4096) * mib},
+                    {"name": "experts", "current_bytes": 4096 * mib},
+                ],
+                memory_governor__charged_bytes=booked * mib,
+                active_requests=list(lanes),
+            )
+
+        lane = {
+            "id": 1,
+            "phase": "decode",
+            "prompt_tokens": 8000,
+            "prompt_processed": 8000,
+            "generated_tokens": 500,
+            "age_ms": 9000,
+        }
+        samples = [
+            status(0, ready=False, memory_governor__host_telemetry=None),
+            sample(10, 10240, 9728, 0),
+            sample(20, 10752, 9840, 1024, lanes=[lane]),
+            sample(30, 10352, 9740, 512),
+        ]
+        cell = {"name": "s", "machine": "studio", "health": ["cand"]}
+
+        def verdicts(label, samples):
+            r = churn_run(self.directory, label, [], samples)
+            r.tree, r.order = "cand", "A"
+            return {
+                v["rule"]: v
+                for v in matrix.churn_cell(cell, self.spec, [r], {}, PRICES)
+            }
+
+        found = verdicts("cand", samples)
+        health = found["G4 G8 G9 cand"]
+        unbooked = {
+            "at_ready_bytes": 512 * mib,
+            "growth_idle_max_bytes": 100 * mib,
+            "growth_live_max_bytes": 400 * mib,
+            "context_tokens_at_live_max": 8500,
+            "bound_bytes": 256 * mib,
+            "past_bound": True,
+        }
+        self.assertEqual(
+            health["numbers"]["readouts"]["compressed"],
+            {"max_bytes": 1024 * mib, "max_share": 0.0952},
+        )
+        self.assertEqual(health["numbers"]["readouts"]["unbooked"], unbooked)
+        self.assertEqual(
+            health["series"],
+            {
+                "compressed": [
+                    [10, 0, 0.0],
+                    [20, 1024 * mib, 0.0952],
+                    [30, 512 * mib, 0.0495],
+                ],
+                "unbooked": [[10, 0, 0], [20, 400 * mib, 8500], [30, 100 * mib, 0]],
+            },
+        )
+        report = found["unbooked memory cand"]
+        self.assertEqual((report["verdict"], report["numbers"]), ("report", unbooked))
+        old = verdicts("old", [status(0), status(900)])
+        readouts = old["G4 G8 G9 old"]["numbers"]["readouts"]
+        self.assertEqual(
+            (readouts["compressed"], readouts["unbooked"]),
+            ("not reported", "not reported"),
+        )
+        self.assertNotIn("unbooked memory old", old)
+
+    def test_clamped_share_of_each_estimate(self):
+        # Borrowed item 6, for stage 2 to decide on: 50 of the 200 prefill
+        # commands that trained the estimate had their time clamped, none of
+        # the decode estimate's 400.
+        def estimate(samples, clamped):
+            return {"samples": samples, "clamped": clamped, "terms": []}
+
+        trained = status(
+            900,
+            scheduler__estimate__prefill=estimate(200, 50),
+            scheduler__estimate__decode=estimate(400, 0),
+        )
+        readouts = matrix.health(
+            churn_run(self.directory, "trained", [], [status(0), trained]),
+            self.machine,
+            self.gates,
+        )["readouts"]
+        self.assertEqual(
+            readouts["clamped"],
+            {
+                "prefill": {"samples": 200, "clamped": 50, "share": 0.25},
+                "decode": {"samples": 400, "clamped": 0, "share": 0.0},
+            },
+        )
+        old = matrix.health(
+            churn_run(self.directory, "old", [], [status(0), status(900)]),
+            self.machine,
+            self.gates,
+        )["readouts"]
+        self.assertEqual(old["clamped"], {"prefill": None, "decode": None})
+
+    def test_prefetch_coverage_with_and_without_a_history_stream(self):
+        # DESIGN §0 Q6 on s-fn-churn-18g cand: in the two sample intervals
+        # in which a history stream read, 80 of the 200 prefill experts read
+        # and 10 of the 20 decode ones had been read ahead; in the other, 90
+        # of 100 and 10 of 20. A resident run reports none.
+        def use(read, prefetched):
+            return {"read": read, "prefetched": prefetched}
+
+        def sample(t, history, prefill, decode):
+            return status(
+                t,
+                kv_spill__history_stream={"bytes": history},
+                streamed_experts__prefill=use(*prefill),
+                streamed_experts__decode=use(*decode),
+            )
+
+        samples = [
+            sample(0, 0, (0, 0), (0, 0)),
+            sample(2, 1000, (100, 40), (10, 5)),
+            sample(4, 1000, (200, 130), (30, 15)),
+            sample(6, 3000, (300, 170), (40, 20)),
+        ]
+        readouts = matrix.health(
+            churn_run(self.directory, "streamed", [], samples),
+            self.machine,
+            self.gates,
+        )["readouts"]
+        self.assertEqual(
+            readouts["prefetch_coverage"],
+            {
+                "prefill": {
+                    "history_stream": {"read": 200, "prefetched": 80, "coverage": 0.4},
+                    "rest": {"read": 100, "prefetched": 90, "coverage": 0.9},
+                },
+                "decode": {
+                    "history_stream": {"read": 20, "prefetched": 10, "coverage": 0.5},
+                    "rest": {"read": 20, "prefetched": 10, "coverage": 0.5},
+                },
+            },
+        )
+        resident = matrix.health(
+            churn_run(self.directory, "resident", [], [status(0), status(900)]),
+            self.machine,
+            self.gates,
+        )["readouts"]
+        self.assertEqual(
+            resident["prefetch_coverage"], {"prefill": None, "decode": None}
+        )
+
     def test_check_finds_a_silent_worker_and_a_short_run(self):
         done = [
             {"tag": f"w{w}-r1", "start": 0, "t": 100, "ttft": 5, "decode_tps": 30}

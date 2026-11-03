@@ -973,6 +973,132 @@ def prefill_shares(status: dict) -> dict:
     }
 
 
+def clamped_shares(status: dict) -> dict:
+    """Borrowed item 6 (owner 21:05), reported for stage 2 to decide on: per
+    command estimate (scheduler.estimate.prefill, decode) the commands or
+    passes that trained it since the server started, those whose time it
+    clamped, and their share; None for an estimate the status lacks or
+    nothing trained."""
+    shares = {}
+    for kind in ("prefill", "decode"):
+        estimate = value(status, f"scheduler.estimate.{kind}") or {}
+        samples, clamped = estimate.get("samples"), estimate.get("clamped", 0)
+        shares[kind] = (
+            {"samples": samples, "clamped": clamped, "share": clamped / samples}
+            if samples
+            else None
+        )
+    return shares
+
+
+def prefetch_coverage(run: Run) -> dict:
+    """DESIGN §0 Q6, reported only: per use of the streamed experts
+    (prefill, decode), of the experts its loads read (not resident) those
+    read ahead, Δprefetched over Δread, over the sample intervals in which a
+    history stream read (kv_spill.history_stream.bytes rose) and over the
+    rest; coverage None where they read none, and None for a use the status
+    lacks."""
+    coverage = {}
+    for use in ("prefill", "decode"):
+        read, ahead = (
+            f"streamed_experts.{use}.read",
+            f"streamed_experts.{use}.prefetched",
+        )
+        if value(run.last, ahead) is None:
+            coverage[use] = None
+            continue
+        parts = {"history_stream": [0, 0], "rest": [0, 0]}
+        for earlier, later in zip(run.samples, run.samples[1:]):
+            a, b = earlier["status"], later["status"]
+            streamed = value(b, "kv_spill.history_stream.bytes", 0) > value(
+                a, "kv_spill.history_stream.bytes", 0
+            )
+            part = parts["history_stream" if streamed else "rest"]
+            part[0] += value(b, read, 0) - value(a, read, 0)
+            part[1] += value(b, ahead, 0) - value(a, ahead, 0)
+        coverage[use] = {
+            name: {
+                "read": read_count,
+                "prefetched": prefetched,
+                "coverage": prefetched / read_count if read_count else None,
+            }
+            for name, (read_count, prefetched) in parts.items()
+        }
+    return coverage
+
+
+def host_memory(run: Run, growth_bound: float) -> tuple[dict, dict]:
+    """Borrowed items 2 and 9 (owner 21:05), reported only, from the samples
+    whose memory_governor.host_telemetry macOS filled ("not reported" where
+    every sample lacks it or has null: the references and every tree before
+    M3a), and the series they come from.
+
+    compressed: the most bytes of the engine's phys_footprint macOS held
+    compressed and the largest share of it they were; the fix round changes
+    a rule only if the engine's own memory is compressed.
+
+    unbooked: phys_footprint less the ledger's accounts, both of one
+    snapshot, as its change since the first sample with `ready` true,
+    against the live context (each active request's encoded prompt and
+    generated tokens): its largest change while no request was live and
+    while one was, with that sample's context, and whether either passed
+    `growth_bound`, past which the fix round books it."""
+    telemetry = [
+        (s["t"], s["status"], value(s["status"], "memory_governor.host_telemetry"))
+        for s in run.samples
+    ]
+    telemetry = [(t, status, host) for t, status, host in telemetry if host]
+    if not telemetry:
+        return {"compressed": "not reported", "unbooked": "not reported"}, {}
+    compressed = [
+        (
+            t,
+            host["compressed_bytes"],
+            host["compressed_bytes"] / host["phys_footprint_bytes"],
+        )
+        for t, _, host in telemetry
+    ]
+    readouts = {
+        "compressed": {
+            "max_bytes": max(c for _, c, _ in compressed),
+            "max_share": round(max(share for _, _, share in compressed), 4),
+        },
+        "unbooked": "no sample with ready true",
+    }
+    series = {"compressed": [[t, c, round(share, 4)] for t, c, share in compressed]}
+    ready = next(
+        (i for i, (_, status, _) in enumerate(telemetry) if status.get("ready")), None
+    )
+    if ready is None:
+        return readouts, series
+    unbooked = []
+    for t, status, host in telemetry[ready:]:
+        booked = sum(
+            a["current_bytes"] for a in value(status, "memory_governor.accounts", [])
+        )
+        context = sum(
+            lane["prompt_processed"] + lane["generated_tokens"]
+            for lane in status.get("active_requests") or []
+        )
+        unbooked.append((t, host["phys_footprint_bytes"] - booked, context))
+    at_ready = unbooked[0][1]
+    growth = [[t, held - at_ready, tokens] for t, held, tokens in unbooked]
+    idle = max((g for _, g, tokens in growth if not tokens), default=None)
+    live, live_tokens = max(
+        ((g, tokens) for _, g, tokens in growth if tokens), default=(None, None)
+    )
+    readouts["unbooked"] = {
+        "at_ready_bytes": at_ready,
+        "growth_idle_max_bytes": idle,
+        "growth_live_max_bytes": live,
+        "context_tokens_at_live_max": live_tokens,
+        "bound_bytes": growth_bound,
+        "past_bound": any(g > growth_bound for _, g, _ in growth),
+    }
+    series["unbooked"] = growth
+    return readouts, series
+
+
 def g8_failures(run: Run, gates: dict) -> list[str]:
     """G8 (amend/V.md §5): the server's own failures a run shows, from its
     /status samples (a ttft run's over its servers, each starting afresh),
@@ -1059,6 +1185,7 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
             f"{gates['value_horizon_seconds']} s of their regrow"
         )
     units = counter_delta(run, "scheduler.prefill_units")
+    memory, facts["series"] = host_memory(run, gates["unbooked_growth_bytes"])
     facts["readouts"] = {
         "store": store,
         "relative_error": value(last, "scheduler.estimate.prefill.relative_error"),
@@ -1084,6 +1211,9 @@ def health(run: Run, machine: dict, gates: dict) -> dict:
         "first_start": run.meta.get("first_start"),
         **queue_readouts(run),
         **prefill_shares(last),
+        "clamped": clamped_shares(last),
+        "prefetch_coverage": prefetch_coverage(run),
+        **memory,
     }
     return facts
 
@@ -1200,7 +1330,16 @@ def churn_cell(
         g4_holds[run.tree] = g4_holds.get(run.tree, True) and not any(
             f.startswith("G4") for f in facts["failures"]
         )
-        record(f"G4 G8 G9 {run.label}", FAIL if facts["failures"] else PASS, facts)
+        series = facts.pop("series")
+        record(
+            f"G4 G8 G9 {run.label}",
+            FAIL if facts["failures"] else PASS,
+            facts,
+            series=series,
+        )
+        unbooked = facts["readouts"]["unbooked"]
+        if isinstance(unbooked, dict) and unbooked["past_bound"]:
+            record(f"unbooked memory {run.label}", "report", unbooked)
         conflicts = facts["readouts"]["index_page_conflicts_per_15min"]
         if (
             conflicts is not None

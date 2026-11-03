@@ -489,4 +489,16 @@ reported to the owner. It counts its client gaps above its G4 bound by
 cause, each gap taking the first of these that the `/status` samples from
 2 s before it to 2 s after it show: a claim waiting for memory, the
 experts' size changing, a compaction, a replan, a history-stream wait, a
-committed prefill command; else it is unattributed.
+committed prefill command; else it is unattributed. It reports the share
+of the commands that trained each `scheduler.estimate` whose time it
+clamped; per use of the streamed experts the share of those read (not
+resident) that were read ahead, over the sample intervals in which a
+history stream read and over the rest; the most of its `phys_footprint`
+macOS held compressed and the largest share of it that was; and its
+unbooked memory (`phys_footprint` less the accounts) as its change since
+the first ready sample, at its largest while no request was live and while
+one was, with that sample's context. A growth past 256 MiB
+(`unbooked_growth_bytes`) is reported for the fix round to book. Where
+`memory_governor.host_telemetry` is absent or null, as on the references,
+the last two read not reported; `verdict.json` keeps their per-sample
+series beside the run's numbers.
