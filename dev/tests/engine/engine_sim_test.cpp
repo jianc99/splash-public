@@ -1500,7 +1500,12 @@ void testDenseTurnsKeepTtftAndThroughput() {
 // SIM-long-prompt (V.md §4.1) on the dense 27B: a 64K prompt beside two
 // decoders. Every decoder gap within the run's unit bound and one decode
 // command of the two lanes; the prompt's prefill, its decode share taken
-// out, at least 0.9 (1 - kPassOverheadShare) of its rate alone.
+// out, at least its rate alone over kLongPromptSlowdown: with its heaviest
+// pass within max(G, u/0.1), the turnarounds of the passes its units take
+// beside the decoders cost it about 14 %, not kPassOverheadShare's tenth
+// (+13.9 % measured at earlyfix/sim-s; owner 11-03 00:10, DESIGN §0,
+// AMENDMENTS end). Uneven layer ranges by priced work would win them back.
+constexpr double kLongPromptSlowdown = 1.14;
 void testLongPromptBesideTwoDecoders() {
   const test::TimingProfile &profile = test::kDense27B;
   std::string shape;
@@ -1535,9 +1540,11 @@ void testLongPromptBesideTwoDecoders() {
     return *turns.ttft(3) - decode;
   };
   const double alone = prefillOf(false), opposed = prefillOf(true);
-  require(opposed <= alone / (1.0 - engine::kPassOverheadShare),
+  require(opposed <= kLongPromptSlowdown * alone,
           "the long prompt's prefill beside two decoders took " + std::to_string(opposed) +
               " ms of its own against " + std::to_string(alone) + " ms alone" + shape);
+  note("the 27B's 64K prompt prefilled in " + std::to_string(opposed) + " ms of its own beside two decoders, " +
+       std::to_string(alone) + " ms alone (+" + std::to_string(100.0 * (opposed / alone - 1.0)) + " %)" + shape);
 }
 
 // --- Placement once a candidate a state ------------------------------------------------------------------------
