@@ -1680,6 +1680,55 @@ void testARegroupHappensOnlyWhenTheSumFalls() {
   }
 }
 
+// D2: after a pass, a leader that stays plans its command's own rows again
+// from a first pass. That plan joins no lane, whose own command is then none
+// and costs nothing (K_J = price(C'|J)), so restarting it would only redo the
+// pass: (|B| + |O|)(R - K') < 0, and the command goes on to its prompt's end
+// while an older 64K prompt of its tier waits. Priced as a command of no
+// rows, the joiners cost the plan's P' turnarounds, which outweigh twice a
+// pass here at the 150 ms profile's learned 24 ms in 48 passes, as in the
+// M6 smoke's 24 passes at 53-72 ms, and the command abandoned itself after
+// every pass.
+void testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt() {
+  for (const test::TimingProfile &profile : atEveryTurnaround({&test::kM6FlashNextQ2})) {
+    Sim sim(profile, limits(8192, 48));
+    sim.seed();
+    // The turnaround learned as testPassesAddAtMostATenthOfTheCommand
+    // learns it.
+    sim.decoder(2);
+    for (uint32_t command = 0; command < 8; ++command) {
+      sim.lane(10 + command, 4096 * command, 8192);
+      while (sim.scheduler.phase(10 + command) == Phase::Prefill)
+        sim.step();
+      sim.scheduler.cancel(10 + command);
+      sim.scheduler.remove(10 + command);
+    }
+    sim.lane(3, 12'288, 64'087);
+    sim.lane(1, 0, 23'488);
+    const auto nextPrefill = [&] {
+      BatchPlan plan = sim.plan();
+      while (plan.kind != WorkKind::Prefill) {
+        sim.run(plan);
+        plan = sim.plan();
+      }
+      return plan;
+    };
+    const BatchPlan command = nextPrefill();
+    require(command.width() == 1 && command.items[0].requestId == 1 && command.passes > 1,
+            at(profile) + ": the 23K prompt did not lead a command in passes alone");
+    const uint64_t abandoned = sim.scheduler.snapshot().abandonedPassCommands;
+    sim.run(command);
+    require(!sim.scheduler.abandonsPasses(nextPrefill(), sim.in()),
+            at(profile) + ": a restart of its own rows superseded the command after the first of its " +
+                std::to_string(command.passes) + " passes, the turnaround learned " +
+                std::to_string(sim.turnaround()) + " ms");
+    while (sim.scheduler.phase(1) == Phase::Prefill)
+      sim.step();
+    const uint64_t more = sim.scheduler.snapshot().abandonedPassCommands - abandoned;
+    require(more == 0, at(profile) + ": the 23K prompt's commands were abandoned " + std::to_string(more) + " times");
+  }
+}
+
 // An overdue lane's command is never abandoned.
 void testAnOverdueLaneIsNeverAbandoned() {
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
@@ -2053,6 +2102,7 @@ constexpr test::TestCase kTests[] = {
     {"testASameTierArrivalSupersedesOnlyWhenTheSumFalls", testASameTierArrivalSupersedesOnlyWhenTheSumFalls},
     {"testAHigherTierAbandonCountsLanesWaitingBehindBoth", testAHigherTierAbandonCountsLanesWaitingBehindBoth},
     {"testARegroupHappensOnlyWhenTheSumFalls", testARegroupHappensOnlyWhenTheSumFalls},
+    {"testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt", testARestartOfTheCommandsOwnRowsDoesNotSupersedeIt},
     {"testAnOverdueLaneIsNeverAbandoned", testAnOverdueLaneIsNeverAbandoned},
     {"testOnlyAHeldStartLiftsTheCommand", testOnlyAHeldStartLiftsTheCommand},
     {"testRepeatedSupersedesEndOnceTheLongLaneIsOverdue", testRepeatedSupersedesEndOnceTheLongLaneIsOverdue},

@@ -317,7 +317,7 @@ private:
   [[nodiscard]] std::vector<model::PrefillLane> prefillLanes(std::span<const BatchItem> items,
                                                              const PlanInputs &in) const;
   // The price of `lanes` as one command in one pass, and summed over the
-  // passes [first, passes) of a command of `passes`.
+  // passes [first, passes) of a command of `passes`, nothing for no lanes.
   [[nodiscard]] double commandMilliseconds(std::span<const model::PrefillLane> lanes) const;
   [[nodiscard]] double passesMilliseconds(std::span<const model::PrefillLane> lanes, uint32_t first,
                                           uint32_t passes) const;
@@ -349,7 +349,7 @@ private:
   // again after it. A lane of a lower priority than the plan's does not
   // count the wait for the plan, which strict priority gives it either way.
   // `planMilliseconds` and `joinersMilliseconds` price the plan and its new
-  // lanes' own command.
+  // lanes' own command, which a plan of no new lanes does not run.
   [[nodiscard]] double supersedeGain(std::span<const BatchItem> lanes, uint32_t starts, RequestPriority priority,
                                      double planMilliseconds, double joinersMilliseconds,
                                      const PlanInputs &in) const;
