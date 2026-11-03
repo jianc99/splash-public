@@ -58,9 +58,11 @@ value::PoolRate observed(double ghostsPerSecond, double hitsPerSecond, double sc
 }
 
 // Before its first interval a rate is zero, and the first interval with
-// commands sets it, with no prior; a cache unit is worth nothing before the
-// probes measure reuse, and the spilled decode's read time starts from the
-// measured 9 ms.
+// commands sets the value rates, with no prior. The take rate counts every
+// interval, the first setting it, and decays over an idle one that took
+// nothing while the value rates hold (amend/M.md B4, B10). A cache unit is
+// worth nothing before the probes measure reuse, and the spilled decode's
+// read time starts from the measured 9 ms.
 void testRatesStartFromTheirFirstMeasurement() {
   value::PoolRate rate;
   require(rate.ghostHitsPerSecond() == 0.0 && rate.hitsPerSecond() == 0.0 && rate.scanReadBytesPerSecond() == 0.0 &&
@@ -68,11 +70,19 @@ void testRatesStartFromTheirFirstMeasurement() {
           "a rate is not zero before its first interval");
   rate.observe({.hits = 10, .ghostHits = 20, .ghostBytes = 4096, .scanReadBytes = 100}, 1, 0.0, true);
   rate.observe({.hits = 60, .ghostHits = 70, .ghostBytes = 4096, .scanReadBytes = 600}, 3, 0.5, false);
-  require(rate.ghostHitsPerSecond() == 0.0, "an interval without commands set a rate");
+  require(rate.ghostHitsPerSecond() == 0.0 && rate.takesPerSecond() == 4.0,
+          "an interval without commands set a value rate, or did not count its takes");
   rate.observe({.hits = 110, .ghostHits = 170, .ghostBytes = 8192, .scanReadBytes = 1100}, 4, 1.0, true);
+  const double takes = 4.0 + (1.0 - std::exp(-0.5 / kRateTimeConstantSeconds)) * (2.0 - 4.0);
   require(rate.hitsPerSecond() == 100.0 && rate.ghostHitsPerSecond() == 200.0 &&
-              rate.scanReadBytesPerSecond() == 1000.0 && rate.takesPerSecond() == 2.0 && rate.ghostBytes() == 8192.0,
-          "the first interval with commands did not set the rates");
+              rate.scanReadBytesPerSecond() == 1000.0 && std::abs(rate.takesPerSecond() - takes) < 1e-12 &&
+              rate.ghostBytes() == 8192.0,
+          "the first interval with commands did not set the value rates, or the take rate did not go on");
+  rate.observe({.hits = 110, .ghostHits = 170, .ghostBytes = 8192, .scanReadBytes = 1100}, 4,
+               1.0 + 2.0 * kRateTimeConstantSeconds, false);
+  require(rate.hitsPerSecond() == 100.0 && rate.ghostHitsPerSecond() == 200.0 &&
+              std::abs(rate.takesPerSecond() - takes * std::exp(-2.0)) < 1e-12,
+          "an idle interval moved a value rate, or the take rate did not decay over it");
   const MemoryRates rates;
   require(value::cached(8192, 108 * kMiB, false, false, rates).at(60.0) == 0.0 &&
               value::cached(8192, 108 * kMiB, false, true, {.prefillSecondsPerRow = 0.001}).at(60.0) == 8.192,

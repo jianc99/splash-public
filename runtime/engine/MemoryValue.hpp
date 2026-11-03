@@ -15,31 +15,40 @@ namespace splash::engine::value {
 // A pool's measured rates: EWMAs (kRateTimeConstantSeconds) of its ghost
 // hits, near-ghost and tail hits, hits and scan reads per second, of the
 // bytes its ghosts span, and of the units claims take from it per second.
-// Only intervals in which the engine ran a command update them (an idle
-// interval says nothing of demand); the first such interval sets them.
-// They outlive the pool's own resets: an idle release and restore clear its
-// ghosts but not these.
+// Only intervals in which the engine ran a command update the value rates
+// (an idle interval says nothing of demand); the first such interval sets
+// them. The take rate counts every interval, the first setting it: one in
+// which no command ran took what claims took in it, none while the engine
+// idled, so that the rate a burst of takes left decays over the idle time
+// after it as it does over commands that take nothing (amend/M.md B4: the
+// units claims take per second). They outlive the pool's own resets: an
+// idle release and restore clear its ghosts but not these.
 class PoolRate final {
 public:
   // `taken`, the units claims took from it, is monotonic like the pool's
   // counters.
   void observe(const model::PoolValue &value, uint64_t taken, double nowSeconds, bool commandsRan) noexcept {
     const Counters now{value.hits, value.ghostHits, value.nearGhostHits, value.tailHits, value.scanReadBytes, taken};
-    if (last_ && commandsRan && nowSeconds > lastSeconds_) {
+    if (last_ && nowSeconds > lastSeconds_) {
       const double seconds = nowSeconds - lastSeconds_;
-      const double weight = rates_ ? 1.0 - std::exp(-seconds / kRateTimeConstantSeconds) : 1.0;
-      const auto mix = [&](double &rate, uint64_t after, uint64_t before) {
+      const double decay = std::exp(-seconds / kRateTimeConstantSeconds);
+      const auto mix = [&](double &rate, double weight, uint64_t after, uint64_t before) {
         rate += weight * (double(after - before) / seconds - rate);
       };
-      Rates rates = rates_.value_or(Rates{});
-      mix(rates.hits, now.hits, last_->hits);
-      mix(rates.ghostHits, now.ghostHits, last_->ghostHits);
-      mix(rates.nearGhostHits, now.nearGhostHits, last_->nearGhostHits);
-      mix(rates.tailHits, now.tailHits, last_->tailHits);
-      mix(rates.scanReadBytes, now.scanReadBytes, last_->scanReadBytes);
-      mix(rates.takes, now.taken, last_->taken);
-      rates.ghostBytes += weight * (double(value.ghostBytes) - rates.ghostBytes);
-      rates_ = rates;
+      double takes = takes_.value_or(0.0);
+      mix(takes, takes_ ? 1.0 - decay : 1.0, now.taken, last_->taken);
+      takes_ = takes;
+      if (commandsRan) {
+        const double weight = rates_ ? 1.0 - decay : 1.0;
+        Rates rates = rates_.value_or(Rates{});
+        mix(rates.hits, weight, now.hits, last_->hits);
+        mix(rates.ghostHits, weight, now.ghostHits, last_->ghostHits);
+        mix(rates.nearGhostHits, weight, now.nearGhostHits, last_->nearGhostHits);
+        mix(rates.tailHits, weight, now.tailHits, last_->tailHits);
+        mix(rates.scanReadBytes, weight, now.scanReadBytes, last_->scanReadBytes);
+        rates.ghostBytes += weight * (double(value.ghostBytes) - rates.ghostBytes);
+        rates_ = rates;
+      }
     }
     last_ = now;
     lastSeconds_ = nowSeconds;
@@ -50,19 +59,19 @@ public:
   [[nodiscard]] double tailHitsPerSecond() const noexcept { return rates_ ? rates_->tailHits : 0.0; }
   [[nodiscard]] double ghostBytes() const noexcept { return rates_ ? rates_->ghostBytes : 0.0; }
   [[nodiscard]] double scanReadBytesPerSecond() const noexcept { return rates_ ? rates_->scanReadBytes : 0.0; }
-  [[nodiscard]] double takesPerSecond() const noexcept { return rates_ ? rates_->takes : 0.0; }
+  [[nodiscard]] double takesPerSecond() const noexcept { return takes_.value_or(0.0); }
 
 private:
   struct Counters final {
     uint64_t hits = 0, ghostHits = 0, nearGhostHits = 0, tailHits = 0, scanReadBytes = 0, taken = 0;
   };
   struct Rates final {
-    double hits = 0.0, ghostHits = 0.0, nearGhostHits = 0.0, tailHits = 0.0, scanReadBytes = 0.0, takes = 0.0,
-           ghostBytes = 0.0;
+    double hits = 0.0, ghostHits = 0.0, nearGhostHits = 0.0, tailHits = 0.0, scanReadBytes = 0.0, ghostBytes = 0.0;
   };
   std::optional<Counters> last_;
   double lastSeconds_ = 0.0;
   std::optional<Rates> rates_;
+  std::optional<double> takes_;
 };
 
 // The ratio of two monotonic counts over the same time constant: the cache's
