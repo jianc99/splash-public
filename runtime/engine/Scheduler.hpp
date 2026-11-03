@@ -259,6 +259,9 @@ public:
   // The tokens a lane commits per decode command, the same decayed mean; 0
   // before the first.
   [[nodiscard]] double decodeTokensPerLaneCommand() const noexcept;
+  // The most a bounded unit may take: G, or turnaround / kPassOverheadShare,
+  // which a decode gap past it exceeds (Engine::DecodeGapCauses).
+  [[nodiscard]] double bound() const;
 
   [[nodiscard]] Phase phase(uint64_t requestId) const;
   // The stage of its decode commands, which a suspension keeps.
@@ -349,8 +352,6 @@ private:
   [[nodiscard]] uint32_t ownRows(const Lane &lane) const;
   [[nodiscard]] double remainingMilliseconds(const Lane &lane) const;
   [[nodiscard]] bool contended(RequestPriority priority) const;
-  // The most a bounded unit may take: G, or turnaround / kPassOverheadShare.
-  [[nodiscard]] double bound() const;
   [[nodiscard]] UnitFit passesFor(std::span<const model::PrefillLane> lanes, bool bounded) const;
   [[nodiscard]] bool withinPairs(std::span<const model::PrefillLane> lanes) const;
   // The resident prefill lanes a plan may serve: those it is not made

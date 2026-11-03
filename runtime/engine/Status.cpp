@@ -108,6 +108,10 @@ static_assert(std::size(kStreamedUses) == model::kSparseRowUses);
 // What held requests before their first tokens, by TtftPart.
 constexpr std::string_view kTtftPartNames[] = {"own_prefill", "claim_wait", "decode", "other_prefill", "rest"};
 static_assert(std::size(kTtftPartNames) == kTtftParts);
+// The causes of decode gaps past the bound, by GapCause.
+constexpr std::string_view kGapCauseNames[] = {"prefill_unit", "claim_wait",   "ssd_read",
+                                               "pool_release", "replan", "other"};
+static_assert(std::size(kGapCauseNames) == kGapCauses);
 
 // A latency histogram (model::LatencyStats) in milliseconds, as ttft_ms is:
 // its quantiles, maximum and total, and its samples.
@@ -634,6 +638,12 @@ std::string runtimeStatusJson(
       << ",\"p95\":" << metrics.itlP95Milliseconds
       << ",\"samples\":" << metrics.itlSamples << "},\"decode_gap_ms\":";
   appendLatency(out, metrics.decodeGap);
+  out << ",\"decode_gap_causes\":{";
+  for (size_t cause = 0; cause < kGapCauses; ++cause)
+    out << json::quote(kGapCauseNames[cause]) << ":{\"gaps\":" << core.decodeGapCauses.gaps[cause]
+        << ",\"ms\":" << core.decodeGapCauses.milliseconds[cause] << "},";
+  out << "\"prefill_predicted_ms\":" << core.decodeGapCauses.prefillPredictedMilliseconds
+      << ",\"prefill_ms\":" << core.decodeGapCauses.prefillMilliseconds << '}';
   out << ",\"prefill_input_tokens\":" << metrics.prefillInputTokens
       << ",\"prefill_wall_ms\":" << metrics.prefillWallMilliseconds
       << ",\"prefill_tokens_per_second\":" << metrics.prefillTokensPerSecond

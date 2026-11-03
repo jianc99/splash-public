@@ -829,6 +829,43 @@ void testTtftPartsSumToTtft() {
   }
 }
 
+// AMENDMENTS Borrowed 4: a decode gap past the scheduler's bound counts
+// once, under the first cause that held in it, and a gap within the bound
+// nowhere. On the harness clock with the M6 profile a lane decodes alone,
+// its gaps a decode command each, within the bound; then a long prompt's
+// prefill units run between its decode commands, and the gaps they make
+// past the bound count under a prefill unit, with the engine's price of
+// those units and their time.
+void testADecodeGapNamesItsCause() {
+  test::EngineHarness harness({.pages = 1024, .timing = &test::kM6FlashNextQ2});
+  harness.model.decodeFinishes = false;
+  EngineRequest decoder = harness.request(1, std::vector<uint32_t>(40, 1));
+  decoder.maxNewTokens = 4000;
+  decoder.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(decoder));
+  harness.runUntil([&] { return harness.events.outputs[1].size() > 8; }, "the decoder did not decode");
+  const auto causes = [&] { return harness.engine.snapshot().decodeGapCauses; };
+  require(causes().gaps == std::array<uint64_t, kGapCauses>{} &&
+              causes().milliseconds == std::array<double, kGapCauses>{},
+          "a decode gap within the bound counted under a cause");
+  EngineRequest prompt = harness.request(2, std::vector<uint32_t>(16384, 2));
+  prompt.maxNewTokens = 1;
+  prompt.deadlineMilliseconds = 1e9;
+  harness.engine.submit(std::move(prompt));
+  harness.runUntil([&] { return harness.events.tokenTimes.contains(2); }, "the prompt did not answer");
+  const DecodeGapCausesSnapshot counted = causes();
+  const auto at = [](GapCause cause) { return static_cast<size_t>(cause); };
+  const double target = harness.engine.snapshot().scheduler.decodeGapTargetMilliseconds;
+  require(counted.gaps[at(GapCause::PrefillUnit)] > 0 &&
+              counted.milliseconds[at(GapCause::PrefillUnit)] > target * counted.gaps[at(GapCause::PrefillUnit)] &&
+              counted.prefillPredictedMilliseconds > 0.0 && counted.prefillMilliseconds > 0.0,
+          "the decode gaps the prompt's prefill units made past the bound did not count under a prefill unit: " +
+              std::to_string(counted.gaps[at(GapCause::PrefillUnit)]) + " gaps");
+  for (const GapCause cause : {GapCause::ClaimWait, GapCause::SsdRead, GapCause::PoolRelease, GapCause::Replan,
+                               GapCause::Other})
+    require(!counted.gaps[at(cause)], "a decode gap counted under a cause that did not hold in it");
+}
+
 } // namespace
 
 std::span<const test::TestCase> rulesTests() {
@@ -849,6 +886,7 @@ std::span<const test::TestCase> rulesTests() {
       {"testAJunctionTakesNothingWorthMoreThanItSaves", testAJunctionTakesNothingWorthMoreThanItSaves},
       {"testCacheReuseFollowsTheRecentProbes", testCacheReuseFollowsTheRecentProbes},
       {"testTtftPartsSumToTtft", testTtftPartsSumToTtft},
+      {"testADecodeGapNamesItsCause", testADecodeGapNamesItsCause},
   };
   return kTests;
 }

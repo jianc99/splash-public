@@ -157,6 +157,21 @@ struct SpillRequestsSnapshot final {
   uint64_t refusedClosed = 0;
 };
 
+// The decode gaps past the scheduler's bound (Scheduler::bound) that lanes
+// saw between two of their token events, each by the first cause that held
+// in it (AMENDMENTS Borrowed 4): a prefill unit ran, the lane's claim waited
+// for memory, a decode command read spilled K/V from the SSD, a pool gave a
+// unit back, a plan was made again, or none of these. Of the gaps a prefill
+// unit caused, the time the engine priced those units at and theirs.
+enum class GapCause : uint8_t { PrefillUnit, ClaimWait, SsdRead, PoolRelease, Replan, Other };
+inline constexpr size_t kGapCauses = 6;
+struct DecodeGapCausesSnapshot final {
+  std::array<uint64_t, kGapCauses> gaps{};
+  std::array<double, kGapCauses> milliseconds{};
+  double prefillPredictedMilliseconds = 0.0;
+  double prefillMilliseconds = 0.0;
+};
+
 struct EngineSnapshot final {
   SchedulerSnapshot scheduler;
   // Requests not yet finalized, in submission (id) order.
@@ -190,6 +205,7 @@ struct EngineSnapshot final {
   // them: a lane's memory was refused or held back, a capture cut its rows,
   // or a lane converted to Spill.
   uint64_t replans = 0;
+  DecodeGapCausesSnapshot decodeGapCauses;
   uint64_t replayStatePublicationFailures = 0;
   uint64_t junctionMaterializations = 0;
   uint64_t junctionMaterializationFailures = 0;
@@ -452,6 +468,20 @@ private:
     std::optional<double> heldSince;
     TtftPart heldBy = TtftPart::Rest;
     bool firstTokenSent = false;
+    // Its last token event, and since then what a decode gap past the bound
+    // may be due to (decodeGap): the prefill units that ran (the engine's
+    // price of them and their time), whether its claim waited and a decode
+    // command of it read spilled K/V, and the pools' releases and the
+    // replans as they stood then.
+    std::optional<double> lastTokenMilliseconds;
+    struct GapSince final {
+      double prefillPredictedMilliseconds = 0.0;
+      double prefillMilliseconds = 0.0;
+      bool claimWaited = false;
+      bool ssdRead = false;
+      uint64_t poolReleases = 0;
+      uint64_t replans = 0;
+    } gapSince;
     // Its model held an anchor when its lane was last suspended: the token
     // it selected last, which the suspension keeps (Model::suspend). A
     // decoding lane holds one once its first token is selected, a
@@ -529,6 +559,8 @@ private:
     // Where the engine's time for this command starts: the previous
     // command's retirement when the engine stayed busy, else its plan.
     double startedMilliseconds = 0.0;
+    // A prefill command's price, the engine's cost model's at its submission.
+    double predictedMilliseconds = 0.0;
   };
   // A prefill command between its passes (BatchPlan::passes), the one owner
   // of it: its progress as planning reads it (PlanInputs::passes), its plan
@@ -861,6 +893,9 @@ private:
   void holds(double nowMilliseconds) noexcept;
   [[nodiscard]] TtftPart holderOf(const Request &request) const;
   void firstTokens(Request &request);
+  // A lane's token event at `now`: a gap past the scheduler's bound since its
+  // last counts under the first cause that held in it (DecodeGapCauses).
+  void decodeGap(Request &request, const model::CommandSample &sample, double nowMilliseconds);
   // Memory a lane could not get, and what the engine knows about its return.
   struct Denial {
     metal::AllocationFailure allocationFailure = metal::AllocationFailure::None;

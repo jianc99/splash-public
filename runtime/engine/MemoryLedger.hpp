@@ -337,6 +337,8 @@ public:
   // the host.
   [[nodiscard]] bool claimWaiting() const noexcept;
   [[nodiscard]] uint64_t hostRefusedWaitingBytes() const noexcept;
+  // The units the pools gave back since the engine started.
+  [[nodiscard]] uint64_t poolReleases() const noexcept;
   // The largest unit a pool grows by next: the host's band reaches past its
   // margin by it.
   [[nodiscard]] uint64_t largestGrowthUnit() const;

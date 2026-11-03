@@ -269,6 +269,13 @@ uint64_t MemoryLedger::pendingGrowthBytes() const noexcept {
   return bytes;
 }
 
+uint64_t MemoryLedger::poolReleases() const noexcept {
+  uint64_t units = 0;
+  for (const Account &account : accounts_)
+    units = plus(units, account.shrinks);
+  return units;
+}
+
 uint64_t MemoryLedger::largestGrowthUnit() const {
   uint64_t unit = 0;
   for (const Account &account : accounts_)

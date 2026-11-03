@@ -149,6 +149,14 @@ void testCleanRuntimeStatus(const char *goldenPath) {
   // passes and a superseding plan abandoned it between them; one plan was
   // prepared again.
   engine.scheduler.decodeGapTargetMilliseconds = 500.0;
+  // Four decode gaps past the bound: three a prefill unit caused, priced at
+  // 1.2 s and taking 1.5 s, and one a claim's wait caused.
+  engine.decodeGapCauses.gaps[static_cast<size_t>(engine::GapCause::PrefillUnit)] = 3;
+  engine.decodeGapCauses.milliseconds[static_cast<size_t>(engine::GapCause::PrefillUnit)] = 1950.5;
+  engine.decodeGapCauses.gaps[static_cast<size_t>(engine::GapCause::ClaimWait)] = 1;
+  engine.decodeGapCauses.milliseconds[static_cast<size_t>(engine::GapCause::ClaimWait)] = 700.0;
+  engine.decodeGapCauses.prefillPredictedMilliseconds = 1200.0;
+  engine.decodeGapCauses.prefillMilliseconds = 1500.0;
   engine.scheduler.contendedPrefill = {.count = 3, .totalMilliseconds = 1200, .maximumMilliseconds = 480,
                                        .p50Milliseconds = 262.144, .p95Milliseconds = 524.288,
                                        .p99Milliseconds = 524.288};

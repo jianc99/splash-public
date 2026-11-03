@@ -370,6 +370,19 @@ bool Engine::tick(double now) {
         abandonPasses();
       tickHosts_.add(static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(AwakeClock::now() - planning).count()));
+      // A prefill command's price as it goes, which the decode gaps it
+      // causes compare with its time (decodeGap).
+      double predicted = 0.0;
+      if (plan->kind == WorkKind::Prefill) {
+        std::vector<model::PrefillLane> lanes;
+        for (const BatchItem &item : plan->items)
+          lanes.push_back({.position = item.promptOffset,
+                           .rows = item.tokenCount,
+                           .indexPages = request(item.requestId).kvMode == KvMode::Spill
+                                             ? indexPagesBefore(uint64_t{item.promptOffset} + item.tokenCount)
+                                             : 0});
+        predicted = scheduler_.prefillMilliseconds(model_.prefillWork(lanes, plan->pass, plan->passes));
+      }
       std::unique_ptr<ModelBatchTicket> ticket =
           model_.submit(*plan, items, completionNotifier_);
       if (!ticket) {
@@ -400,7 +413,8 @@ bool Engine::tick(double now) {
         lane.deduplicatedKvTokens += lane.unreadDeduplicatedKvTokens;
         counters_.deduplicatedKvTokens += std::exchange(lane.unreadDeduplicatedKvTokens, 0);
       }
-      pending_ = Pending{*plan, std::move(captures), std::move(ticket), busySinceMilliseconds_.value_or(now)};
+      pending_ = Pending{*plan, std::move(captures), std::move(ticket), busySinceMilliseconds_.value_or(now),
+                         predicted};
       return true;
     }
     case Prepared::Yielded:
@@ -484,6 +498,30 @@ void Engine::firstTokens(Request &active) {
   if (std::exchange(active.firstTokenSent, true))
     return;
   events_.firstTokenParts(active.request.id, active.held);
+}
+
+void Engine::decodeGap(Request &active, const model::CommandSample &sample, double now) {
+  Request::GapSince &since = active.gapSince;
+  if (sample.spilledKvReadMilliseconds > 0.0 && cache_.holdsIndexPages(active.request.id))
+    since.ssdRead = true;
+  const uint64_t releases = governor().ledger().poolReleases();
+  if (active.lastTokenMilliseconds && now - *active.lastTokenMilliseconds > scheduler_.bound()) {
+    const GapCause cause = since.prefillMilliseconds > 0.0   ? GapCause::PrefillUnit
+                           : since.claimWaited               ? GapCause::ClaimWait
+                           : since.ssdRead                   ? GapCause::SsdRead
+                           : releases != since.poolReleases  ? GapCause::PoolRelease
+                           : counters_.replans != since.replans ? GapCause::Replan
+                                                                : GapCause::Other;
+    DecodeGapCausesSnapshot &causes = counters_.decodeGapCauses;
+    ++causes.gaps[static_cast<size_t>(cause)];
+    causes.milliseconds[static_cast<size_t>(cause)] += now - *active.lastTokenMilliseconds;
+    if (cause == GapCause::PrefillUnit) {
+      causes.prefillPredictedMilliseconds += since.prefillPredictedMilliseconds;
+      causes.prefillMilliseconds += since.prefillMilliseconds;
+    }
+  }
+  active.lastTokenMilliseconds = now;
+  since = {.poolReleases = releases, .replans = counters_.replans};
 }
 
 std::optional<double> Engine::nextWakeupMilliseconds() const {
@@ -1762,6 +1800,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
   if (results.size() != plan.items.size()) {
     throw std::logic_error("model result count changed");
   }
+  const model::CommandSample sample = ticket.sample();
   // A pass before the command's last commits nothing, proves nothing and
   // ends no lane.
   const bool beforeLastPass = plan.kind == WorkKind::Prefill && plan.pass + 1 < plan.passes;
@@ -1872,6 +1911,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       if (!unsent.empty()) {
         firstTokens(active);
         events_.tokens(active.request.id, unsent);
+        decodeGap(active, sample, now);
       }
     }
     if (result.firstToken) {
@@ -1881,6 +1921,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
       active.sentFirstToken = result.firstToken;
       firstTokens(active);
       events_.tokens(active.request.id, {&*result.firstToken, 1});
+      decodeGap(active, sample, now);
     }
     if (plan.kind == WorkKind::Decode) {
       draftedTokens += result.draftedTokens;
@@ -1941,9 +1982,16 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
   // Spill requests' new pages are written as they publish them.
   if (config_.spill.capable)
     static_cast<void>(cache_.writeThrough());
-  const model::CommandSample sample = ticket.sample();
   const double wallMilliseconds = sample.wallMilliseconds;
   ++commandsApplied_;
+  // A prefill unit ran in the gaps of the lanes that have sent tokens.
+  if (plan.kind == WorkKind::Prefill)
+    for (auto &[id, active] : requests_)
+      if (!active.finalized && active.lastTokenMilliseconds &&
+          std::ranges::none_of(plan.items, [&](const BatchItem &item) { return item.requestId == id; })) {
+        active.gapSince.prefillPredictedMilliseconds += command.predictedMilliseconds;
+        active.gapSince.prefillMilliseconds += wallMilliseconds;
+      }
   sampleSpilledReads(plan, sample);
   scheduler_.complete(plan, schedulerResults, sample);
   // The command's last pass ends it, and the lanes that ended between its
