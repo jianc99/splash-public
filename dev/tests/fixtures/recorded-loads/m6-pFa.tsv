@@ -1,4 +1,4 @@
-# M6 churn run pFa (Flash-Next Q2, ~/dev/vr16/churn/pFa.status.jsonl), every 2 s sample:
+# M6 churn run pFa (Flash-Next Q2), every 2 s sample:
 # seconds, streamed_experts.decode.read, streamed_experts.prefill.read_bytes,
 # scheduler.prefill_batches + decode_batches.
 miss_ms 0.2114
