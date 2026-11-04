@@ -6278,6 +6278,63 @@ void testReplayPointCopiesCacheBeforeTheExpertStore() {
   executor.reservationRoom = {};
 }
 
+// The prompt's replay point refused by the host under macOS's warning, the
+// engine's limit ample, while the only unit its claim may take is a cached
+// state whose copy to the SSD cache has not landed: the ledger waits for that
+// copy, and the point passes the host as the request's KV does once nothing
+// is left to take (0bd50301's serving mark), so a lone prompt runs as one
+// command and captures its point. Cut at the point instead, a short prompt
+// ran as two commands, the second streaming every layer's experts again for
+// its last rows (serve1: +260-390 ms on the Studio, +1.35-1.45 s for 2048
+// tokens on the mini-M4).
+void testAHostRefusedReplayPointCutsNoCommand() {
+  test::TestKvStorage storage(16, 4096, 4);
+  KvPool pool(storage, 0);
+  test::TestKvTier tier;
+  engine::Cache cache(pool, &tier, test::ampleDiskBudget());
+  Executor executor;
+  Events events;
+  GovernedHost host;
+  engine::Engine engine(host.connect({}), cache, executor, events);
+  guardReleases(storage, engine);
+  // A finished conversation's state in RAM, whose copy never lands here.
+  std::vector<uint32_t> prompt(129);
+  std::iota(prompt.begin(), prompt.end(), 1000);
+  cache.beginRequest(1);
+  require(cache.ensureTokens(1, 128).granted(), "fixture KV failed");
+  const uint64_t leaf = test::publishBlocks(cache, 1, prompt, 128);
+  cache.publishCompositeState(
+      leaf, std::make_shared<OffloadState>(std::make_shared<OffloadControl>(), executor.evictedStateBytes), false);
+  cache.endRequest(1);
+  // No idle state buffer: a state's buffers take one admission, which the
+  // host refuses under its warning.
+  executor.reservationRoom = [&] {
+    executor.reservationFailure = host.reserve(executor.stateBytes).failure;
+    return executor.reservationFailure == metal::AllocationFailure::None;
+  };
+  host.setPressure(MemoryPressure::Warning);
+  std::vector<uint32_t> rows;
+  executor.commandTimed = [&](const BatchPlan &plan, const test::CommandTimes &) {
+    for (const BatchItem &item : plan.items)
+      if (plan.kind == WorkKind::Prefill && item.requestId == 3)
+        rows.push_back(item.tokenCount);
+  };
+  const uint64_t captures = engine.snapshot().stateCaptures;
+  engine.submit(request(3, std::vector<uint32_t>(65, 3)));
+  double now = 1;
+  tickUntil(engine, now, [&] { return idle(engine); }, "the request did not finish");
+  std::string shown;
+  for (const uint32_t each : rows)
+    shown += " " + std::to_string(each);
+  require(events.completedCount == 1 && events.failedCount == 0 && rows == std::vector<uint32_t>{65} &&
+              engine.snapshot().captureCuts == 0 && engine.snapshot().stateCaptures == captures + 1 &&
+              host.governor.snapshot().claims.waiting == 0,
+          "a lone prompt's replay point, refused by the host with only a copying state to free, cut its command: "
+          "commands" + shown + ", " + std::to_string(engine.snapshot().captureCuts) + " capture cuts");
+  executor.reservationRoom = {};
+  executor.commandTimed = {};
+}
+
 // Borrowed 3(f): priority preemption fires when memory, not width, is what a
 // higher-priority start lacks. Beside a Background lane that holds most of
 // the engine's limit, with lanes to spare, a Foreground start the limit
@@ -6398,6 +6455,7 @@ std::span<const test::TestCase> memoryTests() {
       {"testLaneThatWouldYieldTakesNothingInUse", testLaneThatWouldYieldTakesNothingInUse},
       {"testPacedPassKeepsInServiceReplayPoint", testPacedPassKeepsInServiceReplayPoint},
       {"testReplayPointCopiesCacheBeforeTheExpertStore", testReplayPointCopiesCacheBeforeTheExpertStore},
+      {"testAHostRefusedReplayPointCutsNoCommand", testAHostRefusedReplayPointCutsNoCommand},
       {"testCopyAheadOfALeafHoldsARefusalBack", testCopyAheadOfALeafHoldsARefusalBack},
       {"testCaptureKvPastABoundaryTakesNothingInUse", testCaptureKvPastABoundaryTakesNothingInUse},
       {"testCaptureKvPastTheMarginCutsNoCommand", testCaptureKvPastTheMarginCutsNoCommand},

@@ -814,13 +814,26 @@ Engine::Reservation Engine::reserveCapture(Request &active, StateClass kind, uin
       kind == StateClass::Checkpoint && followsCheckpoint && checkpointPinned(active);
   const bool fromLane = predecessorPinned || checkpointReclaimable(active);
   Reservation result;
-  const auto taken = allocate(
-      [&] {
-        metal::AllocationFailure refusal = metal::AllocationFailure::None;
-        result.buffers = model_.reserveState(id, tokens, refusal);
-        return StateBuffers{.ok = result.buffers != nullptr, .allocationFailure = refusal};
-      },
-      stateClaim(active, kind, tokens, since, supersedes), !fromLane);
+  const auto attempt = [&] {
+    metal::AllocationFailure refusal = metal::AllocationFailure::None;
+    result.buffers = model_.reserveState(id, tokens, refusal);
+    return StateBuffers{.ok = result.buffers != nullptr, .allocationFailure = refusal};
+  };
+  const ClaimSpec spec = stateClaim(active, kind, tokens, since, supersedes);
+  const auto taken = allocate(attempt, spec, !fromLane);
+  // The prompt's replay point the host refused, the ledger waiting for what
+  // lands with nothing taken now: the command cannot wait for it, so it
+  // passes the host as the request's KV does once nothing is left to take
+  // (MemoryGovernor::free; 0bd50301's serving mark), and its claim waits no
+  // more. The engine's limit still ends the command at it (amend/M.md B6).
+  if (!result.buffers && kind == StateClass::InUse && taken.denial.pending &&
+      taken.denial.allocationFailure == metal::AllocationFailure::HostPressure) {
+    MemoryLedger &ledger = governor().ledger();
+    ledger.setHostExempt(active.claim.id, true);
+    static_cast<void>(allocate(attempt, spec, false));
+    if (result.buffers)
+      ledger.setWaiting(active.claim.id, false);
+  }
   result.fromLane = !result.buffers && fromLane;
   result.recycled = result.buffers && taken.freed;
   return result;
