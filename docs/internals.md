@@ -1238,7 +1238,9 @@ prefill and decode). What is in use goes last, and only to a request in
 service. A claim nothing meets waits for what is landing, or falls short.
 Between commands the control pass gives the host's claim what macOS's warning
 asks, up to the margin and cache only while the host lacks nothing past it,
-what the band lacks, or under critical pressure everything above the floors;
+what the band lacks, never a chunk of the store or the hot block cache short
+of critical pressure (what is left short holds the starts), or under
+critical pressure everything above the floors;
 then it grows the pools into the free room while a unit, should no claim
 take it back within the minute ahead, saves more than its cycle costs, but
 not while a claim waits for memory (a start's, a resume's) or to retry what

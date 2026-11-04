@@ -382,10 +382,13 @@ void testACancelBetweenPassesBesideItsOwnPrioritysDecodeKeepsThePasses() {
 // MemoryGovernor.cpp:515; amend/M.md B3): a Foreground lane waits for its
 // token mask, the host has the margin and 48 KiB more, and a start needs 64
 // KiB of fresh lane state; a control pass frees a unit of a pool at its cap
-// (no band), and the start runs.
+// (no band) whose units cost only their rebuild, which the host's claim may
+// take short of critical pressure (a store's it may not, owner 11-03 17:30),
+// and the start runs.
 void testAHostRefusedStartIsFreedForByThePass() {
   test::EngineHarness harness({.pages = 64, .memory = test::FakeMemory::Config{}});
-  test::FakeElasticPool pool("experts", *harness.memory, 64 * 1024, 1, 3, 4, 3, 0.25, 1.0);
+  test::FakeElasticPool pool("vision_arena", *harness.memory, 64 * 1024, 1, 3, 4, 3, 0.25, 1.0);
+  pool.rebuildOnly = true;
   static_cast<void>(harness.governor->ledger().addPool(pool));
   harness.model.laneFootprintBytes = 64 * 1024;
   harness.engine.submit(harness.request(1, std::vector<uint32_t>(513, 1)));
@@ -588,14 +591,16 @@ void testQuotaWaitIsNotAMemoryClaim() {
           "the start did not run once the quota it waited for came back");
 }
 
-// The host claim's choice between a Resident lane's conversion and a unit of
-// the expert store follows their value (amend/M.md B8; DESIGN section 0,
-// 19:45), priced on what was measured: the store's ghost hits over the
-// control passes, a decode command's hot-block reads. A store whose units
-// the decode commands keep missing keeps them, and the lane converts; one
-// whose units nothing misses gives one, and the lane keeps its KV in memory.
+// An in-service claim's choice between a Resident lane's conversion and a
+// unit of the expert store follows their value (amend/M.md B8; DESIGN
+// section 0, 19:45), priced on what was measured: the store's ghost hits
+// over the control passes, a decode command's hot-block reads. A store whose
+// units the decode commands keep missing keeps them, and the lane converts;
+// one whose units nothing misses gives one, and the lane keeps its KV in
+// memory. The claim is the engine's own, as the Index runway's: the host's
+// claim takes no store unit short of critical pressure (owner 11-03 17:30).
 void testConversionVsStoreFollowsValue() {
-  const auto hostTakes = [](uint64_t ghostHitsPerSecond) {
+  const auto claimTakes = [](uint64_t ghostHitsPerSecond) {
     // As testSpillDecodeTermIsMeasured: memory for KV holds the short
     // request's projection, not the long one's, which spills.
     Spilling spill(1024, false, 30 * 100, 0, {4}, 0, {}, {.limitBytes = 3'000});
@@ -628,20 +633,23 @@ void testConversionVsStoreFollowsValue() {
       spill.engine.refreshMemoryRates(pass * 1000.0);
     }
     std::string took;
-    spill.host.governor.ledger().setDecisionLog([&](std::string_view line) {
+    MemoryLedger &ledger = spill.host.governor.ledger();
+    ledger.setDecisionLog([&](std::string_view line) {
       if (took.empty() && line.find(", took") != std::string_view::npos)
         took = line;
     });
-    static_cast<void>(test::hostPass(spill.host.governor, 100));
+    const ClaimId claim = ledger.open({.cls = ClaimClass::InService, .holdSeconds = kValueHorizonSeconds});
+    static_cast<void>(ledger.free(claim, {.bytes = 100}, 0, false, false));
+    ledger.close(claim);
     spill.engine.cancel(1);
     spill.engine.cancel(2);
     spill.runUntilIdle();
     return took;
   };
-  const std::string missed = hostTakes(10'000);
+  const std::string missed = claimTakes(10'000);
   require(missed.find("engine conversion") != std::string::npos && missed.find("experts unit") == std::string::npos,
           "a store whose units decode keeps missing gave one before the Resident lane converted: " + missed);
-  const std::string unmissed = hostTakes(0);
+  const std::string unmissed = claimTakes(0);
   require(unmissed.find("experts unit") != std::string::npos &&
               unmissed.find("engine conversion") == std::string::npos,
           "the Resident lane converted before a store whose units nothing misses gave one: " + unmissed);

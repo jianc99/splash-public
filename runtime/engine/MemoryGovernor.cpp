@@ -490,8 +490,9 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
         hostRule_.deficitBytes(ledger_.hostRefusedWaitingBytes(), ledger_.returning().landingBytes);
     // While the host lacks nothing past its margin its claim may take only
     // cache, which the pools rank above: they grow first, so that the cache
-    // the pass gives back buys their units first. With a deficit it may
-    // take their units, and a unit grown before it would go again.
+    // the pass gives back buys their units first. With a deficit the host's
+    // claim takes first what it may, and the pools grow after it from what
+    // is left.
     if (!deficit)
       ledger_.grow(roomBytes(), growthHost(true));
     if (nowMilliseconds >= nextHostPassMilliseconds_) {

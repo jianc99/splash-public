@@ -588,8 +588,9 @@ double estimatedPrice(const engine::CostEstimateSnapshot &estimate, const model:
 // three lanes, each reading spilled K/V at the store's floor; no request
 // waits for memory past the resource wait limit and none fails for
 // capacity. Inside the episode (to 60 s past its end) the experts account
-// changes direction at most once per level of the host, and the episode
-// takes a unit. Value may take a store unit for a long prompt's prefill
+// changes direction at most once per level of the host, and the episode,
+// short of macOS's critical pressure, takes no unit (owner 11-03 17:30: the
+// host holds the starts instead). Value may take a store unit for a long prompt's prefill
 // outside it (brief §2.12, DESIGN §0 19:45; which one is SIM-value's
 // question, on calibrated counterfactuals), and what it takes comes back:
 // once no request that prefilled when it went still prefills, within two
@@ -600,13 +601,8 @@ double estimatedPrice(const engine::CostEstimateSnapshot &estimate, const model:
 // its cap for more than two settled passes while its next unit would grow by
 // the rule's terms (#645: a store that shrinks and never regrows, 32.9
 // against 48.9 tokens a second). It regrows into free room after the take
-// that precedes the episode; after the episode the lanes' KV and its
-// projected growth hold the room it would grow into (1.08 GB beyond them at
-// the release, falling as the rounds grow, against a 1.32 GB unit; no cache
-// idle to displace), so the store stays a unit short to the end, as the
-// ledger's growth rule says (amend/M.md R3: pools grow into the room the
-// lanes leave), which B4's "back at its size before the episode within 60 s
-// of its end" contradicted under either rule.
+// that precedes the episode and, the episode taking none, is at its size
+// before the episode when it ends.
 void testChurnRegrowsAfterTheHostEpisode() {
   const Machine &machine = kStudio18G;
   constexpr double episode = 300'000.0, warningEnd = 420'000.0, release = 600'000.0, end = 900'000.0;
@@ -715,7 +711,7 @@ void testChurnRegrowsAfterTheHostEpisode() {
   for (const auto &[level, turns] : turnsByLevel)
     require(turns <= 1, at(machine) + "the store changed direction " + std::to_string(turns) +
                             " times at one host level (" + std::to_string(level) + ")");
-  require(episodeShrank, at(machine) + "the host's episode took no store unit");
+  require(!episodeShrank, at(machine) + "the host's episode took a store unit short of critical pressure");
   require(regrowth.oscillations == 0, at(machine) + "the store oscillated: " + std::to_string(regrowth.retaken) +
                                           " units taken back within the value horizon of their regrowth:" +
                                           regrowth.history);

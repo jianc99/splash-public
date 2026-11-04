@@ -107,17 +107,19 @@ void testStoreRetakesFreeRoomAfterCriticalPressure() {
 
 // Borrowed 3(d): host readings that show a release only 0.5-1 s late cause
 // no second release. Other applications leave the idle engine's host half
-// its margin short; the control pass, every 100 ms, gives back a unit of the
-// expert store, which covers that, and the passes while the host's readings
-// still show the shortfall take nothing more, nor take the unit back.
+// its margin short; the control pass, every 100 ms, gives back a unit of a
+// pool that costs only its rebuild (the host's claim takes none of the
+// expert store's short of critical pressure, owner 11-03 17:30), which
+// covers that, and the passes while the host's readings still show the
+// shortfall take nothing more, nor take the unit back.
 void testLaggingHostReadingsCauseNoSecondRelease() {
   constexpr uint64_t kGiB = 1ULL << 30;
   for (const double lag : {500.0, 1000.0}) {
     test::LoopFixture fixture({}, {}, {}, metal::kResidencyKeepAliveSeconds,
                               test::LoopOptions{.memory = test::FakeMemory::Config{.readingLagMilliseconds = lag}});
-    test::FakeElasticPool experts("experts", *fixture.memory, kGiB, 1, 4, 8, 4, 2.5, 80.0);
-    fixture.executor.experts = &experts;
-    static_cast<void>(fixture.governor->ledger().addPool(experts));
+    test::FakeElasticPool arena("vision_arena", *fixture.memory, kGiB, 1, 4, 8, 4, 2.5, 80.0);
+    arena.rebuildOnly = true;
+    static_cast<void>(fixture.governor->ledger().addPool(arena));
     fixture.loop.announceReady(protocol::peer::kTestReady);
     // The control pass every 100 ms, the loop idle: past the lag first, so
     // that the readings show what the engine holds.
@@ -129,15 +131,15 @@ void testLaggingHostReadingsCauseNoSecondRelease() {
       }
     };
     passes(lag + 1000.0);
-    require(!experts.shrinks && !experts.grows, "an ample host moved the store");
+    require(!arena.shrinks && !arena.grows, "an ample host moved the pool");
     const test::GovernorLimits limits;
     fixture.memory->setHost(fixture.memory->hostBytes() - limits.hostSpareReserveBytes - fixture.memory->total() -
                                 kHostMarginBytes / 2,
                             MemoryPressure::Normal);
     passes(3000.0);
-    require(experts.shrinks == 1 && experts.grows == 0,
-            "host readings " + std::to_string(lag) + " ms late took " + std::to_string(experts.shrinks) +
-                " units of the store and gave back " + std::to_string(experts.grows) + ", not one and none");
+    require(arena.shrinks == 1 && arena.grows == 0,
+            "host readings " + std::to_string(lag) + " ms late took " + std::to_string(arena.shrinks) +
+                " units of the pool and gave back " + std::to_string(arena.grows) + ", not one and none");
   }
 }
 

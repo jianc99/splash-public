@@ -191,8 +191,9 @@ struct VictimQuery final {
   Need need;
   bool critical = false;        // macOS critical: InUse and certain-reuse units for Host claims too
   const MemoryRates *rates = nullptr;
-  // The host lacks memory beyond its margin: a Host claim may take pool
-  // units and conversions, not only cache.
+  // The host lacks memory beyond its margin: a Host claim may take
+  // conversions and the units of pools that cost only their rebuild, not
+  // only cache; the other pools' units only under critical pressure.
   bool deficit = false;
   // Chains a walk that may take what is of certain reuse keeps all the
   // same: the one a start restores, which its placement leaves out of the

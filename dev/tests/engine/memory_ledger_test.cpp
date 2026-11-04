@@ -1435,8 +1435,9 @@ void testClassBoundsEligibility() {
           "optional work converted, took InUse or the pass command");
   require(counted({.cls = ClaimClass::Growth}) == 1 + 32 + 64, "growth took certain reuse, a conversion or InUse");
   require(counted({.cls = ClaimClass::Host}) == 1, "the host took more than Ordinary cache without a deficit");
-  require(counted({.cls = ClaimClass::Host}, false, true) == 1 + 8 + 32 + 64,
-          "the host's deficit took the wrong units");
+  require(counted({.cls = ClaimClass::Host}, false, true) == 1 + 8 + 64,
+          "the host's deficit took the wrong units: a pool unit short of critical pressure, or not a conversion and "
+          "the units that cost only their rebuild");
   require(counted({.cls = ClaimClass::Host, .reach = ReclaimClass::InUse}, true, true) == 1 + 2 + 4 + 8 + 32 + 64,
           "critical pressure did not give the host what is in use");
   ledger.setLanes(0, RequestPriority::Foreground);
@@ -2130,8 +2131,8 @@ void testRerunWhileTheDeficitWaitsOnLandings() {
 
 // macOS's warning alone takes cache, never a pool unit or a conversion,
 // while the host lacks nothing past its margin; a measured deficit may take
-// a pool unit by value (amend/M.md B3; kept behaviour, MemoryGovernor.cpp:
-// 391-399).
+// a conversion by value (amend/M.md B3; kept behaviour, MemoryGovernor.cpp:
+// 391-399), a pool unit only under critical pressure (owner 11-03 17:30).
 void testWarningAloneTakesNoPoolUnit() {
   for (const bool deficit : {false, true}) {
     // The headroom beside the pool's 2 GiB and the cache's 1 GiB.
@@ -2152,9 +2153,77 @@ void testWarningAloneTakesNoPoolUnit() {
       require(cache.taken.size() == 2 && experts.units() == 2 && engine.taken.empty(),
               "macOS's warning alone took a pool unit or converted a lane");
     else
-      require(experts.units() == 1 && cache.taken.empty(),
-              "a measured deficit did not take the cheapest unit, the pool's");
+      require(experts.units() == 2 && engine.taken == std::vector<uint64_t>{3} && cache.taken.empty(),
+              "a measured deficit took a pool unit short of critical pressure, or not the cheapest unit it may "
+              "take, the conversion");
   }
+}
+
+// The M6's value runs (smoke c, Flash-Next Q2_0 at default memory; server
+// log 12:08:56, 42 s in): the host 327.7 MiB short of its margin, no cache,
+// the store at its cap with chunks of 1023 and 179.3 MiB above its floor,
+// which it gives back 179.3 MiB first. The host's claim took both chunks
+// "for 1.806 s", the room went to the lanes' KV, and the store never grew
+// back. Short of macOS's critical pressure the host's claim takes no unit of
+// the store (owner 11-03 17:30): at normal pressure (the deficit's pass,
+// 327.7 MiB) and under the warning (the margin's) the pass takes nothing and
+// the store keeps its chunks; the host still refuses a start, which waits as
+// in the band. Under critical pressure the store goes to its floor, as
+// before.
+void testTheHostTakesNoStoreUnitShortOfCritical() {
+  constexpr uint64_t kLarge = 1023 * kMiB, kSmall = 188'000'000, kFloor = 7210 * kMiB;
+  constexpr uint64_t kShort = 343'617'126;  // 327.7 MiB
+  constexpr uint64_t kAll = kFloor + kLarge + kSmall;
+  for (const MemoryPressure pressure : {MemoryPressure::Normal, MemoryPressure::Warning, MemoryPressure::Critical}) {
+    Fixture fixture(host(kAll + kHostMarginBytes - kShort, pressure));
+    ListedPool store(kFloor, {kLarge, kSmall}, 24576ULL * 1382000, 1382000, 0.1);
+    fixture.memory.hold("experts", kAll);
+    TestSource cache("cache", &fixture.memory);
+    MemoryLedger &ledger = fixture.ledger();
+    std::string lines;
+    ledger.setDecisionLog([&](std::string_view line) { lines += " " + std::string(line) + ";"; });
+    ledger.addSource(cache);
+    ledger.addPool(store);
+    ledger.setRates({.weightReadSecondsPerByte = 1.65e-10});
+    static_cast<void>(fixture.pass(1.0));
+    if (pressure == MemoryPressure::Critical) {
+      require(store.currentBytes() == kFloor, "critical pressure left the store above its floor:" + lines);
+      continue;
+    }
+    const std::string when = pressure == MemoryPressure::Normal ? "at normal pressure" : "under macOS's warning";
+    require(store.currentBytes() == kAll,
+            when + " the host's pass took " + std::to_string((kAll - store.currentBytes()) / kMiB) +
+                " MiB of the store's chunks above its floor:" + lines);
+    const ClaimId start = ledger.open(request(1, RequestPriority::Normal, ClaimClass::Start));
+    require(fixture.allocate(start, 128 * kMiB).failure == metal::AllocationFailure::HostPressure,
+            when + " the host short of its margin admitted a start");
+  }
+}
+
+// What the host lacks short of critical pressure it takes from the other
+// units its claim may take: idle cache priced at its recompute, dearer than
+// any of the store's chunks, goes for the M6's 327.7 MiB, and the store keeps
+// both chunks.
+void testTheHostTakesCacheNotTheStore() {
+  constexpr uint64_t kLarge = 1023 * kMiB, kSmall = 188'000'000, kFloor = 7210 * kMiB;
+  constexpr uint64_t kShort = 343'617'126;  // 327.7 MiB
+  constexpr uint64_t kAll = kFloor + kLarge + kSmall;
+  Fixture fixture(host(kAll + 512 * kMiB + kHostMarginBytes - kShort));
+  ListedPool store(kFloor, {kLarge, kSmall}, 24576ULL * 1382000, 1382000, 0.1);
+  fixture.memory.hold("experts", kAll);
+  TestSource cache("cache", &fixture.memory);
+  for (uint64_t key = 1; key <= 4; ++key)
+    cache.units.push_back(unit(key, 128 * kMiB, 5.0));
+  fixture.memory.hold("cache", 512 * kMiB);
+  MemoryLedger &ledger = fixture.ledger();
+  std::string lines;
+  ledger.setDecisionLog([&](std::string_view line) { lines += " " + std::string(line) + ";"; });
+  ledger.addSource(cache);
+  ledger.addPool(store);
+  static_cast<void>(fixture.pass(1.0));
+  require(store.currentBytes() == kAll && cache.taken == std::vector<uint64_t>{1, 2, 3},
+          "the host's pass took " + std::to_string((kAll - store.currentBytes()) / kMiB) + " MiB of the store and " +
+              std::to_string(cache.taken.size()) + " cache units, not 3 cache units and none of the store:" + lines);
 }
 
 // The store shrinks for a long prompt and grows back by displacing copied
@@ -3341,10 +3410,9 @@ void testThe35BPressurePatternTakesNoRegrownUnitBack() {
 // the lanes in service project 29 MiB more KV, which they take 2 s later.
 // The snapshot grew both chunks back against the one reading, and its
 // host's claim took both back 4 s later for 216.5 MiB the host then lacked.
-// No unit grows back that the host takes back within the horizon. At 30 s
-// the lanes end and give their 29 MiB back: the host's room then holds the
-// 1023 MiB chunk beside its margin, and the store grows it back within two
-// passes and kHostSettleMilliseconds (AMENDMENTS X19) and keeps it.
+// Short of macOS's critical pressure the host's claim takes no chunk of the
+// store (owner 11-03 17:30): the store keeps both through the pattern and
+// past the lanes' end at 30 s, so none grows back and none is taken back.
 void testTheM6HostPatternTakesNoRegrownUnitBack() {
   constexpr uint64_t kSmall = 188'000'000, kLarge = 1023 * kMiB, kFloor = 7210 * kMiB, kLanes = 29 * kMiB;
   constexpr uint64_t kAll = kFloor + kLarge + kSmall;
@@ -3385,12 +3453,9 @@ void testTheM6HostPatternTakesNoRegrownUnitBack() {
     }
     before = after;
   }
-  require(retaken == 0, "the host took back " + std::to_string(retaken) + " units within the horizon of a regrowth:" +
-                            history);
-  require(regrown && *regrown >= kEnded && *regrown <= kEnded + 2 * 0.5 + kHostSettleMilliseconds / 1000.0 &&
-              store.currentBytes() == kFloor + kLarge,
-          "the store did not grow the 1023 MiB chunk back once the lanes gave their KV back, or did not keep it:" +
-              history);
+  require(retaken == 0 && !regrown && store.currentBytes() == kAll,
+          "short of critical pressure the host's claim took a chunk of the store, " +
+              std::to_string(store.currentBytes() / kMiB) + " MiB at the end:" + history);
 }
 
 // The M6's 64K prompt beside two decoders as smoke b recorded it
@@ -3402,21 +3467,15 @@ void testTheM6HostPatternTakesNoRegrownUnitBack() {
 // 66.4 s is of the 1023 MiB one), when the log does not say, and plays no
 // part: a take before only raises the rates. Request 2 prefills beside
 // request 1, which decodes: both are in demand. At 66.4 s the host lacks
-// 5.0 MiB of its margin, and its claim takes the 1023 MiB chunk; at 71.4 s
-// other applications give back 5.5 MiB, and the host admits the chunk beside
-// its margin again; at 79.5 s request 3, the 64K prompt, starts and needs
-// 263.7 MiB. The store grew the chunk back at 71.5 s at its own take rate
-// (0.0154 a second keeps 0.40 of what the chunk saves), the host refused the
-// start, and its claim took the chunk back for the 263.2 MiB the start then
-// lacked, 8 s after the chunk grew (amend/V.md A30: no unit regrown is taken
-// back within the horizon; matrix.py's store churn counts it). What the
-// host's claim takes while lanes are in demand it takes for them: the chunk
-// does not grow back within 18.65 s of the take (its 3.2 s over the horizon
-// pay its 0.129 s cycle below 1/18.65 takes a second), the start is admitted
-// at once, and from then the host keeps the chunk out (760 MiB past its
-// margin after the start); once the requests end at 120 s the store grows it
-// back within two passes and kHostSettleMilliseconds and keeps it, and no
-// claim takes it back.
+// 5.0 MiB of its margin, and its claim took the 1023 MiB chunk; at 71.4 s
+// other applications give back 5.5 MiB; at 79.5 s request 3, the 64K
+// prompt, starts and needs 263.7 MiB. The store grew the chunk back at
+// 71.5 s, the host refused the start, and its claim took the chunk back for
+// the 263.2 MiB the start then lacked, 8 s after the chunk grew (amend/V.md
+// A30: no unit regrown is taken back within the horizon). Short of macOS's
+// critical pressure the host's claim takes no chunk of the store (owner
+// 11-03 17:30): the store keeps its chunk to the requests' end at 120 s, and
+// the host, short by what the start asks, holds the start meanwhile.
 void testTheM6LongPromptHostPatternTakesNoRegrownUnitBack() {
   constexpr uint64_t kLarge = 1023 * kMiB, kFloor = 7210 * kMiB, kLanes = 600 * kMiB;
   constexpr uint64_t kStart = 276'509'491;  // 263.7 MiB
@@ -3481,29 +3540,20 @@ void testTheM6LongPromptHostPatternTakesNoRegrownUnitBack() {
     }
     before = after;
   }
-  require(retaken == 0, "the host took back " + std::to_string(retaken) + " units within the horizon of a regrowth:" +
-                            history);
-  require(started && *started == 79.5, "the 64K prompt's start was not admitted at once:" + history);
-  require(regrown && *regrown >= kEnded && *regrown <= kEnded + 2 * 0.5 + kHostSettleMilliseconds / 1000.0 &&
-              store.currentBytes() == kFloor + kLarge,
-          "the store did not grow the 1023 MiB chunk back within two passes and the host's settling of the "
-          "requests' end, or did not keep it:" +
-              history);
+  require(retaken == 0 && !regrown && store.currentBytes() == kFloor + kLarge,
+          "short of critical pressure the host's claim took the store's chunk:" + history);
+  require(!started, "the 64K prompt started while the host lacked what it asks:" + history);
 }
 
 // A lane decodes alone (not in demand) when a request's start needs
-// 263.7 MiB that the host refuses: the request waits for it, its need counts
-// in the host's deficit, and the host's claim takes the store's 1023 MiB
+// 263.7 MiB that the host refuses: the request waits for it, and its need
+// counts in the host's deficit. The host's claim took the store's 1023 MiB
 // chunk (the M6's, as in testTheM6LongPromptHostPatternTakesNoRegrownUnitBack)
-// for the request, which starts at its retry beside the lane and prefills.
-// At 33 s other applications give back 300 MiB and the host admits the chunk
-// beside its margin; at 40 s the prompt's KV grows by 300 MiB. At the store's
-// own rate the chunk grew back at 33 s and, the host short of its margin
-// after the KV, its claim took it back at 40 s. A take for a request that
-// waits for what the host refused is a take for the lanes: the chunk does
-// not grow back within 18.65 s of it, and once the requests end at 60 s the
-// store grows it back within two passes and kHostSettleMilliseconds.
-void testATakeForAStartTheHostRefusedCountsForTheLanes() {
+// for it; short of macOS's critical pressure it takes none of the store
+// (owner 11-03 17:30): the request waits until other applications give back
+// 300 MiB at 33 s, then starts beside the lane, whose KV grows by 300 MiB at
+// 40 s past the margin, and the store keeps its chunk to the end.
+void testAStartTheHostRefusedWaitsForTheHostNotTheStore() {
   constexpr uint64_t kLarge = 1023 * kMiB, kFloor = 7210 * kMiB, kLane = 600 * kMiB, kGrowth = 300 * kMiB;
   constexpr uint64_t kStart = 276'509'491;  // 263.7 MiB
   constexpr uint64_t kEngine = kFloor + kLarge + kLane;
@@ -3565,28 +3615,19 @@ void testATakeForAStartTheHostRefusedCountsForTheLanes() {
     }
     before = after;
   }
-  require(retaken == 0, "the host took back " + std::to_string(retaken) + " units within the horizon of a regrowth:" +
-                            history);
-  require(regrown && *regrown >= kEnded && *regrown <= kEnded + 2 * 0.5 + kHostSettleMilliseconds / 1000.0 &&
-              store.currentBytes() == kFloor + kLarge,
-          "the store did not grow the chunk back within two passes and the host's settling of the requests' end, "
-          "or did not keep it:" +
-              history);
+  require(retaken == 0 && !regrown && store.currentBytes() == kFloor + kLarge,
+          "short of critical pressure the host's claim took the store's chunk for a start it refused:" + history);
+  require(started, "the start the host refused did not start once other applications gave the host room");
 }
 
-// The lanes stay in demand for a whole churn, and the host's claim takes the
-// store's 1023 MiB chunk (the M6's, as in
-// testTheM6LongPromptHostPatternTakesNoRegrownUnitBack) at 20 s and again,
-// after the chunk grew back, at 150 s, each time for 5 MiB of its margin
-// that other applications took; they give it back 5 s later, and take it
-// again at 165 s. Counted from the first take at 20 s, the take at 150 s
-// was two in 130 s, 0.015 a second, below the store's own rate after it:
-// the chunk grew back at 155 s and the host's claim took it back at 165 s.
-// Each take counts from itself too: the chunk grows back no sooner than
-// 18.65 s after a take (its 3.2 s over the horizon pay its 0.129 s cycle
-// below 1/18.65 takes a second), at 39 s and 170 s, and no claim takes it
-// back within the horizon.
-void testATakeAHorizonAfterTheLastCountsAfresh() {
+// The lanes stay in demand for a whole churn, and other applications take
+// 5 MiB of the host's margin at 20 s, 150 s and 165 s, each time for 5 s.
+// The host's claim took the store's 1023 MiB chunk (the M6's, as in
+// testTheM6LongPromptHostPatternTakesNoRegrownUnitBack) at 20 s and, after
+// it grew back, at 150 s and 165 s; short of macOS's critical pressure it
+// takes none of the store (owner 11-03 17:30), and the store keeps its
+// chunk through every shortfall.
+void testTheHostsRecurringShortfallsTakeNoStoreUnit() {
   constexpr uint64_t kLarge = 1023 * kMiB, kFloor = 7210 * kMiB, kLanes = 600 * kMiB;
   constexpr uint64_t kEngine = kFloor + kLarge + kLanes;
   const uint64_t past = kEngine + kHostMarginBytes + kMiB / 2, short5 = kEngine + kHostMarginBytes - 5 * kMiB;
@@ -3624,18 +3665,16 @@ void testATakeAHorizonAfterTheLastCountsAfresh() {
     }
     before = after;
   }
-  require(retaken == 0, "the host took back " + std::to_string(retaken) + " units within the horizon of a regrowth:" +
-                            history);
-  require(regrown && *regrown >= 150.0 + 18.5 && store.currentBytes() == kFloor + kLarge,
-          "the store did not grow the chunk back once the take at 150 s was a horizon old, or did not keep it:" +
-              history);
+  require(retaken == 0 && !regrown && store.currentBytes() == kFloor + kLarge,
+          "short of critical pressure the host's claim took the store's chunk:" + history);
 }
 
 // A lane that prefills alone while a claim of no request takes a store unit
-// for it: the host's claim, for the margin other applications took
-// (`host`), or the engine's own in-service claim, which closes as it decides
+// for it: the engine's own in-service claim, which closes as it decides
 // (the Index runway's in Engine::allocate, the Slim extents' trim's in
-// Engine::prepare), for room under the engine's limit. The unit is the lane's demand as a unit its own
+// Engine::prepare), for room under the engine's limit; the host's claim, for
+// the margin other applications took (`host`), took one too, and short of
+// macOS's critical pressure takes none (owner 11-03 17:30). The unit is the lane's demand as a unit its own
 // claim took would be: it does not grow back while the lane prefills, and
 // once the lane decodes alone the store grows it back within a pass (owner
 // rule 12; amend/V.md A30's regrowth lower bound). A store whose 1 GiB unit
@@ -3697,14 +3736,19 @@ void aUnitTakenForALoneLaneGrowsBackOnceItDecodes(bool host) {
     }
     before = after;
   }
-  const std::string taker = host ? "the host" : "the engine's own claim";
+  if (host) {
+    require(experts.shrinks == 0,
+            "short of critical pressure the host's claim took a unit of the store for a lone lane:" + history);
+    return;
+  }
+  const std::string taker = "the engine's own claim";
   require(retaken == 0,
           taker + " took back " + std::to_string(retaken) + " units within the horizon of a regrowth:" + history);
   require(regrown && *regrown >= kPrefilled && *regrown <= kPrefilled + 0.5 && experts.units() == 4,
           "the store did not grow back the unit " + taker + " took within a pass of the prefill's end, or did not "
           "keep it:" + history);
 }
-void testAUnitTheHostTookForALoneLaneGrowsBackOnceItDecodes() { aUnitTakenForALoneLaneGrowsBackOnceItDecodes(true); }
+void testTheHostTakesNoUnitForALoneLane() { aUnitTakenForALoneLaneGrowsBackOnceItDecodes(true); }
 void testAUnitTheEngineTookForALoneLaneGrowsBackOnceItDecodes() {
   aUnitTakenForALoneLaneGrowsBackOnceItDecodes(false);
 }
@@ -3838,6 +3882,8 @@ std::span<const test::TestCase> ledgerTests() {
       {"testMissingTelemetryGivesNoCacheBack", testMissingTelemetryGivesNoCacheBack},
       {"testRerunWhileTheDeficitWaitsOnLandings", testRerunWhileTheDeficitWaitsOnLandings},
       {"testWarningAloneTakesNoPoolUnit", testWarningAloneTakesNoPoolUnit},
+      {"testTheHostTakesNoStoreUnitShortOfCritical", testTheHostTakesNoStoreUnitShortOfCritical},
+      {"testTheHostTakesCacheNotTheStore", testTheHostTakesCacheNotTheStore},
       {"testStoreRegrowsByDisplacementUnderPersistentWarning", testStoreRegrowsByDisplacementUnderPersistentWarning},
       {"testStoreRegrowsByDisplacementInTheBand", testStoreRegrowsByDisplacementInTheBand},
       {"testTheStoreRegrowsBeforeTheWarningPassTakesItsCache", testTheStoreRegrowsBeforeTheWarningPassTakesItsCache},
@@ -3875,10 +3921,9 @@ std::span<const test::TestCase> ledgerTests() {
       {"testThe35BPressurePatternTakesNoRegrownUnitBack", testThe35BPressurePatternTakesNoRegrownUnitBack},
       {"testTheM6HostPatternTakesNoRegrownUnitBack", testTheM6HostPatternTakesNoRegrownUnitBack},
       {"testTheM6LongPromptHostPatternTakesNoRegrownUnitBack", testTheM6LongPromptHostPatternTakesNoRegrownUnitBack},
-      {"testATakeForAStartTheHostRefusedCountsForTheLanes", testATakeForAStartTheHostRefusedCountsForTheLanes},
-      {"testATakeAHorizonAfterTheLastCountsAfresh", testATakeAHorizonAfterTheLastCountsAfresh},
-      {"testAUnitTheHostTookForALoneLaneGrowsBackOnceItDecodes",
-       testAUnitTheHostTookForALoneLaneGrowsBackOnceItDecodes},
+      {"testAStartTheHostRefusedWaitsForTheHostNotTheStore", testAStartTheHostRefusedWaitsForTheHostNotTheStore},
+      {"testTheHostsRecurringShortfallsTakeNoStoreUnit", testTheHostsRecurringShortfallsTakeNoStoreUnit},
+      {"testTheHostTakesNoUnitForALoneLane", testTheHostTakesNoUnitForALoneLane},
       {"testAUnitTheEngineTookForALoneLaneGrowsBackOnceItDecodes",
        testAUnitTheEngineTookForALoneLaneGrowsBackOnceItDecodes},
       {"testAClaimPaysForAPoolUnitsRelease", testAClaimPaysForAPoolUnitsRelease},

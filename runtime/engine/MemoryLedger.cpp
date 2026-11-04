@@ -415,18 +415,24 @@ MemoryLedger::DryRun MemoryLedger::dryRun(const ClaimSpec &spec, const VictimQue
     return false;
   };
   // Pool units: above floors for in-service work, optional work (while they
-  // cost less than its benefit), growth (another pool's) and a host short of
-  // memory; for a start, only those of a pool whose units cost only their
+  // cost less than its benefit), growth (another pool's) and the host under
+  // macOS's critical pressure; for a start, and a host short of memory below
+  // critical pressure, only those of a pool whose units cost only their
   // rebuild, which nothing in service holds or reads (PoolState::
   // rebuildOnly; amend/M.md B2 as the owner amended it 11-03: the store and
-  // the hot block cache stay out of its reach); none for a claim below a
-  // lane in service. Pending growth only for claims that may take memory the
-  // engine's limit holds for a pool.
+  // the hot block cache stay out of its reach; for the host, owner 11-03
+  // 17:30: the M6's value runs gave the store's 179 and 1023 MiB chunks to a
+  // 327.7 MiB host claim, and the room went to the lanes' KV for the rest of
+  // the run). What the host's other units do not meet stays short, and the
+  // host's rule holds the starts. None for a claim below a lane in service.
+  // Pending growth only for claims that may take memory the engine's limit
+  // holds for a pool.
   const bool belowALane = lanePriority_ && *lanePriority_ < spec.priority;
   const bool poolUnits = !belowALane && (spec.cls == ClaimClass::InService || spec.cls == ClaimClass::Optional ||
                                          spec.cls == ClaimClass::Growth ||
-                                         (spec.cls == ClaimClass::Host && (query.deficit || query.critical)));
-  const bool rebuiltUnits = poolUnits || (!belowALane && spec.cls == ClaimClass::Start);
+                                         (spec.cls == ClaimClass::Host && query.critical));
+  const bool rebuiltUnits =
+      poolUnits || (!belowALane && (spec.cls == ClaimClass::Start || (spec.cls == ClaimClass::Host && query.deficit)));
   const bool pendingUnits = poolUnits && spec.cls != ClaimClass::Growth && spec.cls != ClaimClass::Host;
 
   struct Head final {
