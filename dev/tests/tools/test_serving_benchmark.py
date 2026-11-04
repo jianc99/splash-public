@@ -1427,10 +1427,10 @@ class GateTests(unittest.TestCase):
     def test_only_the_servers_own_failures_fail_g8(self):
         # s-fn-churn-18g on the final day: a stale server still answers on
         # the port, and run.py refuses the run. An M5 run is voided because
-        # the laptop's owner was on a call, and its loop shows a 5.2 s tick.
+        # the M5 Pro was in use during a call, and its loop shows a 5.2 s tick.
         # Both are listed, to be repeated, and fail nothing. A run whose
         # server exited during the scenario fails G8. p-fn-churn-18g on the
-        # M5: the owner touched the laptop at minute 3, and at minute 10 the
+        # M5: the machine was touched at minute 3, and at minute 10 the
         # engine crashed and was relaunched. The run is listed, to be
         # repeated, and its crash still fails G8.
         cell = {"name": "c", "machine": "m6", "model": "fn-q2", "scenario": "churn"}
@@ -1490,11 +1490,11 @@ class GateTests(unittest.TestCase):
             [(r.label, r.invalid, bool(r.voided)) for r in runs],
             [
                 ("refused", [f"the run did not end with DONE: {refusal}"], True),
-                ("called", ["the laptop was in use (HIDIdleTime 3.0 s)"], True),
+                ("called", ["the machine was in use (HIDIdleTime 3.0 s)"], True),
                 (
                     "crashed",
                     [
-                        "the laptop was in use (HIDIdleTime 4.0 s)",
+                        "the machine was in use (HIDIdleTime 4.0 s)",
                         "the engine restarted (0 -> 1)",
                     ],
                     True,
@@ -1831,7 +1831,7 @@ class GateTests(unittest.TestCase):
         )
         self.assertEqual(
             self.m5_validated("touched", quiet, [display], hid_idle_s=2.5),
-            ["the laptop was in use (HIDIdleTime 2.5 s)"],
+            ["the machine was in use (HIDIdleTime 2.5 s)"],
         )
 
     def test_an_unreported_bound_or_ledger_is_not_judged(self):
@@ -2256,7 +2256,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(g1["numbers"]["tolerance"], self.gates["trade_tolerance"])
 
     def test_a_cell_without_a_usable_candidate_run_says_so(self):
-        # p-fn-churn-18g: the laptop's owner used the M5 Pro during cand's A
+        # p-fn-churn-18g: the M5 Pro was in use during cand's A
         # runs, the watchdog killed B1 before it wrote its meta.json, and B2
         # never ran. cand's gates are INCONCLUSIVE, naming its runs; the
         # killed run is listed, and B2 as not run.
@@ -2315,11 +2315,11 @@ class GateTests(unittest.TestCase):
             [
                 (
                     "p-fn-churn-18g-cand-A1",
-                    ["the laptop was in use (HIDIdleTime 3.0 s)"],
+                    ["the machine was in use (HIDIdleTime 3.0 s)"],
                 ),
                 (
                     "p-fn-churn-18g-cand-A2",
-                    ["the laptop was in use (HIDIdleTime 3.0 s)"],
+                    ["the machine was in use (HIDIdleTime 3.0 s)"],
                 ),
                 ("p-fn-churn-18g-cand-B1", ["the run did not end with DONE"]),
                 ("p-fn-churn-18g-cand-B2", ["not run"]),
@@ -2966,7 +2966,7 @@ class GateTests(unittest.TestCase):
         )
         self.assertTrue(all(v["verdict"] == stats.PASS for v in verdicts), verdicts)
         self.assertEqual(unused, [])
-        # p-serve1 on the owner's laptop: typing during a cand run voids it,
+        # p-serve1 on the M5 Pro: typing during a cand run voids it,
         # its set is not judged, and the voided run is not judged on G8.
         write_jsonl(
             self.directory / "s1-cand-2.idle.jsonl",
@@ -2979,7 +2979,7 @@ class GateTests(unittest.TestCase):
         )
         self.assertEqual(
             [(u["label"], u["reasons"]) for u in unused],
-            [("s1-cand-2", ["the laptop was in use (HIDIdleTime 2.5 s)"])],
+            [("s1-cand-2", ["the machine was in use (HIDIdleTime 2.5 s)"])],
         )
 
     def test_an_abba_set_with_a_second_copy_of_a_run_is_judged(self):
@@ -3350,7 +3350,7 @@ class GateTests(unittest.TestCase):
         self.assertEqual(len(matrix.overruns(queue, now=time.time() + 41 * 60)), 1)
 
     def test_a_single_comparison_its_job_voided_is_not_judged(self):
-        # M5 p-single: the laptop was touched during the make, so the job
+        # M5 p-single: the machine was touched during the make, so the job
         # wrote LABEL.void beside the comparison it copied.
         cell = next(c for c in self.spec["cells"] if c["name"] == "p-single")
         spec = {**self.with_cand_build(self.spec, "src-new"), "cells": [cell]}
@@ -3934,7 +3934,7 @@ class PlanTests(unittest.TestCase):
                                     words[3:7],
                                     [
                                         "env",
-                                        "HF_HOME=/home/dev/splash-lead/hf",
+                                        "HF_HOME=/home/splash-bench/hf",
                                         "nice",
                                         "-n",
                                     ],
@@ -3942,7 +3942,7 @@ class PlanTests(unittest.TestCase):
                                 self.assertEqual(parsed.gpu_idle_percent, 0)
                                 self.assertTrue(
                                     parsed.draft_model.startswith(
-                                        "/home/dev/splash-lead/hf/hub/"
+                                        "/home/splash-bench/hf/hub/"
                                     )
                                 )
                         else:

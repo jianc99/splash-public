@@ -443,7 +443,7 @@ an error event in a stream it had begun, a request of a failed TTFT round, or
 one `/status` counts in `requests.failed`), it saw no `serious` or `critical`
 thermal sample, it served the cell's model, no process it did not start was
 among the top five by CPU at 24 % or more (`foreign_cpu_percent` in the spec,
-whose note gives its source), and, on the M5 Pro, its owner neither touched
+whose note gives its source), and, on the M5 Pro, nobody touched
 it (HIDIdleTime under 10 s) nor had an app hold a display or system sleep
 assertion: a process the run did not start other than powerd, which holds one
 itself whenever the display is on. A TTFT run's concurrency counts only where

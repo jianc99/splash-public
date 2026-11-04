@@ -3,10 +3,10 @@ the records that make the run checkable.
 
 Run from a checkout holding these tools, with the tree to measure:
 
-    python3 -m dev.benchmarks.serving.run --tree ~/dev/vr16/cand --machine m6 \\
+    python3 -m dev.benchmarks.serving.run --tree TREE --machine m6 \\
         --model ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0 --revision ed59f92... \\
-        --draft-model ~/.cache/.../snapshots/a22a... --scenario churn --order 2,0,1 \\
-        --minutes 15 --label m6-fn-churn-cand-A1 --out ~/bench/1.6.0
+        --draft-model DRAFT --scenario churn --order 2,0,1 \\
+        --minutes 15 --label m6-fn-churn-cand-A1 --out OUT
 
 It installs the model with the tree's own installer, offline, or takes
 --model-root as installed; starts the tree's own server (the wire differs
@@ -22,7 +22,7 @@ SIGINT; and writes beside the client's records:
   start compiles Metal), host memory and pressure at start, ps snapshots at
   the start, middle and end of the scenario while the server serves, the pids
   this run started, on the M5 Pro the idle and sleep-assertion samples
-  (LABEL.idle.jsonl) that void a run the laptop's owner used, and for a run
+  (LABEL.idle.jsonl) that void a run while the machine was in use, and for a run
   that did not complete why (error) and whose failure that was (failure:
   server or request, the server's own, else the refusal's kind);
 - LABEL.server.log (one per server: LABEL-nN for each concurrency of ttft).
@@ -56,10 +56,10 @@ READY_TIMEOUT_SECONDS = 900
 # A server that ignores SIGINT this long gets SIGTERM, then SIGKILL (a server
 # under memory pressure once ignored SIGINT, ATTEMPTS A109).
 STOP_GRACE_SECONDS = 60
-# The M5 Pro is the owner's laptop: its idle time and sleep assertions are
+# The M5 Pro is also used interactively: its idle time and sleep assertions are
 # sampled this often during a run (amend/V.md A96).
 IDLE_SAMPLE_SECONDS = 10
-# On a machine whose owner does not hold our lock (the mini-M4), a timed
+# On a shared machine that does not hold our lock (the mini-M4), a timed
 # run waits until the GPU is as idle as it was recorded with nothing running:
 # five samples 2 s apart, for up to 10 minutes (amend/V.md A96 item 4).
 GPU_IDLE_SAMPLES, GPU_IDLE_PERIOD, GPU_IDLE_WAIT_SECONDS = 5, 2.0, 600

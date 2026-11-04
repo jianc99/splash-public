@@ -1,10 +1,10 @@
 """The 1.6.0 benchmark matrix: plan its jobs, check its runs, judge them.
 
     python3 -m dev.benchmarks.serving.matrix plan --spec SPEC --machine m6 \\
-        --tree cand=~/dev/vr16/cand --tree pass=~/dev/vr16/pass0bd --commit cand=<sha> \\
-        --tools ~/dev/vr16/cand --out ~/bench/1.6.0 --jobs ~/gpuq/pending --first 20
+        --tree cand=CAND --tree pass=PASS --commit cand=<sha> \\
+        --tools CAND --out OUT --jobs JOBS/pending --first 20
     python3 -m dev.benchmarks.serving.matrix check RUN_DIR LABEL [--minutes 15]
-    python3 -m dev.benchmarks.serving.matrix check --running ~/gpuq
+    python3 -m dev.benchmarks.serving.matrix check --running JOBS
     python3 -m dev.benchmarks.serving.matrix disk --spec SPEC --results DIR... --cell CELL
     python3 -m dev.benchmarks.serving.matrix analyze --spec SPEC --results DIR... \\
         --build cand=<build id>[,<build id>...] --out DIR
@@ -439,7 +439,7 @@ def app_assertion(holder: str, ours: set) -> bool:
     whenever the display is on, on the M5 Pro (displaysleep 0) always: every
     sample of its six references of 11-01 shows it, at HIDIdleTime 11,263 s
     or more. It is a system process following the display, not an app in
-    use; the owner's use shows in HIDIdleTime."""
+    use; interactive use shows in HIDIdleTime."""
     _, found, rest = holder.partition("pid ")
     digits, _, rest = rest.partition("(")
     pid = int(digits) if found and digits.strip().isdigit() else None
@@ -511,7 +511,7 @@ def validate(run: Run, spec: dict, cell: dict) -> None:
         ]
         if touched:
             void(
-                f"the laptop was in use (HIDIdleTime {touched[0]['hid_idle_s']:.1f} s)"
+                f"the machine was in use (HIDIdleTime {touched[0]['hid_idle_s']:.1f} s)"
             )
         if held:
             void(f"another process held a sleep assertion: {held[0]}")
@@ -1486,7 +1486,7 @@ def churn_cell(
     # the voided, also on one the server's own failures made unusable (it
     # fails G8) or whose SSD cache is not comparable with its references';
     # one run.py refused to measure or its surroundings voided (heat, other
-    # processes, the laptop's owner) is listed under the runs not used, to be
+    # processes, interactive use) is listed under the runs not used, to be
     # repeated, and judged on G8 alone, which fails on the server's own
     # failures it also shows. G4 holds for a tree when none of its runs
     # fails it: each candidate's own, never another tree's (the floor = cap
@@ -2649,7 +2649,7 @@ def check_run(
     rather than at the batch's analyze: no DONE, the server's own failures
     (G8), and, for a run of a spec cell, every reason analyze would void it
     for (validate: a process it did not start in the top five by CPU, the
-    laptop in use or another process's sleep assertion, heat, a busy GPU at
+    machine in use or another process's sleep assertion, heat, a busy GPU at
     its start, another model, an ample start below the cap). A churn run
     also: an end before its load window, a worker that completed nothing, a
     G4/G9 failure of its own status and gaps, or, with `streamed`, a model
