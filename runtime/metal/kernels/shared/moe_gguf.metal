@@ -69,8 +69,9 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
                                     uint simd_lane [[thread_index_in_simdgroup]],
                                     uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half stage[kStagedStages]; threadgroup half2 tl[Tables * kQuantPairTableEntries];
-  if (group.y >= *tile_count) return;
-  const MoeTileDescriptor tile = tiles[group.y];
+  const uint t = moe_first_tile(tile_count, p.tiles) + group.y;
+  if (t >= moe_end_tile(tile_count, p.tiles)) return;
+  const MoeTileDescriptor tile = tiles[t];
   const bool up = simd_group == 1;
   const MoeGgufSegment gs = moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size,
                                                      p.gate_routed_format, p.gate_shared_format, slots, chunks,
@@ -91,12 +92,12 @@ kernel void moe_expert_gguf_gate_up(device bfloat *input [[buffer(0)]],
   const MoeGgufSegment s = up ? us : gs;
   threadgroup half2 *table = tl + (Tables == 2 && up ? kQuantPairTableEntries : 0);
   const uint K = p.input_size, N = p.output_size;
-  device bfloat *x = input + ulong(group.y) * Rows * K;
-  const ulong out = ulong(group.y) * Rows * N;
+  device bfloat *x = input + ulong(t) * Rows * K;
+  const ulong out = ulong(t) * Rows * N;
   const uint origin = group.x * GGUF_STAGED_COLUMNS;
   threadgroup half *my = stage + simd_group * kStagedSimdgroupStage;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
-  if (moe_column_tile(tiles, group.y)) {
+  if (moe_column_tile(tiles, t)) {
     moe_gate_up_column(x, tile.rows, K, N, s, origin, simd_lane, table, up, gate, output, out);
     return;
   }

@@ -22,15 +22,16 @@ inline void moe_gguf_expert_tile(device bfloat *input, device const MoeTileDescr
                                  device uchar *smeta, device const uint *slots, constant MoeGgufExpertParams &p,
                                  constant ulong *chunks, uint2 group, uint simd_lane, uint simd_group,
                                  threadgroup half *stage, threadgroup half2 *tl, Store store) {
-  if (group.y >= *tile_count) return;
-  const MoeTileDescriptor tile = tiles[group.y];
+  const uint t = moe_first_tile(tile_count, p.tiles) + group.y;
+  if (t >= moe_end_tile(tile_count, p.tiles)) return;
+  const MoeTileDescriptor tile = tiles[t];
   const MoeGgufSegment s =
       moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
                                slots, chunks, p.floor_slots, p.chunk_slots, Projection, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
-  const ulong out = ulong(group.y) * Rows * p.output_size;
+  device bfloat *x = input + ulong(t) * Rows * p.input_size;
+  const ulong out = ulong(t) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * GGUF_STAGED_COLUMNS;
-  if (moe_column_tile(tiles, group.y)) {
+  if (moe_column_tile(tiles, t)) {
     float sums[MOE_GGUF_COLUMN_ROWS];
     column_dot_any<MOE_GGUF_COLUMN_ROWS>(s.format, x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane,
                                          0, p.input_size / 32, tl, simd_group * 32 + simd_lane, GGUF_STAGED_THREADS,
