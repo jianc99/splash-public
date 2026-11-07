@@ -1,5 +1,6 @@
 // GGUF projections: plan validation and dispatch (kernels/shared/gguf_linear.metal,
-// kernels/decode/linear_gguf_sgmatrix.metal); KernelSelection.cpp picks the plans.
+// kernels/prefill/gguf_prefill_int8.metal, kernels/decode/linear_gguf_sgmatrix.metal);
+// KernelSelection.cpp picks the plans.
 #include "Linear.hpp"
 
 #include "metal/abi/ExecutionGeometry.h"
@@ -22,6 +23,7 @@ namespace {
 
 // The segments one fused decode dispatch runs.
 constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::cols)>;
+static_assert(QUANT_TILE_ROWS % GGUF_TILE_COLUMNS == 0, "an int8 prefill column tile lies inside one plane tile");
 
 // A staged decode kernel of a format at `rows` rows: gguf_decode_<format>_m<rows>_<suffix>, in int8 activations
 // (LinearConfig::decodeInt8) gguf_decode_int8_<format>_m<rows>_<suffix>.
@@ -142,7 +144,7 @@ void LinearPlan::requireConfiguration() const {
       throw std::invalid_argument("the register block decode tile takes a K unit per split");
     return;
   }
-  if (c.tile == LinearTile::GgufPrefill) {
+  if (c.tile == LinearTile::GgufPrefill || c.tile == LinearTile::GgufPrefillInt8) {
     if (decode || c.splits != 1) throw std::invalid_argument("invalid block prefill configuration");
     return;
   }
@@ -156,7 +158,7 @@ void LinearPlan::requireConfiguration() const {
 
 uint32_t LinearPlan::storageRows() const noexcept {
   if (config_.tile == LinearTile::GgufRegister) return workload_.rows;
-  if (config_.tile == LinearTile::GgufPrefill)
+  if (config_.tile == LinearTile::GgufPrefill || config_.tile == LinearTile::GgufPrefillInt8)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
   return stagedStorageRows(workload_.rows, config_.sixteenRows);
 }
@@ -172,6 +174,9 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
             config_.splits > 1 ? config_.splits * rows * n * sizeof(float) : 0,
             config_.splits > 1 ? uint64_t{n / GGUF_TILE_COLUMNS} * sizeof(uint32_t) : 0};
   }
+  // Int8 prefill: the codes and scales of the stored rows.
+  if (config_.tile == LinearTile::GgufPrefillInt8)
+    return {gguf_prefill_int8_table_bytes(k, storageRows()), gguf_prefill_int8_scale_bytes(k, storageRows()), 0, 0};
   // Staged split-K: [split][row][column] fp32 partials over the tile's rows,
   // a one-pass gate/up's of both tensors, and one counter per column tile (a
   // tile covers every row of the dispatch): 64 columns, 32 in one pass. The
@@ -254,6 +259,7 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   case LinearTile::GgufRegister: addGgufRegister(graph, b, p, plan, gate); break;
   case LinearTile::GgufStaged: addGgufStaged(graph, b, p, plan, gate); break;
   case LinearTile::GgufPrefill: addGgufPrefill(graph, b, p, plan); break;
+  case LinearTile::GgufPrefillInt8: addGgufPrefillInt8(graph, b, p, plan); break;
   }
 }
 
@@ -394,6 +400,39 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
                 GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {GGUF_PREFILL_THREADS, 1, 1});
     else
       graph.add(prefillKernel(s.name(), epilogue), std::move(bindings), params, groups, {GGUF_PREFILL_THREADS, 1, 1});
+  }
+}
+
+// The int8 prefill tile: the chunk's rows quantized into the scratch's codes
+// and scales, unless it holds them from the plan before over the same rows
+// (b.prepared: a SwiGLU's gate for its up), then a GEMM dispatch per segment
+// over its column tiles and the chunk's row tiles, on a grid 16 threadgroups
+// wide (kernels/prefill/gguf_prefill_int8.metal); a view of leading inputs
+// reads its planes' rows at their own stride.
+void Linear::addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers &b, const Projection &p,
+                                const LinearPlan &plan) const {
+  const LinearWorkload w = plan.workload();
+  const auto [n, k] = w.matrix;
+  const uint32_t storage = plan.storageRows(), groups = k / GGUF_PREFILL_INT8_GROUP,
+                 rowTiles = (w.rows + GGUF_PREFILL_INT8_ROWS - 1) / GGUF_PREFILL_INT8_ROWS;
+  for (const QuantizedSegment &s : p.blocks().segments)
+    if (!quant_prefill_int8_format(s.formatId))
+      throw std::invalid_argument(std::string("the int8 prefill tile does not take ") + s.name() + " weights");
+  if (b.prepared.layout != LinearInput::PrefillInt8 || !b.prepared.source.sameView(b.input))
+    graph.add("gguf_prefill_int8_quantize", {b.input, b.scratch.input, b.scratch.sums},
+              GgufPrefillInt8QuantizeParams{k, w.rows, storage},
+              {(groups + GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS - 1) / GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS, w.rows, 1},
+              {GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS * 32, 1, 1});
+  const std::string epilogue(1, epilogueSuffix(w.epilogue));
+  for (const QuantizedSegment &s : p.blocks().segments) {
+    const uint32_t columnTiles = s.outputSize / GGUF_TILE_COLUMNS;
+    graph.add(std::string("gguf_prefill_int8_") + s.name() + "_" + epilogue,
+              {b.scratch.input, b.scratch.sums, s.plane0, s.plane1Slot(), s.meta, b.output,
+               epilogueInput(b, w.epilogue)},
+              GgufPrefillInt8Params{k, w.rows, storage, n, s.columnOffset, p.planeInputs() ? p.planeInputs() : k,
+                                    columnTiles},
+              {GGUF_PREFILL_INT8_WALK, (columnTiles * rowTiles + GGUF_PREFILL_INT8_WALK - 1) / GGUF_PREFILL_INT8_WALK, 1},
+              {GGUF_PREFILL_INT8_THREADS, 1, 1});
   }
 }
 

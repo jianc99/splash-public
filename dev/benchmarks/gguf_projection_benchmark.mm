@@ -4,15 +4,16 @@
 // law of runtime/ops/KernelCalibration.hpp:
 //   gguf-projection-benchmark <metallib> <fmt[+fmt+fmt]> <N[+N+N]> <K> [none|residual|gateup] [rounds]
 //                             [prefill=R[,R...]]
-// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64
-// columns. With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the
-// decode tiles run the smaller chunks) of a single segment, and for R up to 64 the staged 64-row tile at every K
-// split; gateup is then the up projection's gated epilogue. The
-// weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each projection with the
-// next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the activation table its
-// producers write alongside their output (LinearBuffers::prepared), prepared once and not timed. The cases run in
-// ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection, the device
-// policy's choice marked with *. Widths emulate core counts: the policy's split law counts threadgroups per core.
+// The projection has one segment per format and width (up to three, fused, no epilogue), each a multiple of 64 columns.
+// With prefill=, it times the 128-row prefill tile instead, one case per chunk of R rows (more than 32: the decode
+// tiles run the smaller chunks), for R up to 64 the staged 64-row tile at every K split, and for segments the int8
+// prefill tile takes (af4g64, af5g64) that tile (prefill int8) and its GEMM alone on the codes the scratch holds
+// (int8 codes, as a SwiGLU's up runs on its gate's); gateup is then the up projection's gated epilogue. The weights stay DRAM-cold: a command streams every copy of a ring of at least 384 MiB once, each
+// projection with the next copy (decode gate/up: the gate and up weights of two copies). The register tile reads the
+// activation table its producers write alongside their output (LinearBuffers::prepared), prepared once and not timed.
+// The cases run in ABBA order after a warm-up; printed are the medians of `rounds` (20) commands in ms per projection,
+// the device policy's choice marked with *. Widths emulate core counts: the policy's split law counts threadgroups per
+// core.
 // PQ2_0 projections of whole rotation blocks run rotated, as Prism's are stored, their decode cases also on the int8
 // tiles of 16 or 32 rows (int8, int8pair: LinearConfig::decodeInt8), each time including the input's rotation.
 // The float formats float-bf16 and float-f32, and float-<fmt> for the native rows of a quantized format (an MLX
@@ -69,12 +70,14 @@ MetalBuffer upload(MetalBackend &backend, const std::vector<uint8_t> &bytes) {
   return buffer;
 }
 
-// One plan, printed on its line (L<lanes> or R<rows>) under its label.
+// One plan, printed on its line (L<lanes> or R<rows>) under its label; an int8 prefill plan on the codes the scratch
+// already holds when `codes` (LinearInput::PrefillInt8, as a SwiGLU's up runs after its gate).
 struct Case {
   std::string line, label;
   LinearPlan plan;
   bool chosen;
   std::vector<double> ms;
+  bool codes = false;
 };
 
 // One float projection's tile at `rows` rows, printed as a Case.
@@ -223,12 +226,12 @@ int main(int argc, char **argv) {
                                   : prefill                    ? LinearEpilogue::UpWithGate
                                                                : LinearEpilogue::GateUp;
     if (formats.size() != widths.size() || formats.size() > 3 ||
-        (formats.size() > 1 && (epilogue != LinearEpilogue::None || prefill)) ||
+        (formats.size() > 1 && epilogue != LinearEpilogue::None) ||
         (epilogue == LinearEpilogue::None && epilogueName != "none") || !rounds ||
         (prefill && (prefillRows.empty() ||
                      std::any_of(prefillRows.begin(), prefillRows.end(), [](uint32_t r) { return r <= 32; })))) {
-      std::cerr << "one format per width, at most three, fused projections take no epilogue; prefill takes one "
-                   "format and chunks of more than 32 rows\n";
+      std::cerr << "one format per width, at most three, fused projections take no epilogue; prefill takes chunks "
+                   "of more than 32 rows\n";
       return 2;
     }
     try {
@@ -286,6 +289,14 @@ int main(int argc, char **argv) {
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == policy, {}});
+        if (std::all_of(images.begin(), images.end(),
+                        [](const Image &i) { return quant_prefill_int8_format(i.format); })) {
+          const LinearConfig int8{.tile = LinearTile::GgufPrefillInt8};
+          cases.push_back({"R" + std::to_string(rows), "prefill int8", Linear::plan(w, int8, FloatOutput::BFloat16),
+                           int8 == policy, {}});
+          cases.push_back({"R" + std::to_string(rows), "int8 codes", Linear::plan(w, int8, FloatOutput::BFloat16),
+                           false, {}, true});
+        }
         // Chunks of up to kMaximumStagedPrefillRows rows also on the staged 64-row tile, at every split.
         for (uint32_t splits = 1; rows <= kMaximumStagedPrefillRows && splits <= LinearConfig::kMaximumSplits;
              splits *= 2) {
@@ -385,7 +396,9 @@ int main(int argc, char **argv) {
         const LinearBuffers b{.input = input, .output = output,
                               .residual = epilogue == LinearEpilogue::Residual ? residual : MetalBuffer{},
                               .gateScratch = gate, .scratch = scratch,
-                              .prepared = c.plan.input() == LinearInput::Table16 ? table : PreparedInput{}};
+                              .prepared = c.codes ? PreparedInput{input, LinearInput::PrefillInt8}
+                                          : c.plan.input() == LinearInput::Table16 ? table
+                                                                                   : PreparedInput{}};
         const uint32_t step = epilogue == LinearEpilogue::GateUp ? 2 : 1;
         for (uint32_t i = 0; i < copies / step; ++i, next += step)
           static_cast<void>(linear.add(graph, b, ring[next % copies], c.plan,

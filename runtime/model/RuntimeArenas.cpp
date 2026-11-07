@@ -114,8 +114,9 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(uint64_t{geometry.target.attentionKvHeads} *
                          kRaggedAttentionRows *
                          geometry.target.attentionHeadDimension));
-  // The split partials and counters and the rotated rows of the largest
-  // prefill plan, the draft's context projections' too.
+  // The split partials and counters, the rotated rows and the int8 tile's
+  // codes and scales of the largest prefill plan, the draft's context
+  // projections' too.
   const auto &draft = geometry.draft;
   std::vector<ops::ProjectionShape> prefillProjections = geometry.target.prefillProjections;
   prefillProjections.push_back({draft.hiddenSize, draft.targetHiddenSize()});
@@ -124,6 +125,8 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
     const ops::LinearScratchSize linear = operators.linear().prefillScratchSize(projection);
     put(PrefillTensor::LinearPartials, linear.partials);
     put(PrefillTensor::LinearCounters, linear.counters);
+    put(PrefillTensor::LinearTable, linear.input);
+    put(PrefillTensor::LinearSums, linear.sums);
     put(PrefillTensor::LinearRotated, linear.rotated);
   }
   if (geometry.target.ffnKind == QwenFfnKind::SparseMoe) {

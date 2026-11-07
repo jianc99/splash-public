@@ -80,7 +80,12 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // GgufRegister: the exact register tile on bf16 8x8 matrix operations
 // (Apple9), over an activation table, every request lane in one threadgroup,
 // optional K splits.
-enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister };
+// GgufPrefillInt8: prefill chunks of MLX affine 4- and 5-bit g64 weights
+// (quant_prefill_int8_format) in int8 activations, quantized per row and
+// 64-input group into the scratch table, against the weights' exact codes
+// (kernels/prefill/gguf_prefill_int8.metal); not exact, unsplit, the prefill
+// tile's storage rows.
+enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPrefillInt8 };
 // The decode tiles hold at most a full decode batch.
 inline constexpr uint32_t kMaximumDecodeTileRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
 // The staged tile's tallest height, which holds prefill chunks of up to this
@@ -141,7 +146,8 @@ struct LinearConfig final {
 // allocation and restored by each completed split dispatch. Never share this
 // workspace between concurrent command streams.
 struct LinearScratch final {
-  // The register tile's Table16 table and its sums.
+  // The register tile's Table16 table and its sums; the int8 prefill tile's
+  // codes and scales.
   metal::MetalBuffer input;
   metal::MetalBuffer sums;
   metal::MetalBuffer partials;
@@ -178,10 +184,13 @@ struct LinearScratchSize final {
 
 // The activation layout a decode plan reads: the producer's bf16 rows, or an
 // X^T table with fp32 row sums in LinearScratch that a producer can emit
-// alongside its ordinary output.
+// alongside its ordinary output; or the int8 prefill tile's codes, which only
+// that tile writes, for a next plan over the same rows (a SwiGLU's up after
+// its gate).
 enum class LinearInput : uint8_t {
-  Plain,    // bf16 [rows][K]
-  Table16,  // the register tile's table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  Plain,        // bf16 [rows][K]
+  Table16,      // the register tile's table, sums per 16 and 32 inputs (kernels/common/gguf_sgmatrix.h)
+  PrefillInt8,  // the int8 prefill tile's codes and scales per 64 inputs (kernels/prefill/gguf_prefill_int8.metal)
 };
 // Scratch bytes a producer writes for `rows` rows of `width` inputs.
 [[nodiscard]] constexpr uint64_t tableBytes(uint32_t width, uint64_t rows) noexcept {
@@ -271,7 +280,9 @@ public:
   [[nodiscard]] LinearScratchSize decodeScratchSize(ProjectionShape shape) const;
   // The scratch of every prefill chunk and epilogue of a projection of
   // `shape`: the split partials and counters of the chunks that run the
-  // staged tile (LinearGguf.cpp), and the rotated rows of a full chunk.
+  // staged tile (LinearGguf.cpp), the rotated rows of a full chunk, and where
+  // the device runs the int8 prefill tile on the shape's formats, its codes
+  // and scales of a full chunk.
   [[nodiscard]] LinearScratchSize prefillScratchSize(ProjectionShape shape) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // of rows in `formatId` (QuantizedSegment::rows) on this device
@@ -294,13 +305,11 @@ public:
   void addPrefill(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                   metal::MetalBuffer output, uint32_t rows, LinearScratch scratch = {},
                   uint32_t chunkRows = 0) const;
-  void addPrefillUpWithGate(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &up,
-                            metal::MetalBuffer gateScratch, metal::MetalBuffer output, uint32_t rows,
-                            LinearScratch scratch, uint32_t chunkRows = 0) const;
   void addPrefillResidual(metal::CommandGraph &graph, metal::MetalBuffer input, const Projection &projection,
                           metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
                           LinearScratch scratch, uint32_t chunkRows = 0) const;
-  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows.
+  // output = residual + down(silu(gate x) * up x) of `rows` normalized rows;
+  // up takes what gate's plan leaves of x in the scratch table.
   void addPrefillSwiGlu(metal::CommandGraph &graph, const SwiGluProjections &ffn, const PrefillFfnBuffers &buffers,
                         metal::MetalBuffer residual, metal::MetalBuffer output, uint32_t rows,
                         uint32_t chunkRows = 0) const;
@@ -321,6 +330,8 @@ private:
                      const Projection *gate) const;
   void addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &buffers,
                       const Projection &projection, const LinearPlan &plan) const;
+  void addGgufPrefillInt8(metal::CommandGraph &graph, const LinearBuffers &buffers,
+                          const Projection &projection, const LinearPlan &plan) const;
   void addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &buffers,
                        const Projection &projection, const LinearPlan &plan,
                        const Projection *gate) const;
