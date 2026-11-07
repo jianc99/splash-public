@@ -442,7 +442,12 @@ The rules:
    under the wave law where its grid runs in as many waves of that tile as of
    the 8-row tile, `sixteenRowWaves` at most; a pair's only where both its
    tensors' own plans take it. A unit stages only where every quantized
-   segment's class does: dense measurements were taken per projection.
+   segment's class does: dense measurements were taken per projection. A
+   unit whose quantized segments are all rotated in a format the int8 decode
+   tiles take (`UnitFormats::decodeInt8Takes`: PQ2_0) runs a staged plan of
+   at least `decodeInt8FromRows` rows (16 on Apple10 and Apple11, one lane's
+   16-row plan among them; never on Apple9) whose K splits keep whole PQ2_0
+   blocks on those tiles, at the plan's splits and passes.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.
@@ -466,11 +471,11 @@ The register-against-staged boundaries are measured table entries, not a
 cost model: the wave law, which describes the Apple10 staged tiles, does not
 describe the register tile (`KernelCalibration.hpp`). `kernel-selection`
 (`dev/tests/engine/kernel_selection_test.cc`) pins every plan of every
-family's projections, float tiles, MoE blocks and attention on fifteen device
-classes and core counts as a golden of one FNV-1a-64 per device, section and
-group, and `--dump <dir>` writes the plan lines; a change of a rule or an entry
-shows as the groups it changes. Kernels and their instances do not depend on
-any of this.
+family's projections (a rotated PQ2_0 unit's with its int8 activations), float
+tiles, MoE blocks and attention on fifteen device classes and core counts as a
+golden of one FNV-1a-64 per device, section and group, and `--dump <dir>`
+writes the plan lines; a change of a rule or an entry shows as the groups it
+changes. Kernels and their instances do not depend on any of this.
 
 ### GGUF tiles
 
@@ -720,6 +725,28 @@ the register tile prepares its table from the rotated rows, so the input's
 producer writes plain rows. The token table gathers each row through the inverse
 (`gguf_embed_rotated_pq20`).
 
+In int8 activations (`LinearConfig::decodeInt8`, rule 2) the rotation
+writes int8 rows instead (`gguf_rotate_int8`), one fp32 scale per row and
+rotation block, whose values the rotation spreads evenly, and the staged plan
+runs the int8 tiles, the staged tiles' dispatches on int8 stages
+(`gguf_decode_int8_pq20_m<rows>_<e>`, `_gate_up` and
+`gguf_decode_int8_pq20_fused_m<rows>`), at 16 or 32 rows: PQ2_0's two-bit
+codes q stand for q - 1, exact in int8, staged at a byte per weight, and the
+neural accelerator multiplies int8 at twice its bf16 rate. The 27B Bonsai's projections take 9-31% less time there than on
+the bf16 tiles at the policy's plans (20-core M5 Pro; 10-25% on a 12-core M6);
+the 8-row int8 matmul takes twice the 16-row one's time, so one lane's split
+plans, of 8 rows, keep bf16.
+
+Both int8-activation paths (these rows and the attention tiles' INT8
+queries) quantize by one rule, `kernels/common/int8_activations.h`: a block
+whose largest magnitude is m codes x as clamp(rint(x * (127 / m)), -127, 127),
+ties to even, with scale m / 127, both quotients correctly rounded so that the
+tests' references compute the same codes; a block whose m is 2^-100 or less
+codes as zeros; and a block holding an infinity or a NaN, which its codes
+alone would round to finite values, takes a NaN scale, so that its row goes
+on in NaN as it would in bf16: a projection's outputs are not finite, and an
+attention row's softmax statistics are NaN, which the reduce writes as zeros.
+
 A GGUF kernel of one quantized tensor names its epilogue last: `a` none, `r` residual, `g` the
 up pass with the silu gate. The staged ones are `gguf_decode_<format>_m<rows>_<e>`, with gate and
 up in one pass `gguf_decode_<format>_m<rows>_gate_up`, and
@@ -753,13 +780,18 @@ production executor and its `gguf_repack` kernel write them, bitwise against the
 also as column windows, the alpha/beta, norm, convolution and router bytes they write and the
 golden images; then `gguf-dequant`, the staged tile's dequantizer, built with the production Metal
 flags, against the half rounding of every reference weight; `gguf-rotation`, `gguf_rotate` and the
-rotated PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64;
+rotated PQ2_0 token gather bitwise against the fp32 butterflies and within one bf16 step of fp64,
+and `gguf_rotate_int8`'s codes at their stage positions and per-block scales bit for bit against
+the int8-activation rule, NaN bits where a block holds a NaN or an infinity;
 `gguf-projection`, every GGUF projection through `ops::Linear` with each tile forced, so both
 decode tiles run on every GPU, each in every format it takes (the register tile all but F16), at
 one to four lanes, every K split and epilogue, fused segments, every format's gate with the next
 format's up and the prefill tiles, each output inside the fp64 bound of
 `GgufFormatReference.hpp`, the one-pass gate/up bitwise against the two passes at the same K
-split, and one lane on the staged 16-row tile bitwise against the 8-row tile; and
+split, one lane on the staged 16-row tile bitwise against the 8-row tile, and, where the device
+row takes int8 activations, rotated PQ2_0 on the int8 tiles within the fp32 rounding of the exact
+products of their codes, lanes and pass modes bitwise, and a non-finite input's row alone not
+finite; and
 `gguf-moe`: the float projections on both float tiles and the MoE layer on every GGUF
 plan, the staged 8- and 32-row tiles, in every format as each routed and shared expert tensor,
 against fp64, bitwise against the full grids and two gate/up passes, and with the experts in
@@ -805,7 +837,8 @@ windowed split and reduce start at the page of their tile's first row's window s
 lane's or prefill tile's splits stop at the 18 pages such a window reads
 (`kv::windowAttentionPages`). Over INT8 pages each dense split kernel (`…q8_split…`) also has a
 `…q8q_split…` entry, `q8q` for INT8 queries: it quantizes its tile's queries once (absmax / 127
-per row) and scores them against the INT8 keys (kernel selection, rule 5). A geometry
+per row, by the int8-activation rule) and scores them against the INT8 keys (kernel selection,
+rule 5). A geometry
 with learned sinks (`reduce…_sinks`) binds the layer's, an F32 per query head, to the reduce,
 which adds each to its row's softmax after the splits, in their order, as a key with no value;
 one without an output gate (`gather`) gives the out-projection its attention rows as they are.
