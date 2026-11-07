@@ -42,7 +42,7 @@ void requirePrefillStates(const QwenTargetGeometry &geometry, const QwenTargetPr
 
 void QwenTargetGeometry::finish(std::span<const ops::BlockMoeWeights *const> moeBlocks,
                                 const ops::Projection &logits) {
-  moeFormats = ops::moeFormats(moeBlocks);
+  moeRouterFormat = ops::moeRouterFormat(moeBlocks);
   prefillProjections = decodeProjections;
   include(logits);
   for (auto *shapes : {&prefillProjections, &decodeProjections, &gateUpProjections}) {
@@ -156,7 +156,7 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
       step.windowedAttention.push_back(prefillAttentionPlan(operators_, geometry_, sequence, {.windowTokens = window}));
   }
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
-    step.moe = operators_.moePrefill(geometry_.moeBlockShape(), geometry_.moeFormats, chunk.rows);
+    step.moe = operators_.moePrefill(geometry_.moeBlockShape(), geometry_.moeRouterFormat, chunk.rows);
   if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
   return step;
 }
@@ -186,7 +186,7 @@ QwenTarget::VerifyStep QwenTarget::verifyStep(metal::CommandGraph &graph, const 
                                                               geometry_.kvLayout, std::span(histories).first(lanes),
                                                               {.windowTokens = window}));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
-    step.moe = operators_.moeDecode(geometry_.moeBlockShape(), geometry_.moeFormats, lanes);
+    step.moe = operators_.moeDecode(geometry_.moeBlockShape(), geometry_.moeRouterFormat, lanes);
   return step;
 }
 

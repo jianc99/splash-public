@@ -15,8 +15,7 @@
 namespace splash::ops {
 
 // What selection reads of the quantized segments of a weight unit: one
-// projection, a gate/up pair's two, or a MoE target's routed experts (their
-// shared segments enter registerTakes only).
+// projection or a gate/up pair's two.
 struct UnitFormats final {
   FormatClass formatClass = FormatClass::FourBitsOrMore;
   // The register tile takes every quantized segment (quant_register_tensor).
@@ -63,19 +62,13 @@ struct SplitChoice final {
 [[nodiscard]] FloatTile selectFloatTile(const KernelCalibration &calibration, uint32_t rows, uint32_t outputSize,
                                         uint32_t formatId) noexcept;
 
-// The formats a MoE target's plans follow. Its routed experts are one weight
-// unit: one plan per step serves every block (QwenTarget.cpp). Their class is
-// the class of the format holding most routed elements; registerTakes holds
-// over every block's routed and shared segments; the router is the format of
-// most routers' rows, F32 for none.
-struct MoeFormats final {
-  UnitFormats experts;
-  uint32_t router = QuantizedSegment::kFloat32;
-  bool operator==(const MoeFormats &) const = default;
-};
-[[nodiscard]] MoeFormats moeFormats(std::span<const BlockMoeWeights *const> blocks) noexcept;
-// A MoE plan's configuration of `rows` rows in `phase`.
+// The router format a MoE target's plans follow: one plan per step serves
+// every block (QwenTarget.cpp), at the format of most routers' rows, F32 for
+// none.
+[[nodiscard]] uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcept;
+// A MoE plan's configuration of `rows` rows in `phase`, its routers in
+// `routerFormat`.
 [[nodiscard]] MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape,
-                                  const MoeFormats &formats, uint32_t rows, MoePhase phase) noexcept;
+                                  uint32_t routerFormat, uint32_t rows, MoePhase phase) noexcept;
 
 } // namespace splash::ops

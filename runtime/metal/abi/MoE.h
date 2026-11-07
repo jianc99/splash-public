@@ -121,7 +121,8 @@ static_assert(sizeof(MoeGatherParams) == 12,
 #define MOE_EXPERT_CHUNK_ADDRESSES 9u
 #define MOE_EXPERT_MAX_CHUNKS 48u
 
-// A GGUF expert pass (ops/MoE.cpp) of projection z (0 gate, 1 up, 2 down):
+// A GGUF expert pass of one projection (the down pass,
+// moe_expert_gguf_m<rows>_down; kernels/common/moe_gguf_expert_tile.h):
 // routed expert e's planes start at row local * output_size of the
 // projection's regions in the chunk that holds slot slots[e] (local is the
 // slot's place in it); the shared expert's slices (ids `experts` on) have a
@@ -136,11 +137,10 @@ struct MoeGgufExpertParams {
   uint32_t shared_format;
   uint32_t floor_slots;
   uint32_t chunk_slots;
-  uint32_t projection;
 };
 
-static_assert(sizeof(MoeGgufExpertParams) == 32,
-              "MoE GGUF expert parameters are 32 bytes on both sides");
+static_assert(sizeof(MoeGgufExpertParams) == 28,
+              "MoE GGUF expert parameters are 28 bytes on both sides");
 
 // The gate and up passes in one (moe_expert_gguf_m<rows>_gate_up[_mixed]):
 // their sizes, expert count, floor and chunk slots, as MoeGgufExpertParams
