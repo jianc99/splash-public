@@ -7,6 +7,7 @@
 #include "TestKvPool.hpp"
 #include "TestKvTier.hpp"
 #include "TestRegistry.hpp"
+#include "TestWriteBudget.hpp"
 #include "engine/Engine.hpp"
 
 #include <algorithm>
@@ -521,6 +522,252 @@ void testALaneFreeingLessThanItsNeedDoesNotConvert() {
           "the lane did not decode its whole output");
 }
 
+// The pooled buffers the next lane starts from (Executor::pooledLaneBytes), `bytes` of them, which
+// only KV in service takes: a lane's start takes none of them.
+void poolTheNextLanesBuffers(Spilling &spill, uint64_t bytes) {
+  spill.host.memory.hold("states", bytes);
+  spill.model.heldStateBytes += bytes;
+  spill.model.pooledLaneBytes += bytes;
+}
+
+// Memory beside a Flash-Next prompt of 2,046 pages and its 828 MiB of Resident KV, on a run whose SSD
+// cache holds `slots` pages: the engine's limit leaves `room` past what memory holds, `pooled` bytes
+// of it held as the next lane's pooled buffers.
+struct ShortOfBoth {
+  explicit ShortOfBoth(uint64_t room, uint64_t pooled = 0, uint32_t slots = 1'000)
+      : spill{slots, false, 0, 200'000, Spilling::Extent{256}, {}, {}, true, FlashNextLanes::kPages} {
+    if (pooled)
+      poolTheNextLanesBuffers(spill, pooled);
+    const uint64_t limit = test::GovernorLimits{}.limitBytes;
+    spill.host.memory.hold("limit", limit - std::min(limit, spill.host.memory.total() + room));
+  }
+  Spilling spill;
+};
+
+// The ways the SSD cache cannot take a start: its room short of the projection, as ShortOfBoth's 1,000
+// slots are of a 64K prompt's 2,047 pages; the tier closed; or the daily write budget spent, which a
+// write of another writer's (a state in use) overdrew until it refills in 6 hours.
+enum class Unspillable : uint8_t { Quota, Closed, WriteBudget };
+constexpr std::array kUnspillable{Unspillable::Quota, Unspillable::Closed, Unspillable::WriteBudget};
+void cannotSpill(Spilling &spill, Unspillable way) {
+  if (way == Unspillable::Closed)
+    spill.tier.writableFile = false;
+  if (way == Unspillable::WriteBudget) {
+    spill.budget->setWriteBudget(2 * kHostPageBytes);
+    test::spendWriteBudget(spill.budget);
+  }
+}
+std::string unspillable(Unspillable way) {
+  return way == Unspillable::Quota    ? " for a short quota"
+         : way == Unspillable::Closed ? " while the tier took no writes"
+                                      : " while the write budget was spent";
+}
+std::string failureDetail(const Events &events) {
+  return events.failureDetails.empty() ? std::string() : ": " + events.failureDetails.front().first;
+}
+
+// What a 64K start refused at its start for want of memory and of the SSD cache names of memory: its
+// Resident lane of 65,473 tokens at its start, the Metal memory outside the engine's buffers, and the
+// bytes its least start needs, its prompt and the rows of the decode step after it in eight Full
+// extents with its state, less than a page, beside fewer that memory has for it.
+bool namesTheMemoryShortfall(const std::string &message) {
+  const uint64_t extents = 8 * 256 * FlashNextLanes::kPages.fullBytes;
+  const std::string lane = "; the request, a Resident lane of 65473 tokens at its start, does not fit in the "
+                           "memory this server may use beside device_untracked_bytes=";
+  const std::string needs = ": it needs memory_needed_bytes=", has = ", where memory_available_bytes=";
+  const size_t at = message.find(needs), there = message.find(has);
+  if (message.find(lane) == std::string::npos || at == std::string::npos || there == std::string::npos)
+    return false;
+  const uint64_t needed = std::stoull(message.substr(at + needs.size()));
+  return needed >= extents && needed < extents + FlashNextLanes::kPages.fullBytes &&
+         std::stoull(message.substr(there + has.size())) < needed;
+}
+
+// A start alone that cannot spill and whose prompt memory does not hold now is refused at its start,
+// naming what memory and the SSD cache have for it, rather than start Resident and fail partway through
+// its prefill: kv_disk_quota for a short quota, capacity_exhausted for a closed tier, kv_write_budget
+// with the 6 hours until the budget covers what spilling requests were promised for a spent one.
+void testALoneStartMemoryCannotHoldIsRefusedAtItsStart() {
+  for (const Unspillable way : kUnspillable) {
+    ShortOfBoth both(400ULL << 20);
+    Spilling &spill = both.spill;
+    cannotSpill(spill, way);
+    spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
+    spill.runUntilIdle();
+    const std::string message = spill.events.failureDetails.empty() ? "" : spill.events.failureDetails.front().first;
+    const std::string code = way == Unspillable::Quota    ? "kv_disk_quota"
+                             : way == Unspillable::Closed ? "capacity_exhausted"
+                                                          : "kv_write_budget";
+    require(spill.events.failures == std::vector<std::string>{code} && spill.model.prefillChunks[1] == 0 &&
+                spill.events.retryAfters == std::vector<uint32_t>{way == Unspillable::WriteBudget ? 21'600U : 0U} &&
+                namesTheMemoryShortfall(message),
+            "a start alone that neither memory nor the SSD cache holds was not refused at its start naming both" +
+                unspillable(way) + failureDetail(spill.events));
+  }
+}
+
+// A start alone that cannot spill, whose prompt memory holds but not its projection, starts Resident
+// under the bound of the KV memory holds, as the quota bounds a Spill start's output, and ends at it with
+// Length: memory holds eight Full extents, 2,048 pages, of the 2,056 the 64K prompt and its 300 tokens of
+// output project, and so 56 tokens of output with the 7 rows past them its last decode step verifies.
+void testALoneStartTakesMemorysBound() {
+  for (const Unspillable way : kUnspillable) {
+    ShortOfBoth both(900ULL << 20);
+    Spilling &spill = both.spill;
+    cannotSpill(spill, way);
+    spill.engine.submit(Spilling::prompt(1, 1, 2'046, 300));
+    spill.runUntilIdle();
+    const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+    require(spill.events.completedCount == 1 && spill.events.failures.empty() && counts.resident == 1 &&
+                counts.spill == 0 && counts.bounded == 1 && counts.lengthEnds == 1 &&
+                spill.model.outputLimits.at(1) == 56 && spill.events.usage.at(1).second == 56 &&
+                spill.events.boundedIds == std::vector<uint64_t>{1},
+            "a start alone whose prompt memory holds did not start Resident and end at memory's bound" +
+                unspillable(way) + failureDetail(spill.events));
+  }
+}
+
+// A guard: the same start beside the next lane's pooled buffers, which cover what memory lacks,
+// starts Resident and decodes its output. The claim it makes in service takes them, as its growth
+// does; a start's would keep them, and it would not start.
+void testALoneStartCountsTheNextLanesBuffers() {
+  ShortOfBoth both(400ULL << 20, 768ULL << 20);
+  Spilling &spill = both.spill;
+  spill.engine.submit(Spilling::prompt(1, 1, 2'046, 200));
+  spill.runUntilIdle();
+  require(spill.events.completedCount == 1 && spill.events.failures.empty() &&
+              spill.events.usage.at(1).second == 200 && spill.model.pooledLaneBytes == 0,
+          "a start alone that the next lane's buffers hold did not take them and decode: " +
+              (spill.events.failureDetails.empty() ? std::string() : spill.events.failureDetails.front().first));
+}
+
+// A start alone that cannot spill and whose Resident KV memory does not hold now, but whose SSD
+// cache holds its prompt and some of its output, takes the quota's bound on its output and starts
+// Spill, as a Spill start short of its projection does: 2,050 slots hold the 64K prompt's 2,047 pages
+// and 127 tokens of its 300.
+void testALoneStartMemoryCannotHoldTakesTheQuotasBound() {
+  ShortOfBoth both(400ULL << 20, 0, 2'050);
+  Spilling &spill = both.spill;
+  spill.engine.submit(Spilling::prompt(1, 1, 2'046, 300));
+  spill.runUntilIdle();
+  const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+  require(spill.events.completedCount == 1 && spill.events.failures.empty() && counts.spill == 1 &&
+              counts.resident == 0 && spill.model.outputLimits.at(1) == 127 &&
+              spill.events.usage.at(1).second == 127 && spill.events.boundedIds == std::vector<uint64_t>{1},
+          "a start alone that memory does not hold did not start Spill under the quota's bound: " +
+              (spill.events.failureDetails.empty() ? std::string() : spill.events.failureDetails.front().first));
+}
+
+// Beside a lane in service, a start that cannot spill and whose Resident KV that lane keeps memory
+// from holding waits for it to end, then starts and decodes: it never prefills beside it.
+void testAStartMemoryCannotHoldBesideALaneWaitsForIt() {
+  for (const Unspillable way : kUnspillable) {
+    ShortOfBoth both(1'200ULL << 20);
+    Spilling &spill = both.spill;
+    cannotSpill(spill, way);
+    spill.engine.submit(Spilling::prompt(1, 1, 1'000, 100));
+    spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first lane did not decode");
+    spill.engine.submit(Spilling::prompt(2, 2, 2'046, 50));
+    bool beside = false;
+    spill.runUntil(
+        [&] {
+          beside = beside || (spill.events.completedCount == 0 && spill.model.prefillChunks[2] > 0);
+          return idle(spill.engine);
+        },
+        "the requests did not end");
+    require(!beside && spill.events.completedCount == 2 && spill.events.failures.empty() &&
+                spill.events.usage.at(2).second == 50,
+            "a start memory could not hold beside a lane prefilled beside it, or did not decode after it" +
+                unspillable(way) + failureDetail(spill.events));
+  }
+}
+
+// Beside a lane in service, a start the closed tier refuses whose prompt memory does not hold even
+// alone waits for that lane and is decided once it ends: refused at its start, naming what memory has
+// for it, never prefilled.
+void testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds() {
+  ShortOfBoth both(800ULL << 20);
+  Spilling &spill = both.spill;
+  spill.tier.writableFile = false;
+  spill.engine.submit(Spilling::prompt(1, 1, 1'000, 100));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the first lane did not decode");
+  spill.engine.submit(Spilling::prompt(2, 2, 2'046, 50));
+  spill.runUntil([&] { return spill.events.failedCount != 0; }, "the start was not refused");
+  require(spill.events.completedCount == 1 && spill.events.usage.at(1).second == 100 &&
+              spill.events.failures == std::vector<std::string>{"capacity_exhausted"} &&
+              spill.model.prefillChunks[2] == 0 &&
+              namesTheMemoryShortfall(spill.events.failureDetails.front().first),
+          "a start memory does not hold even alone was not refused at its start once the lane beside it ended" +
+              failureDetail(spill.events));
+  spill.runUntilIdle();
+}
+
+// Beside a lane of a lower priority, the same start makes that lane yield, as a start refused memory
+// does, and prefills only once it has; it decodes, and the lane decodes its output once it resumes.
+void testAStartMemoryCannotHoldBesideALowerLaneMakesItYield() {
+  ShortOfBoth both(1'200ULL << 20);
+  Spilling &spill = both.spill;
+  EngineRequest background = Spilling::prompt(1, 1, 1'000, 100);
+  background.priority = RequestPriority::Background;
+  spill.engine.submit(std::move(background));
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the Background lane did not decode");
+  EngineRequest foreground = Spilling::prompt(2, 2, 2'046, 50);
+  foreground.priority = RequestPriority::Foreground;
+  spill.engine.submit(std::move(foreground));
+  bool beside = false;
+  spill.runUntil(
+      [&] {
+        beside = beside || (spill.engine.snapshot().prioritySuspensions == 0 && spill.model.prefillChunks[2] > 0);
+        return idle(spill.engine);
+      },
+      "the requests did not end");
+  require(!beside && spill.engine.snapshot().prioritySuspensions == 1 && spill.events.completedCount == 2 &&
+              spill.events.failures.empty() && spill.events.usage.at(2).second == 50 &&
+              spill.events.usage.at(1).second == 100,
+          "a start memory could not hold prefilled beside a lower priority's lane before that lane yielded to "
+          "it, or the two did not decode");
+}
+
+// Beside a Foreground lane whose KV and projected growth keep memory from holding it, a Foreground start
+// that cannot spill waits for that lane and suspends none of the Background lanes beside it, which would
+// bring it no closer to running: they keep their lanes and KV. Once that lane ends it starts, and all four
+// decode.
+void testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning() {
+  ShortOfBoth both(1'200ULL << 20);
+  Spilling &spill = both.spill;
+  const auto submit = [&](uint64_t id, uint32_t pages, uint32_t output, RequestPriority priority) {
+    EngineRequest request = Spilling::prompt(id, static_cast<uint32_t>(id), pages, output);
+    request.priority = priority;
+    spill.engine.submit(std::move(request));
+  };
+  submit(2, 100, 300, RequestPriority::Background);
+  submit(3, 100, 300, RequestPriority::Background);
+  spill.runUntil([&] { return spill.events.outputs.contains(2) && spill.events.outputs.contains(3); },
+                 "the Background lanes did not decode");
+  submit(1, 1'000, 100, RequestPriority::Foreground);
+  spill.runUntil([&] { return spill.events.outputs.contains(1); }, "the Foreground lane did not decode");
+  submit(4, 2'046, 50, RequestPriority::Foreground);
+  // While the Foreground lane is in service: the lanes suspended, and the start's prefill chunks.
+  uint64_t suspended = 0;
+  uint32_t chunks = 0;
+  spill.runUntil(
+      [&] {
+        if (!spill.events.usage.contains(1)) {
+          const EngineSnapshot snapshot = spill.engine.snapshot();
+          suspended = snapshot.prioritySuspensions + snapshot.resourceSuspensions;
+          chunks = spill.model.prefillChunks[4];
+        }
+        return idle(spill.engine);
+      },
+      "the requests did not end");
+  require(suspended == 0 && chunks == 0 && spill.events.completedCount == 4 && spill.events.failures.empty() &&
+              spill.events.usage.at(4).second == 50 && spill.events.usage.at(2).second == 300 &&
+              spill.events.usage.at(3).second == 300,
+          "beside a lane of its priority, a start that waits for it suspended " + std::to_string(suspended) +
+              " lanes and ran " + std::to_string(chunks) + " prefill chunks, or the requests did not decode" +
+              failureDetail(spill.events));
+}
+
 // Lane demand counts the hot block floor a prefilling Spill lane waits for, and none once it holds
 // it.
 void testLaneDemandCountsTheHotFloorALaneWaitsFor() {
@@ -1023,24 +1270,37 @@ void testAQuotaRefusalReadsOnlyTheChainAStartKeeps() {
   require(spill.committedSlots() == 0, "the quota was not returned");
 }
 
-// A start that cannot spill, the tier closed or the quota short, starts Resident where its
-// projection fits the resident context alone.
-void testAStartThatCannotSpillStartsResidentWithinTheResidentContext() {
-  for (const bool closed : {true, false}) {
-    // The room beside the lanes holds 20 pages, so placement spills; the resident context is 50.
-    Spilling spill(8, false, 0, 50 * KvCache::pageTokens, {4}, {}, {.limitBytes = 20 * 100});
-    spill.tier.writableFile = !closed;
-    // 40 pages of prompt and 64 tokens of output project 43 pages; the 8
-    // slots of the quota cannot hold them.
-    spill.engine.submit(Spilling::prompt(1, 1, 40, 64));
-    spill.runUntilIdle();
-    const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
-    require(spill.events.completedCount == 1 && spill.events.usage.at(1).second == 64 &&
-                counts.resident == 1 && counts.spill == 0 && counts.refusedClosed == 0 &&
-                counts.refusedQuota == 0 && spill.tier.writes.empty(),
-            closed ? "a start that fits the resident context was refused while the tier took no writes"
-                   : "a start that fits the resident context was refused for a short quota");
-  }
+// A start alone that cannot spill, the tier closed or the quota short, and whose projection fits
+// the resident context starts Resident where memory holds it now, the next lane's pooled buffers
+// among it, and is refused at its start where it does not.
+void testAStartThatCannotSpillStartsResidentWhereMemoryHoldsIt() {
+  for (const bool closed : {true, false})
+    for (const bool buffers : {true, false}) {
+      Spilling spill(8, false, 0, 50 * KvCache::pageTokens, {4}, {}, {.limitBytes = Spilling::kGovernedLimitBytes},
+                     true);
+      spill.tier.writableFile = !closed;
+      // The room holds 20 pages, so placement spills; the resident context is 50, and the next lane's
+      // pooled buffers, where it has them, hold 60 more.
+      if (buffers)
+        poolTheNextLanesBuffers(spill, 60 * 100);
+      spill.limit(spill.held() + 20 * 100);
+      // 40 pages of prompt and 64 tokens of output project 43 pages; the 8
+      // slots of the quota cannot hold them.
+      spill.engine.submit(Spilling::prompt(1, 1, 40, 64));
+      spill.runUntilIdle();
+      const SpillRequestsSnapshot counts = spill.engine.snapshot().spill;
+      const std::string when = std::string(closed ? " while the tier took no writes" : " for a short quota");
+      if (buffers)
+        require(spill.events.completedCount == 1 && spill.events.usage.at(1).second == 64 && counts.resident == 1 &&
+                    counts.spill == 0 && counts.refusedClosed == 0 && counts.refusedQuota == 0 &&
+                    spill.model.pooledLaneBytes == 0,
+                "a start the next lane's buffers hold was refused, or did not take them," + when);
+      else
+        require(spill.events.failures ==
+                        std::vector<std::string>{closed ? "capacity_exhausted" : "kv_disk_quota"} &&
+                    (closed ? counts.refusedClosed : counts.refusedQuota) == 1 && spill.model.prefillChunks[1] == 0,
+                "a start memory did not hold started" + when);
+    }
 }
 
 // A Spill start the write budget cannot cover is refused (kv_write_budget) with a Retry-After of
@@ -2768,6 +3028,16 @@ std::span<const test::TestCase> spillTests() {
       {"testASharedPrefixCountsForNoConversion", testASharedPrefixCountsForNoConversion},
       {"testAShortOrPrefillingLaneDoesNotConvert", testAShortOrPrefillingLaneDoesNotConvert},
       {"testALoneResidentWallNamesItsModeAndPhase", testALoneResidentWallNamesItsModeAndPhase},
+      {"testALoneStartMemoryCannotHoldIsRefusedAtItsStart", testALoneStartMemoryCannotHoldIsRefusedAtItsStart},
+      {"testALoneStartCountsTheNextLanesBuffers", testALoneStartCountsTheNextLanesBuffers},
+      {"testALoneStartTakesMemorysBound", testALoneStartTakesMemorysBound},
+      {"testALoneStartMemoryCannotHoldTakesTheQuotasBound", testALoneStartMemoryCannotHoldTakesTheQuotasBound},
+      {"testAStartMemoryCannotHoldBesideALaneWaitsForIt", testAStartMemoryCannotHoldBesideALaneWaitsForIt},
+      {"testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds", testAStartMemoryNeverHoldsIsDecidedOnceTheLaneEnds},
+      {"testAStartMemoryCannotHoldBesideALowerLaneMakesItYield",
+       testAStartMemoryCannotHoldBesideALowerLaneMakesItYield},
+      {"testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning",
+       testAStartWaitingForALaneOfItsPriorityLeavesLowerLanesRunning},
       {"testALanesGrowthConvertsNoOtherLane", testALanesGrowthConvertsNoOtherLane},
       {"testLaneDemandCountsTheHotFloorALaneWaitsFor", testLaneDemandCountsTheHotFloorALaneWaitsFor},
       {"testAStartRefusedMemoryCountsNoConversion", testAStartRefusedMemoryCountsNoConversion},
@@ -2782,8 +3052,8 @@ std::span<const test::TestCase> spillTests() {
       {"testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal",
        testAStartRestoringHeldCopiesStartsBesideAQuotaRefusal},
       {"testASpillStartCountsTheCopiesItRestores", testASpillStartCountsTheCopiesItRestores},
-      {"testAStartThatCannotSpillStartsResidentWithinTheResidentContext",
-       testAStartThatCannotSpillStartsResidentWithinTheResidentContext},
+      {"testAStartThatCannotSpillStartsResidentWhereMemoryHoldsIt",
+       testAStartThatCannotSpillStartsResidentWhereMemoryHoldsIt},
       {"testWriteBudgetRefusalSaysWhenToRetry", testWriteBudgetRefusalSaysWhenToRetry},
       {"testPrefillGroupsFollowIndexPages", testPrefillGroupsFollowIndexPages},
       {"testALaneThatTakesSpilledBlocksAsItPrefillsRunsPrefillGroups",

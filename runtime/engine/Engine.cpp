@@ -925,9 +925,16 @@ bool Engine::admit(Request &active, double now) {
     }
     active.kvMode = *active.placement;
   }
+  // A request is in service when no other lane is resident
+  // (anotherResident): the host exempts it once nothing in place meets it,
+  // and it takes up to what is in use. Beside a resident lane it is a start,
+  // which takes only the cache nothing in use holds, the model's caches it
+  // rebuilds on use among them, and waits for that lane.
+  ClaimSpec spec = claimFor(active, anotherResident(active.request.id) ? ClaimClass::Start : ClaimClass::InService);
+  spec.supersedes = supersedes;
   bool commits = false;
   if (active.kvMode == KvMode::Spill) {
-    switch (admitSpill(active, resuming, chainEnd(lookup), now)) {
+    switch (admitSpill(active, resuming, chainEnd(lookup), spec, now)) {
     case SpillAdmission::Commit:
       commits = true;
       break;
@@ -940,13 +947,6 @@ bool Engine::admit(Request &active, double now) {
     }
   }
   modelRequest.maxNewTokens = active.outputLimit;
-  // A request is in service when no other lane is resident
-  // (anotherResident): the host exempts it once nothing in place meets it,
-  // and it takes up to what is in use. Beside a resident lane it is a start,
-  // which takes only the cache nothing in use holds, the model's caches it
-  // rebuilds on use among them, and waits for that lane.
-  ClaimSpec spec = claimFor(active, anotherResident(active.request.id) ? ClaimClass::Start : ClaimClass::InService);
-  spec.supersedes = supersedes;
   const auto begin = [&] {
     modelRequest.restoredTokens = lookup.resumeBoundary();
     return resuming ? model_.resume(modelRequest) : model_.begin(modelRequest);
@@ -967,20 +967,17 @@ bool Engine::admit(Request &active, double now) {
   if (!state.admission.granted()) {
     // Without a free lane the request waits for one; only memory it could
     // not get may fail it.
-    if (state.admission.failure == StateFailure::MemoryPressure &&
-        judge(state.denial, active.request.id) == Verdict::Fail) {
-      settle(active, capacityExhausted(active, "request state",
-                                       state.admission.allocationFailure));
-      return true;
+    if (state.admission.failure == StateFailure::MemoryPressure) {
+      if (judge(state.denial, active.request.id) == Verdict::Fail) {
+        settle(active, capacityExhausted(active, "request state",
+                                         state.admission.allocationFailure));
+        return true;
+      }
+      waitForMemory(active, now, state.denial);
+      return false;
     }
-    active.refusedResources = state.admission.failure == StateFailure::MemoryPressure;
     scheduler_.waitForResources(active.request.id);
     deferResourceRetry(active, now, state.denial, state.admission.failure);
-    // A start refused memory takes it from a resident of a lower priority,
-    // whose suspension makes it retry at the next pass. Memory on its way
-    // back makes no lane yield: the start waits for it.
-    if (active.refusedResources && !resuming && !state.denial.pending)
-      static_cast<void>(preemptBelow(active.request.priority, now));
     return false;
   }
   const uint64_t requestId = active.request.id;
@@ -1042,12 +1039,7 @@ bool Engine::admit(Request &active, double now) {
       active.skipCache = true;
       active.admissionProbe.reset();
     }
-    active.refusedResources = true;
-    scheduler_.waitForResources(requestId);
-    deferResourceRetry(active, now, kv.denial);
-    // As for a refused state.
-    if (!resuming && !kv.denial.pending)
-      static_cast<void>(preemptBelow(active.request.priority, now));
+    waitForMemory(active, now, kv.denial);
     return false;
   }
   // Admitted, it waits for nothing.
@@ -1915,7 +1907,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
     }
     // Score requests carry maxNewTokens == 0; only the model's finished flag
     // on the final prompt chunk completes them. A request whose output the
-    // SSD cache's quota bounded ends at that bound.
+    // SSD cache's quota or memory bounded ends at that bound.
     const bool complete =
         result.finished || (!scoring && completionTokens >= active.outputLimit);
     const bool boundEnd = complete && !result.finished && active.outputLimit < active.request.maxNewTokens;
@@ -2035,7 +2027,7 @@ Engine::LaneEnd Engine::deadlineEnd() {
   return {LaneOutcome::DeadlineExceeded, std::string(kDeadlineExceededMessage)};
 }
 
-std::string Engine::memoryShortfall(const Request &active) const {
+std::string Engine::memoryShortfall(const Request &active, const std::optional<ResidentRoom> &room) const {
   const uint64_t id = active.request.id;
   const Phase phase = scheduler_.phase(id);
   const char *const when = phase == Phase::Prefill                                   ? "in prefill"
@@ -2045,10 +2037,15 @@ std::string Engine::memoryShortfall(const Request &active) const {
   // Less Metal memory outside the server's buffers, which the limit charges
   // past the runtime reserves, fits it too: 17 MB of it on a 64 GB M5 Pro
   // serving Flash-Next.
-  return "the request, a " + std::string(active.kvMode == KvMode::Spill ? "Spill" : "Resident") + " lane of " +
-         std::to_string(active.exactTokens.size()) + " tokens " + when +
-         ", does not fit in the memory this server may use beside device_untracked_bytes=" +
-         std::to_string(governor().untrackedBytes()) + " of Metal memory outside the server's buffers";
+  const bool spill = !room && active.kvMode == KvMode::Spill;
+  std::string message = "the request, a " + std::string(spill ? "Spill" : "Resident") + " lane of " +
+                        std::to_string(active.exactTokens.size()) + " tokens " + when +
+                        ", does not fit in the memory this server may use beside device_untracked_bytes=" +
+                        std::to_string(governor().untrackedBytes()) + " of Metal memory outside the server's buffers";
+  if (room)
+    message += ": it needs memory_needed_bytes=" + std::to_string(room->needed) +
+               ", where memory_available_bytes=" + std::to_string(room->available) + " are there for it now";
+  return message;
 }
 
 Engine::LaneEnd Engine::capacityExhausted(const Request &active,
@@ -2077,7 +2074,8 @@ void Engine::finish(Request &active, EngineFinishReason reason,
   active.finalized = true;
   const uint32_t completionTokens = generatedTokens(active);
   // Only a bound of the engine's own ends a request with Length short of
-  // its output: the quota's (outputLimit) or a lone lane's at the wall.
+  // its output: the quota's or memory's (outputLimit), or a lone Spill
+  // lane's at the wall.
   const bool bounded =
       reason == EngineFinishReason::Length && completionTokens < active.request.maxNewTokens;
   events_.completed(active.request.id, reason, bounded, active.promptTokens,

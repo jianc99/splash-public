@@ -1547,10 +1547,31 @@ start's projection is its tokens plus up to 4096 output tokens. It runs
 Resident when that fits its dense history or costs no more than Spill's peak
 (its floors and the larger of its history staging and its hot block floor);
 else Resident when what a `Start` claim may take covers its Resident KV, its
-state buffers and the lanes' projected growth; else Spill. The lanes'
-projected growth (`Engine::laneDemand`) is each lane's KV up to its
-projection and the hot block floors the lanes that read spilled KV still
-lack. One rule prices a hot block floor in both
+state buffers and the lanes' projected growth (`Engine::residentRoom`); else
+Spill. A start alone is priced so too: the claim keeps what only work in
+service takes, the pooled buffers the next lane starts from among it, which
+Spill, taking less memory, leaves to the requests that follow. A Spill start
+the SSD cache cannot take (closed, its write budget spent, or its room short
+of the projection) goes on in memory only where its projection fits one
+request's resident context (`Engine::inMemory`). There it starts Resident
+where the claim its admission makes covers its Resident KV now, as placement
+prices it. Beside another lane in service that claim is a `Start`'s, whose
+test placed it Spill unless every request spills; short of it the start waits
+for memory, and a lane of a lower priority yields to it only while every lane
+in service is of a lower priority, when each suspension brings it closer to
+alone (`Engine::waitForMemory`). Alone the claim is `InService`, as its lane's
+growth is, which takes the pooled buffers the next lane starts from too, and
+short of the projection the KV it covers bounds the output, as the quota
+bounds a Spill start's, where it holds the prompt and a token past it with the
+7 rows past that its decode step verifies. Otherwise one the tier refuses is
+refused, and one whose room is short takes the SSD cache's bound on its output
+or waits for its quota as a Spill start does, and is otherwise refused at its
+start rather than fail partway through its prefill. The refusal names what the
+SSD cache has for it and, within the resident context, what memory has for its
+least start (`Engine::memoryShortfall`, as `capacity_exhausted` names memory).
+The lanes' projected growth (`Engine::laneDemand`) is each lane's KV up to its
+projection and the hot block floors the lanes that read spilled KV still lack.
+One rule prices a hot block floor in both
 (`KvBlockCache::lanesShortfallBytes`): the floors lacked count once for all
 lanes, in whole extents, and extents no lane reads above the floors are a
 rebuilt cache, not a lane's floor.
