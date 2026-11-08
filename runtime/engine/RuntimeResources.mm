@@ -288,18 +288,29 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
       throw;
     logLine("SSD cache KV storage disabled; state storage remains enabled (", error.what(), ").");
   }
-  // The volume sizes the tier before it takes anything back. A persistent
-  // tier's root holds the other caches nobody holds too.
+  // The volume sizes the tier before it takes anything back, read through
+  // diskVolume, the probe the automatic quota reads it with before the files
+  // open, for the folder they opened in: a persistent tier's root, which holds
+  // the other caches nobody holds too, else the temporary files' directory.
+  // Its links are resolved now, so that a measure after the folder went still
+  // reads the volume that holds the open files.
   std::vector<std::shared_ptr<model::SlotFile>> files{tier.states};
   if (tier.kv)
     files.push_back(tier.kv);
+  const std::filesystem::path directory =
+      tier.persistent.directory ? config.cacheRoot : std::filesystem::temp_directory_path();
+  std::error_code unresolved;
+  std::filesystem::path resolved = std::filesystem::canonical(directory, unresolved);
+  if (unresolved)
+    resolved = directory;
   tier.space = std::make_unique<DiskSpace>(
       tier.budget, config.cacheDisk.automatic, std::move(files),
+      [diskVolume = config.diskVolume, resolved] { return diskVolume(resolved); },
       tier.persistent.directory ? std::move(otherCaches) : std::vector<CacheDirectory::Idle>{});
   reportDiskTier(*tier.space, *tier.budget, config.cacheDiskWritesPerDay,
                  tier.persistent.directory
                      ? "persistent files in " + tier.persistent.directory->path().string()
-                     : "temporary files in " + std::filesystem::temp_directory_path().string(),
+                     : "temporary files in " + directory.string(),
                  tier.kv ? kvSlotBytes : 0, stateBytes);
   return tier;
 }
