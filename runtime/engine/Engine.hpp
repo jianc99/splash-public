@@ -1113,9 +1113,17 @@ private:
   // A lane of either command ends at its deadline so (tick).
   void settle(Request &request, LaneEnd end);
   [[nodiscard]] static LaneEnd deadlineEnd();
-  [[nodiscard]] static LaneEnd capacityExhausted(std::string_view what,
-                                                 metal::AllocationFailure failure,
-                                                 std::string_view detail = {});
+  // What says that memory does not hold a request, in every end for want
+  // of memory: its lane's KV mode, phase and tokens, which tell the limit it
+  // met, and the Metal memory outside the server's buffers, which the limit
+  // charges beside it (MemoryGovernor::untrackedBytes).
+  [[nodiscard]] std::string memoryShortfall(const Request &request) const;
+  // The end of a request that cannot fit even alone: what it could not
+  // allocate and why, and its memoryShortfall.
+  [[nodiscard]] LaneEnd capacityExhausted(const Request &request,
+                                          std::string_view what,
+                                          metal::AllocationFailure failure,
+                                          std::string_view detail = {}) const;
   void finish(Request &request, EngineFinishReason reason,
               std::span<const float> optionLogits);
   void finishFailure(Request &request, LaneEnd end);
