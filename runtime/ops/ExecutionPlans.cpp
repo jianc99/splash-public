@@ -22,18 +22,21 @@ void include(Workspace &bound, const Workspace &required,
 
 } // namespace
 
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device) : linear_(device) {}
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations)
+    : linear_(device, int8Activations) {}
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
     AttentionVariant variant) const {
-  return PagedAttention::prefillPlan(rows, historyTokens, queryHeads, layout, calibration().attention, variant);
+  return PagedAttention::prefillPlan(rows, historyTokens, queryHeads, layout, calibration().attention,
+                                     linear_.int8Activations(), variant);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens, AttentionVariant variant) const {
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, calibration().attention, variant);
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, calibration().attention,
+                                    linear_.int8Activations(), variant);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

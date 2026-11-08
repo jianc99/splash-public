@@ -125,7 +125,7 @@ void checkGateUpLayers() {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
-    ops::ExecutionPlans plans(device);
+    ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8, ops::GdnStateFormat::Float32);
     const auto head = target.logitsProjection.shape();
     const auto containsHead = [&](const auto &shapes) {
@@ -187,7 +187,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
-      const ops::ExecutionPlans plans(device);
+      const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
       const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
       for (const auto matrix : matrices)
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
@@ -224,7 +224,7 @@ uint64_t decodeBytes(const model::RuntimeGeometry &geometry, model::DecodeTensor
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
-  return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device))[static_cast<uint32_t>(tensor)];
+  return model::decodeTensorBytes(geometry, ops::ExecutionPlans(device, ops::Int8Activations::On))[static_cast<uint32_t>(tensor)];
 }
 
 // A block-sparse target selects its blocks through index tables of their
@@ -285,7 +285,7 @@ void checkArenasWithoutGdnLayers() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
-  const ops::ExecutionPlans plans(device);
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   // Whether `bytes` are the hybrid's but for the GDN tensors, which only the
   // hybrid's arena holds.
   const auto withoutGdn = [](const auto &hybridBytes, const auto &bytes, const auto &gdnTensors) {
@@ -387,7 +387,7 @@ void checkPrefillAttentionHistory() {
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
-  const ops::ExecutionPlans plans(device);
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
   model::QwenTargetPrefillSequence sequence;
   sequence.rows = 300;
   const auto splitsAfter = [&](uint32_t history) {

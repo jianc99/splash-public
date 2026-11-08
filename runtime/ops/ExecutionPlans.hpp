@@ -10,11 +10,13 @@
 
 namespace splash::ops {
 
-// The device's plans of every operator a model runs. One runtime owns this
-// object and production models borrow it; it never changes after creation.
+// The device's plans of every operator a model runs, at the runtime's
+// Int8Activations, which its Linear holds and its attention plans read too.
+// One runtime owns this object and production models borrow it; it never
+// changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device);
+  explicit ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations);
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
   [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
 
