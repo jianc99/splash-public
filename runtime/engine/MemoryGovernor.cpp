@@ -226,7 +226,12 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   const bool fits = engineFits && ledger_.heldBytes(scope_) <= limitBytes_ - observed - requested;
   const ClaimClass cls = hostClass(claim.spec);
   const bool hostAdmits = hostRule_.admits(cls, hostBytes(cls, bytes), claim.hostExempt);
-  if (!fits || !hostAdmits) {
+  // What the scope's work released and its allocations have not taken back
+  // pays for one of no more than that past both, under critical pressure
+  // too: the scope's net change never raises the charge, so it takes no room
+  // from the limit, the claims ranked above or the host (fund).
+  const bool funded = !overflows && bytes <= fundedBytes_;
+  if (!funded && (!fits || !hostAdmits)) {
     // The host's refusal lifts with its pressure, the limit's only once
     // memory is freed: a refusal they share is the host's.
     failure = hostAdmits ? metal::AllocationFailure::EngineBudget : metal::AllocationFailure::HostPressure;
@@ -259,6 +264,9 @@ metal::AllocationAdmission MemoryGovernor::allocationAdmission() noexcept {
       // Host headroom is an estimate; the driver can still deny the allocation.
       return error.failure();
     }
+    // Only memory allocated takes back what the scope's work released: a
+    // refusal, the driver's too, leaves it (fund).
+    fundedBytes_ = saturatingSubtract(fundedBytes_, bytes);
     return {};
   };
 }
@@ -322,9 +330,19 @@ MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
 void MemoryGovernor::release(uint64_t bytes) noexcept { reservedBytes_ = saturatingSubtract(reservedBytes_, bytes); }
 
 MemoryGovernor::Scope::Scope(MemoryGovernor &governor, ClaimId claim) noexcept
-    : governor_(governor), previousClaim_(std::exchange(governor.scope_, claim)) {}
+    : governor_(governor), previousClaim_(std::exchange(governor.scope_, claim)),
+      previousFunded_(std::exchange(governor.fundedBytes_, 0)) {}
 
-MemoryGovernor::Scope::~Scope() { governor_.scope_ = previousClaim_; }
+MemoryGovernor::Scope::~Scope() {
+  governor_.scope_ = previousClaim_;
+  governor_.fundedBytes_ = previousFunded_;
+}
+
+void MemoryGovernor::fund(uint64_t bytes) {
+  if (!scope_)
+    throw std::logic_error("memory was released for an allocation outside a claim's scope");
+  fundedBytes_ = saturatingAdd(fundedBytes_, bytes);
+}
 
 void MemoryGovernor::HostRule::sample(const std::optional<HostMemory> &host, uint64_t spareReserve, uint64_t inFlight,
                                       MemoryPressure system, uint64_t hysteresisBytes, uint64_t refusedWaitingBytes,
@@ -389,15 +407,17 @@ std::array<uint32_t, 3> MemoryGovernor::heldPages(ClaimId claim) const {
 }
 
 FreeResult MemoryGovernor::free(ClaimId claim, const Need &need) {
-  return ledger_.free(claim, need, roomBytes(), hostRule_.level() == MemoryPressure::Critical,
+  return ledger_.free(claim, need, roomBytes(), critical(),
                       hostClass(ledger_.claim(claim).spec) == ClaimClass::InService);
 }
 
 uint64_t MemoryGovernor::available(const ClaimSpec &spec, const Need &need, const RestoredChains *kept) const {
-  return ledger_.available(spec, need, roomBytes(), hostRule_.level() == MemoryPressure::Critical, kept);
+  return ledger_.available(spec, need, roomBytes(), critical(), kept);
 }
 
 bool MemoryGovernor::admits(ClaimClass cls) const noexcept { return hostRule_.admits(cls, 0, false); }
+
+bool MemoryGovernor::critical() const noexcept { return hostRule_.level() == MemoryPressure::Critical; }
 
 bool MemoryGovernor::copyDemand() const noexcept { return ledger_.copyDemand(); }
 
@@ -438,7 +458,8 @@ GrowthHost MemoryGovernor::growthHost(bool paced) {
                 sampleHostRule(sampleHost());
                 // A unit the cache funds whole changes the host by nothing:
                 // it needs only no critical pressure and no deficit, under
-                // macOS's warning too. The rest is judged as growth.
+                // macOS's warning too, since a host short of memory takes
+                // those cache units itself. The rest is judged as growth.
                 if (funded >= bytes)
                   return hostRule_.level() != MemoryPressure::Critical &&
                          !hostRule_.deficitBytes(ledger_.hostRefusedWaitingBytes(), ledger_.returning().landingBytes);

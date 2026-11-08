@@ -434,11 +434,14 @@ bool Engine::laneInService() const {
 
 SpilledExtents Engine::landedExtents() const {
   // A converted lane's moves always release the Full extents they empty:
-  // its conversion was for those bytes, which its hot block floor needs.
+  // its conversion was for those bytes, which its hot block floor needs. So
+  // do all moves under critical pressure: only those bytes pay for the Index
+  // extents the next pages move into (MemoryGovernor::fund).
   const bool converting = std::ranges::any_of(
       requests_, [](const auto &entry) { return entry.second.lane && entry.second.converted; });
-  return !converting && (spillingPrompt() || !governor().admits(ClaimClass::Start)) ? SpilledExtents::KeepRunway
-                                                                                    : SpilledExtents::Released;
+  return !converting && !governor().critical() && (spillingPrompt() || !governor().admits(ClaimClass::Start))
+             ? SpilledExtents::KeepRunway
+             : SpilledExtents::Released;
 }
 
 void Engine::spillLanded(bool controlPass) {
@@ -446,10 +449,12 @@ void Engine::spillLanded(bool controlPass) {
     return;
   // The Index runway the pages draw on refills if memory allows. Index
   // pages, the runway's included, are memory the resident Spill lanes need,
-  // like their Full pages, and a fraction of what the moves free: with no
-  // such lane in service they take only what costs nothing; with one, they
-  // are the highest-ranked such lane's, at its priority, since the room its
-  // waiting claim holds is the room its landed pages move into.
+  // like their Full pages, and a fraction of what the moves free, which
+  // pays for them past the engine's limit and the host
+  // (MemoryGovernor::fund): with no such lane in service they take only
+  // what costs nothing; with one, they are the highest-ranked such lane's,
+  // at its priority, since the room its waiting claim holds is the room its
+  // landed pages move into.
   const SpilledExtents extents = landedExtents();
   const Request *needed = nullptr;
   for (const auto &[_, active] : requests_)
@@ -457,7 +462,8 @@ void Engine::spillLanded(bool controlPass) {
       needed = &active;
   if (!needed && !controlPass)
     return;
-  static_cast<void>(allocate([&] { return cache_.spillWritten(extents); },
+  const auto fund = [&](uint64_t bytes) { governor().fund(bytes); };
+  static_cast<void>(allocate([&] { return cache_.spillWritten(extents, fund); },
                              {.cls = needed ? ClaimClass::InService : ClaimClass::Optional,
                               .rank = needed ? rankOf(*needed) : ClaimRank{},
                               .timing = NeedTiming::Immediate,
