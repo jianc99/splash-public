@@ -295,6 +295,15 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     bindings.insert(bindings.end(), {b.output, partials, counters});
     graph.add("gguf_decode_fused_m" + std::to_string(rows), std::move(bindings), params,
               {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
+    // The pipeline decodes the segments' formats alone, each once in
+    // ascending order and the last repeated to three, so projections of one
+    // format set share it (gguf_linear.metal, fused_formats).
+    std::array<uint32_t, kFusedSegments> formats{};
+    for (size_t i = 0; i < order.size(); ++i) formats[i] = order[i]->formatId;
+    std::sort(formats.begin(), formats.begin() + order.size());
+    const auto distinct = std::unique(formats.begin(), formats.begin() + order.size());
+    std::fill(distinct, formats.end(), distinct[-1]);
+    graph.specialize(formats);
   };
   if (w.phase == LinearPhase::Prefill) {
     // A fused projection's chunk runs its segments in one dispatch, as decode
