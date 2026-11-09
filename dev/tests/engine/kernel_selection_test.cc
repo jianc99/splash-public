@@ -4,12 +4,15 @@
 // Each (device, section, group) holds the FNV-1a-64 of its plan lines; the
 // golden file holds one line per group. A change of selection shows as the
 // groups it changes, and --dump <dir> writes every plan line to diff them.
+// Against the golden, it also checks that startup warmup's prefill chunks
+// select every plan a prefill chunk selects (warmupCovers).
 //
 //   kernel-selection <golden>            compare against the golden
 //   kernel-selection --write <golden>    write it
 //   kernel-selection --dump <dir> [...]  also write the plan lines
 #include "TestChecks.hpp"
 #include "model/ModelDescriptor.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/KernelSelection.hpp"
 
@@ -25,6 +28,7 @@
 #include <iterator>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -300,13 +304,16 @@ void projections(Golden &golden, const std::string &name, const ExecutionPlans &
   }
 }
 
+// The float formats and quantized rows, and the columns, of float tiles.
+constexpr uint32_t kFloatFormats[] = {QuantizedSegment::kFloat32, GGUF_FMT_BF16, GGUF_FMT_Q4K, GGUF_FMT_Q80,
+                                      GGUF_FMT_AF8G64, GGUF_FMT_AF4G64};
+constexpr uint32_t kFloatColumns[] = {8, 64, 96, 128, 256, 320, 512, 1024, 2048, 4096};
+
 // The float tile of rows x columns of each float format and quantized rows.
 void floatTiles(Golden &golden, const std::string &name, const Linear &linear) {
-  constexpr uint32_t formats[] = {QuantizedSegment::kFloat32, GGUF_FMT_BF16, GGUF_FMT_Q4K, GGUF_FMT_Q80,
-                                  GGUF_FMT_AF8G64, GGUF_FMT_AF4G64};
-  for (const uint32_t format : formats) {
+  for (const uint32_t format : kFloatFormats) {
     Group &group = golden.group(name, "float-tile", formatName(format));
-    for (const uint32_t columns : {8U, 64U, 96U, 128U, 256U, 320U, 512U, 1024U, 2048U, 4096U}) {
+    for (const uint32_t columns : kFloatColumns) {
       std::string line = "columns " + std::to_string(columns) + ":";
       for (uint32_t rows = 1; rows <= 2048; rows += rows < 64 ? 1 : 16)
         line += linear.ggufFloatTile(rows, columns, format) == FloatTile::NeuralAccelerator ? 'a' : 's';
@@ -439,19 +446,27 @@ std::string describe(const VerifyAttentionPlan &plan) {
          std::to_string(plan.sinks);
 }
 
+// The tokens of history the attention plans are planned after.
+constexpr uint32_t kHistories[] = {0, 1, 511, 2047, 4096, 32768, 65536, 131072, 262144};
+
+// The variants a family's attention layers run (QwenTargetGeometry::attentionVariant).
+template <class Family> std::vector<AttentionVariant> attentionVariants(const Family &family) {
+  std::vector<AttentionVariant> variants;
+  const kv::Layout base = family.kvLayout();
+  for (uint32_t a = 0; a < base.attentionLayers; ++a) {
+    const AttentionVariant v{.rotated = a >= 64 || !(family.unrotatedLayers >> a & 1),
+                             .windowTokens = base.windowed(a) ? base.windowTokens : 0};
+    if (std::find(variants.begin(), variants.end(), v) == variants.end()) variants.push_back(v);
+  }
+  return variants;
+}
+
 void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlans &plans) {
   constexpr uint32_t rowsList[] = {1, 7, 8, 64, 255, 256, 300, 512, 1024, 2048};
-  constexpr uint32_t histories[] = {0, 1, 511, 2047, 4096, 32768, 65536, 131072, 262144};
   model::forEachFamily([&](const auto &family) {
     const std::string f(family.family);
-    // The variants its attention layers run (QwenTargetGeometry::attentionVariant).
-    std::vector<AttentionVariant> variants;
+    const std::vector<AttentionVariant> variants = attentionVariants(family);
     const kv::Layout base = family.kvLayout();
-    for (uint32_t a = 0; a < base.attentionLayers; ++a) {
-      const AttentionVariant v{.rotated = a >= 64 || !(family.unrotatedLayers >> a & 1),
-                               .windowTokens = base.windowed(a) ? base.windowTokens : 0};
-      if (std::find(variants.begin(), variants.end(), v) == variants.end()) variants.push_back(v);
-    }
     Group &prefill = golden.group(name, "attention-prefill", f);
     Group &verify = golden.group(name, "attention-verify", f);
     Group &workspace = golden.group(name, "attention-workspace", f);
@@ -463,14 +478,14 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
         const std::string variant =
             fmt + (v.rotated ? " rope" : " nope") + " window " + std::to_string(v.windowTokens);
         for (const uint32_t rows : rowsList)
-          for (const uint32_t history : histories)
+          for (const uint32_t history : kHistories)
             prefill.add(variant + " rows " + std::to_string(rows) + " history " + std::to_string(history) + ": " +
                         attempt([&] {
                           return describe(
                               plans.prefillAttention(rows, history, family.attentionQueryHeads, layout, v));
                         }));
         for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes)
-          for (const uint32_t history : histories) {
+          for (const uint32_t history : kHistories) {
             std::vector<uint32_t> each(lanes, history);
             if (lanes > 1) each.front() = history / 2;
             verify.add(variant + " lanes " + std::to_string(lanes) + " history " + std::to_string(history) + ": " +
@@ -486,6 +501,116 @@ void attentionPlans(Golden &golden, const std::string &name, const ExecutionPlan
       workspace.add(fmt + " verify per lane: " + attempt([&] {
                       return describe(plans.verifyAttentionWorkspacePerLane(family.attentionQueryHeads, layout));
                     }));
+    }
+  });
+}
+
+// ---- Warmup ---------------------------------------------------------------
+
+// The rows and history of the first prefill chunk, of 1 to 2048 rows after
+// each of `histories`, whose `select(rows, history)` no warmup chunk's is (a
+// chunk of each of `warm` rows, from no history); nothing when there is none.
+template <class Select>
+std::optional<std::pair<uint32_t, uint32_t>> unwarmed(std::span<const uint32_t> warm,
+                                                      std::span<const uint32_t> histories, const Select &select) {
+  std::set<decltype(select(1U, 0U))> warmed;
+  for (const uint32_t rows : warm) warmed.insert(select(rows, 0U));
+  for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows)
+    for (const uint32_t history : histories)
+      if (!warmed.contains(select(rows, history))) return std::pair{rows, history};
+  return std::nullopt;
+}
+
+// Startup warmup runs a prefill chunk of the fewest rows of each class
+// (ExecutionPlans::prefillRowClasses) and one of the most, from no history,
+// and a chunk whose plans none of them selects creates its kernels while its
+// request waits: 19 s for the 27B's cold 17-row chunk on a 16-core Apple9
+// plan. So every plan a chunk of 1 to 2048 rows selects is a warmup chunk's:
+// its projections' tile and staged height, whole and of its one read row
+// (Linear::prefillPlan), with the Neural Engine split from any of its least
+// rows or without it; its float tiles; its MoE blocks' expert and router
+// tiles; and after each of kHistories, its attention's kernels. Adds each
+// that is not to `misses`. It checks one matrix shape and the columns of
+// kFloatColumns; the other kernels a chunk's rows pick, the staged norm and
+// the hyper-connection norm's quarters (single thresholds today, whose sides
+// the chunks of one row and of the most take) and those of GDN, the draft and
+// vision, only the backend's count of pipelines created while serving checks.
+void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
+  std::vector<uint32_t> warm = plans.prefillRowClasses();
+  warm.push_back(SPLASH_PREFILL_TOKEN_BUDGET);
+  constexpr uint32_t noHistory[] = {0};
+  const auto check = [&](const std::string &what, std::span<const uint32_t> histories, const auto &select) {
+    if (const auto chunk = unwarmed(warm, histories, select))
+      misses.push_back(name + " " + what + ": no warmup chunk selects the plan of " + std::to_string(chunk->first) +
+                       " rows after " + std::to_string(chunk->second) + " tokens");
+  };
+  const Linear &linear = plans.linear();
+  // A projection plan's tile, and a staged tile's height, which names its kernels.
+  const auto tile = [](const LinearPlan &plan) {
+    const LinearTile t = plan.configuration().tile;
+    return uint32_t(t) << 8 | (t == LinearTile::GgufStaged ? plan.storageRows() : 0);
+  };
+  // Of one matrix, whose shape the tile a chunk's rows pick does not follow,
+  // in each set of formats the plans tell apart.
+  std::vector<UnitFormats> units;
+  for (const FormatSet &set : formatSets()) {
+    std::optional<Projection> p;
+    try {
+      p.emplace(projection(projectionCases().front(), set));
+    } catch (const std::exception &) {
+      continue;
+    }
+    const Projection *unit = &*p;
+    const UnitFormats formats = unitFormats(std::span(&unit, 1));
+    if (std::ranges::find(units, formats) != units.end()) continue;
+    units.push_back(formats);
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
+      std::vector<uint32_t> whole(SPLASH_PREFILL_TOKEN_BUDGET + 1), read(SPLASH_PREFILL_TOKEN_BUDGET + 1);
+      for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
+        whole[rows] = tile(linear.prefillPlan(*p, rows, epilogue));
+        read[rows] = tile(linear.prefillPlan(*p, 1, epilogue, rows));
+      }
+      const std::string what = "projection " + set.name + " e" + std::to_string(unsigned(epilogue));
+      check(what, noHistory, [&](uint32_t rows, uint32_t) { return whole[rows]; });
+      check(what + " read row", noHistory, [&](uint32_t rows, uint32_t) { return read[rows]; });
+      for (uint32_t least = AneFfn::kMinimumRows; least <= AneFfn::kMaximumRows; least += AneFfn::kProgramStep)
+        check(what + " split from " + std::to_string(least), noHistory,
+              [&](uint32_t rows, uint32_t) { return whole[rows] << 1 | (rows >= least); });
+    }
+  }
+  for (const uint32_t format : kFloatFormats)
+    for (const uint32_t columns : kFloatColumns)
+      check("float tile " + formatName(format) + " columns " + std::to_string(columns), noHistory,
+            [&](uint32_t rows, uint32_t) { return linear.ggufFloatTile(rows, columns, format); });
+  model::forEachFamily([&](const auto &family) {
+    const std::string f(family.family);
+    if (family.ffnKind == model::QwenFfnKind::SparseMoe) {
+      const MoeShape shape = family.moeBlockShape();
+      std::vector<MoeFormats> seen;
+      for (const MoeFormatSet &set : moeFormatSets()) {
+        const MoeFormats formats = formatsOf(moeBlocks(shape, set));
+        if (std::ranges::find(seen, formats) != seen.end()) continue;
+        seen.push_back(formats);
+        const auto config = [&](uint32_t rows) {
+          return selectMoe(plans.calibration(), shape, formats, rows, MoePhase::Prefill);
+        };
+        check("moe experts " + f + " " + set.name, noHistory,
+              [&](uint32_t rows, uint32_t) { return config(rows).expertTile; });
+        check("moe router " + f + " " + set.name, noHistory,
+              [&](uint32_t rows, uint32_t) { return config(rows).ggufRouterTile; });
+      }
+    }
+    for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+      kv::Layout layout = family.kvLayout();
+      layout.format = format;
+      for (const AttentionVariant &v : attentionVariants(family))
+        check("attention " + f + (format == kv::Format::Int8 ? " int8" : " bf16") + " window " +
+                  std::to_string(v.windowTokens) + (v.rotated ? " rope" : " nope"),
+              kHistories, [&](uint32_t rows, uint32_t history) {
+                const PrefillAttentionPlan plan =
+                    plans.prefillAttention(rows, history, family.attentionQueryHeads, layout, v);
+                return plan.splitPipeline + " " + plan.reducePipeline;
+              });
     }
   });
 }
@@ -576,6 +701,16 @@ int main(int argc, char **argv) {
     }
     std::cout << "PASS kernel selection: " << computed.groups().size() << " groups of " << std::size(kDevices)
               << " devices match the golden\n";
+    std::vector<std::string> misses;
+    for (const auto [family, cores] : kDevices)
+      warmupCovers(std::to_string(family) + "," + std::to_string(cores), ExecutionPlans(device(family, cores)),
+                   misses);
+    if (!misses.empty()) {
+      for (size_t i = 0; i < misses.size() && i < 40; ++i) std::cerr << misses[i] << '\n';
+      throw std::runtime_error(std::to_string(misses.size()) + " selections pick a plan no warmup chunk selects");
+    }
+    std::cout << "PASS kernel selection: warmup's prefill chunks select every plan of " << std::size(kDevices)
+              << " devices\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL kernel selection: " << error.what() << '\n';
