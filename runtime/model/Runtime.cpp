@@ -604,7 +604,8 @@ struct Runtime::Impl {
                                                 geometry.prefillChunks);
                         },
                         value.model.target)),
-        draftModel(value.model.draft, value.backend, operators),
+        draftModel(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
+                   geometry.target.draftVocabulary),
         aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
@@ -2161,18 +2162,20 @@ struct Runtime::Impl {
     buffers.ropeSin = d(DecodeTensor::DraftRopeSin);
     buffers.gateScratch = decodeArena->gateScratch();
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addDecode(graph, std::move(buffers),
-                         targetModel->vocabularyProjection(),
-                         std::span(cacheLengths).first(lanes));
     std::array<uint32_t, kLaneCount> anchors{};
+    std::array<std::span<const uint32_t>, kLaneCount> tokens{};
     std::array<ops::SamplingPolicy, kLaneCount> policies{};
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       Request &entry = laneEntry(entries, lane);
       if (!entry.pendingToken)
         throw std::invalid_argument("draft batch lane has no anchor");
       anchors[lane] = *entry.pendingToken;
+      tokens[lane] = entry.tokens;
       policies[lane] = samplingPolicy(entry);
     }
+    const ops::DraftVocabulary vocabulary = DFlashDraft::vocabulary(
+        geometry.target.draftVocabulary, std::span(tokens).first(lanes), std::span(anchors).first(lanes));
+    draftModel.addDecode(graph, std::move(buffers), vocabulary, std::span(cacheLengths).first(lanes));
     draftModel.addSelection(
         graph,
         {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
@@ -2180,7 +2183,7 @@ struct Runtime::Impl {
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
-        std::span(anchors).first(lanes), std::span(policies).first(lanes));
+        vocabulary, std::span(anchors).first(lanes), std::span(policies).first(lanes));
     ops::VerifyRowsModel verify;
     if (verifyBudget && !verifyBudget->explores(lanes, constrained)) {
       const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();

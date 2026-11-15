@@ -38,15 +38,22 @@ DraftSelectorWorkspace DraftSelector::workspace(uint32_t positions) {
 void DraftSelector::add(metal::CommandGraph &graph,
                         const DraftSelectorBuffers &buffers,
                         const DraftCodebooks &codebooks,
+                        DraftVocabulary vocabulary,
                         std::span<const uint32_t> anchors,
                         std::span<const SamplingPolicy> policies) const {
   if (anchors.empty() || anchors.size() != policies.size() ||
       anchors.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
     throw std::invalid_argument("invalid draft selector batch");
+  if (vocabulary.leading > vocabulary.trailing || vocabulary.trailing > vocabulary_ || !vocabulary.columns(vocabulary_))
+    throw std::invalid_argument("a draft's tokens lie in its vocabulary");
   const uint32_t lanes = static_cast<uint32_t>(anchors.size());
+  const uint32_t columns = vocabulary.columns(vocabulary_);
   SelectorBatchParams params{};
   params.lanes = lanes;
   params.vocabulary = vocabulary_;
+  params.columns = columns;
+  params.leading = vocabulary.leading;
+  params.trailing = vocabulary.trailing;
   for (uint32_t lane = 0; lane < lanes; ++lane) {
     params.anchor[lane] = anchors[lane];
     params.temperature[lane] = policies[lane].temperature;
@@ -59,7 +66,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   const DraftSelectorWorkspace workspace = DraftSelector::workspace(lanes * kPositions);
   const uint64_t rows = uint64_t{lanes} * SPLASH_DRAFT_QUERY_ROWS;
   const uint64_t codebook = uint64_t{vocabulary_} * SPLASH_DRAFT_SELECTOR_RANK * 2;
-  requireBytes(buffers.logits, rows * vocabulary_ * sizeof(float), "draft logits");
+  requireBytes(buffers.logits, rows * columns * sizeof(float), "draft logits");
   requireBytes(buffers.partialIds, workspace.partialIdsBytes, "draft selector partial id");
   requireBytes(buffers.partialValues, workspace.partialValuesBytes, "draft selector partial value");
   requireBytes(buffers.candidates, workspace.candidatesBytes, "draft candidate");
@@ -78,7 +85,7 @@ void DraftSelector::add(metal::CommandGraph &graph,
   }
   graph.add("draft_select_top16_sharded",
             {buffers.logits, buffers.partialIds, buffers.partialValues},
-            vocabulary_, {uint64_t{lanes} * kPositions * kShards, 1, 1});
+            params, {uint64_t{lanes} * kPositions * kShards, 1, 1});
   graph.add("draft_select_edges",
             {buffers.partialIds, buffers.partialValues, buffers.candidates,
              buffers.unary, buffers.selectorHidden, codebooks.predecessor,

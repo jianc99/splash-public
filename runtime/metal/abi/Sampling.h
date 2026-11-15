@@ -167,17 +167,23 @@ static_assert(sizeof(ThinkingCutoffParams) == 220,
 
 // The batched selector and acceptance kernels' grids cover exactly the
 // dispatch's lanes: per-lane arrays hold those lanes, and entries past them
-// are zero and unread.
+// are zero and unread. The draft's logits rows hold `columns` tokens of the
+// vocabulary's (ops::DraftVocabulary): column c is token c below `leading`
+// and token c - leading + trailing from there; the codebooks hold a row of
+// each of the `vocabulary` tokens.
 struct SelectorBatchParams {
   uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
   uint32_t sampling_mask;
   uint32_t vocabulary;
+  uint32_t columns;
+  uint32_t leading;
+  uint32_t trailing;
 };
 
-static_assert(sizeof(SelectorBatchParams) == 44,
-              "Draft selector parameters are 44 bytes on both sides");
+static_assert(sizeof(SelectorBatchParams) == 56,
+              "Draft selector parameters are 56 bytes on both sides");
 
 // The rows of its block each lane of a decode cycle verifies (its verify
 // rows, draft_verify_rows), chosen for the whole batch by expected accepted
