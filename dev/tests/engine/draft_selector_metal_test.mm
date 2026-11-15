@@ -149,10 +149,6 @@ void runCase(MetalBackend &backend, const Case &c) {
   const uint32_t rows = c.lanes * kRows;
   const uint32_t positions = c.lanes * kPositions;
   const uint32_t columns = c.tokens.columns(c.vocabulary);
-  // The token of a logits column.
-  const auto token = [&](uint32_t column) {
-    return column < c.tokens.leading ? column : column - c.tokens.leading + c.tokens.trailing;
-  };
   const auto workspace = DraftSelector::workspace(positions);
   const DraftSelector selector(c.vocabulary);
 
@@ -223,7 +219,7 @@ void runCase(MetalBackend &backend, const Case &c) {
         const uint32_t id = candidates[global * kCandidates + rank];
         const float value = unary[global * kCandidates + rank];
         if (rank < expected.size()) {
-          require(id == token(expected[rank]) && value == row[expected[rank]],
+          require(id == c.tokens.token(expected[rank]) && value == row[expected[rank]],
                   "draft top-16 candidates differ from the exact sorted order of their tokens");
         } else {
           require(id == 0xFFFFFFFFU && value == -INFINITY,
