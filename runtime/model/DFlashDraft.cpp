@@ -153,19 +153,26 @@ ops::DraftVocabulary DFlashDraft::vocabulary(ops::DraftVocabulary subset,
   return subset;
 }
 
+DFlashDraftStep DFlashDraft::step(std::span<const uint32_t> cacheLengths,
+                                  std::span<const std::span<const uint32_t>> tokens,
+                                  std::span<const uint32_t> anchors,
+                                  std::span<const ops::SamplingPolicy> policies) const {
+  if (cacheLengths.size() != anchors.size() || policies.size() != anchors.size())
+    throw std::invalid_argument("a draft step's lanes each have a cache length, an anchor and a policy");
+  return {cacheLengths, anchors, policies, vocabulary(subset_, tokens, anchors)};
+}
+
 const ops::Projection &DFlashDraft::head(ops::DraftVocabulary vocabulary) const {
   if (vocabulary == subset_) return subsetHead_;
   if (vocabulary == ops::DraftVocabulary{}) return head_;
   throw std::invalid_argument("a draft proposes from the whole vocabulary or its subset");
 }
 
-void DFlashDraft::addSelection(
-    metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
-    ops::DraftVocabulary vocabulary, std::span<const uint32_t> anchors,
-    std::span<const ops::SamplingPolicy> policies) const {
+void DFlashDraft::addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
+                               const DFlashDraftStep &step) const {
   selector_.add(graph, buffers,
                 {weights_.predecessorCodebook, weights_.successorCodebook},
-                vocabulary, anchors, policies);
+                step.vocabulary, step.anchors, step.policies);
 }
 
 void DFlashDraft::addContextPrefill(
@@ -260,10 +267,9 @@ uint32_t DFlashDraft::decodeStorageLanes(uint32_t lanes) const {
   return storageRows / ExecutionLimits::draftQueryRows;
 }
 
-void DFlashDraft::addDecode(
-    metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-    ops::DraftVocabulary vocabulary,
-    std::span<const uint32_t> cacheLengths) const {
+void DFlashDraft::addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
+                            const DFlashDraftStep &step) const {
+  const std::span<const uint32_t> cacheLengths = step.cacheLengths;
   const uint32_t lanes = static_cast<uint32_t>(cacheLengths.size());
   if (!lanes || lanes > ExecutionLimits::maximumBatchWidth ||
       buffers.persistentKeys.size() != weights_.layout.layers ||
@@ -349,7 +355,7 @@ void DFlashDraft::addDecode(
   // its scratch is sized (DecodeArena::linearScratchSize): only the draft's
   // own projections keep bf16 activations.
   const ops::Linear &target = operators_.linear();
-  const ops::Projection &vocabularyProjection = head(vocabulary);
+  const ops::Projection &vocabularyProjection = head(step.vocabulary);
   const ops::LinearPlan headPlan = target.decodePlan(vocabularyProjection, lanes);
   const ops::PreparedInput finalHidden = ops::Normalization::addRms(
       graph, buffers.hidden[weights_.layout.layers & 1], weights_.finalNorm,

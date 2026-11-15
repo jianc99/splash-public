@@ -234,6 +234,17 @@ class DraftCheckpointLoader;
 loadDFlashDraftWeights(metal::MetalBackend &backend, DraftCheckpointLoader &files,
                        DFlashDraftLayout layout);
 
+// A draft decode step (DFlashDraft::step): each lane's cache length, anchor
+// and sampling policy, and the one vocabulary the step proposes from, whose
+// columns its head writes (DFlashDraft::addDecode) and its selection reads
+// (addSelection).
+struct DFlashDraftStep final {
+  std::span<const uint32_t> cacheLengths;
+  std::span<const uint32_t> anchors;
+  std::span<const ops::SamplingPolicy> policies;
+  ops::DraftVocabulary vocabulary;
+};
+
 // Builds the draft layer graph and its proposal selection
 // (ops::DraftSelector) from batch buffers and persistent context; the
 // target's sampling and acceptance policy remain outside the model. Its
@@ -260,6 +271,13 @@ public:
   [[nodiscard]] static ops::DraftVocabulary vocabulary(ops::DraftVocabulary subset,
                                                        std::span<const std::span<const uint32_t>> tokens,
                                                        std::span<const uint32_t> anchors);
+  // The step of lanes of `cacheLengths`, `anchors` and `policies` whose
+  // tokens before their anchors are `tokens`, over the vocabulary they choose
+  // of this draft's subset (vocabulary).
+  [[nodiscard]] DFlashDraftStep step(std::span<const uint32_t> cacheLengths,
+                                     std::span<const std::span<const uint32_t>> tokens,
+                                     std::span<const uint32_t> anchors,
+                                     std::span<const ops::SamplingPolicy> policies) const;
 
   void addContextPrefill(metal::CommandGraph &graph,
                          DFlashPrefillBuffers buffers, uint32_t rows,
@@ -279,16 +297,11 @@ public:
   // Lanes of storage the draft's own projections bind in a decode step or
   // context commit of `lanes` lanes (ops::Linear::decodeStorageRows).
   [[nodiscard]] uint32_t decodeStorageLanes(uint32_t lanes) const;
-  // A step's draft layers and its logits over `vocabulary`, the whole
-  // vocabulary or the subset, and its proposals from them.
-  void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers,
-                 ops::DraftVocabulary vocabulary,
-                 std::span<const uint32_t> cacheLengths) const;
-  void addSelection(metal::CommandGraph &graph,
-                    const ops::DraftSelectorBuffers &buffers,
-                    ops::DraftVocabulary vocabulary,
-                    std::span<const uint32_t> anchors,
-                    std::span<const ops::SamplingPolicy> policies) const;
+  // A step's draft layers and its logits over its vocabulary, then its
+  // proposals from them.
+  void addDecode(metal::CommandGraph &graph, DFlashDecodeBuffers buffers, const DFlashDraftStep &step) const;
+  void addSelection(metal::CommandGraph &graph, const ops::DraftSelectorBuffers &buffers,
+                    const DFlashDraftStep &step) const;
   // Sets each of `lanes` lanes' mask rows of the draft input `rows` (all but
   // its anchor's, row 0 of its draftQueryRows) to the mask embedding the
   // checkpoint ships; without one they keep the target table's row.

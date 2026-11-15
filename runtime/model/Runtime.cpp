@@ -2173,9 +2173,10 @@ struct Runtime::Impl {
       tokens[lane] = entry.tokens;
       policies[lane] = samplingPolicy(entry);
     }
-    const ops::DraftVocabulary vocabulary = DFlashDraft::vocabulary(
-        geometry.target.draftVocabulary, std::span(tokens).first(lanes), std::span(anchors).first(lanes));
-    draftModel.addDecode(graph, std::move(buffers), vocabulary, std::span(cacheLengths).first(lanes));
+    const DFlashDraftStep step =
+        draftModel.step(std::span(cacheLengths).first(lanes), std::span(tokens).first(lanes),
+                        std::span(anchors).first(lanes), std::span(policies).first(lanes));
+    draftModel.addDecode(graph, std::move(buffers), step);
     draftModel.addSelection(
         graph,
         {d(DecodeTensor::Logits), d(DecodeTensor::TopPartialIds),
@@ -2183,7 +2184,7 @@ struct Runtime::Impl {
          d(DecodeTensor::Unary), d(DecodeTensor::SelectorHidden),
          d(DecodeTensor::SamplingUniforms), d(DecodeTensor::ProposedTokens),
          d(DecodeTensor::ProposalProbs), d(DecodeTensor::VerifyConfidence)},
-        vocabulary, std::span(anchors).first(lanes), std::span(policies).first(lanes));
+        step);
     ops::VerifyRowsModel verify;
     if (verifyBudget && !verifyBudget->explores(lanes, constrained)) {
       const VerifyBudget::Acceptance &acceptance = verifyBudget->acceptance();
