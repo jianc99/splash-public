@@ -156,6 +156,23 @@ struct ChatContextFlowTests {
         }
     }
 
+    /// What was typed while a read was in flight is read once it ends, without waiting for the
+    /// next keystroke.
+    @Test func whatWasTypedDuringAReadIsReadWhenItEnds() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.newChat()
+            try fixture.holdAhead()
+            let paragraph = "The parser walks the tokens once and keeps a stack of the open blocks. "
+            try await type(String(repeating: paragraph, count: 3), in: state)
+            try await fixture.aheadHeld()
+            try await type(String(repeating: paragraph, count: 3), in: state)
+            try fixture.releaseAhead()
+            try? await waitFor((try? fixture.readAhead().count) == 2, "the second read")
+            #expect(try fixture.readAhead().last == state.draft.text.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
     @Test func sendingLeavesTheReadAheadToFinish() async throws {
         try await withServer { fixture in
             let state = fixture.state

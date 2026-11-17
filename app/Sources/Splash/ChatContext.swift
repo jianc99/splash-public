@@ -154,8 +154,10 @@ final class ReadAhead {
 
     private let reader: Reader
     private let delay: Duration
-    /// The prompt read last, or being read, and the read in flight or waiting for the pause.
+    /// The prompt read last, or being read, and the read in flight or waiting for the pause; and
+    /// the prompt as it is now, which a read that ends looks at again.
     private var read: ChatContext.Request?
+    private var latest: ChatContext.Request?
     private var reading = false
     private var task: Task<Void, Never>?
 
@@ -166,9 +168,11 @@ final class ReadAhead {
 
     /// Takes the next prompt as it changes, nil while there is none to read: no model answers, a
     /// reply streams or nothing is written. A read in flight goes on while the prompt only grows
-    /// past it, or is sent, and stops when its text is no longer the start of the prompt's (an
-    /// edit inside it), or the chat or the model changes.
+    /// past it, is sent, or is none, as in a chat with nothing written; it stops when the prompt is
+    /// another chat's or model's, or its text no longer starts with what was read (an edit inside
+    /// it). The draft grown while a read was in flight is read once that read ends.
     func refresh(_ request: ChatContext.Request?) {
+        latest = request
         if reading, let read, let request, !request.continues(read) {
             task?.cancel()
             reading = false
@@ -185,7 +189,10 @@ final class ReadAhead {
             read = request
             reading = true
             await reader(request)
-            if read == request { reading = false }
+            if read == request {
+                reading = false
+                refresh(latest)
+            }
         }
     }
 }
