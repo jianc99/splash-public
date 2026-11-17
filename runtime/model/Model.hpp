@@ -973,6 +973,10 @@ public:
   virtual WarmupStepResult warmupPrefill(uint32_t rows) = 0;
   virtual WarmupStepResult warmupDecodeBatch(uint32_t width) = 0;
   virtual WarmupStepResult warmupCompositeStateRestore() = 0;
+  // After the start's last warmup: forgets what the warmups' made-up rows
+  // left in memory that a request would otherwise inherit (a streamed expert
+  // store's experts, ExpertStore::forget).
+  virtual void endWarmups() = 0;
   [[nodiscard]] virtual ModelMemoryActual actualRuntimeMemory() const = 0;
   [[nodiscard]] virtual ModelTelemetry telemetry() const noexcept = 0;
 };

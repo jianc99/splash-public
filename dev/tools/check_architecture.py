@@ -235,7 +235,8 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # disk.weights_read_bytes (Status.cpp).
 # 30,691: +48 for a Background request held back 10 s being ordered as Normal
 # (Scheduler.cpp 33, Scheduler.hpp 12, Engine.cpp 3).
-ENGINE_LINE_BUDGET = 30_691
+# 30,692: +1 for the start ending its warmups (Bootstrap.mm).
+ENGINE_LINE_BUDGET = 30_692
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
