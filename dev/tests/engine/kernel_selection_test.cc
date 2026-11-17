@@ -486,6 +486,13 @@ std::vector<MoeFormatSet> moeFormatSets() {
   sets.push_back({"router-mixed", {{GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, f32},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16},
                                    {GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_BF16}}});
+  // MLX experts: 4- and 5-bit ones take the int8 prefill passes where the
+  // device's plans run int8 activations (moeInt8Experts); 3-bit ones (Flint's)
+  // and 4-bit experts beside other shared experts keep the staged passes.
+  for (const uint32_t bits : {GGUF_FMT_AF3G64, GGUF_FMT_AF4G64, GGUF_FMT_AF5G64})
+    sets.push_back({formatName(bits), std::vector<BlockFormats>(4, {bits, bits, bits, bits, GGUF_FMT_AF8G64})});
+  sets.push_back({"af4g64-shared-q8_0", std::vector<BlockFormats>(4, {GGUF_FMT_AF4G64, GGUF_FMT_AF4G64, GGUF_FMT_AF4G64,
+                                                                      GGUF_FMT_Q80, GGUF_FMT_AF8G64})});
   return sets;
 }
 
@@ -504,18 +511,20 @@ std::vector<BlockMoeWeights> moeBlocks(const MoeShape &shape, const MoeFormatSet
   return blocks;
 }
 
-// The router format of the target's MoE blocks, as its loaded weights give
-// it (QwenTargetGeometry::finish).
-uint32_t routerFormatOf(const std::vector<BlockMoeWeights> &blocks) {
+// The router format of the target's MoE blocks and whether their experts
+// take the int8 prefill passes, as its loaded weights give them
+// (QwenTargetGeometry::finish).
+std::pair<uint32_t, bool> routerFormatOf(const std::vector<BlockMoeWeights> &blocks) {
   std::vector<const BlockMoeWeights *> pointers;
   for (const BlockMoeWeights &block : blocks) pointers.push_back(&block);
-  return moeRouterFormat(pointers);
+  return {moeRouterFormat(pointers), moeInt8Experts(pointers)};
 }
 
 std::string describe(const MoePlan &plan) {
   const MoeConfig c = plan.configuration();
   std::ostringstream line;
-  line << "tile " << unsigned(c.expertTile) << " router " << unsigned(c.ggufRouterTile) << " tiles "
+  line << "tile " << unsigned(c.expertTile) << " router " << unsigned(c.ggufRouterTile) << " int8 " << c.int8Passes
+       << " tiles "
        << plan.maximumTiles() << " workspace";
   for (const auto field : kMoeWorkspaceFields) line << " " << plan.workspace().*field;
   return line.str();
@@ -532,8 +541,9 @@ void moePlans(Golden &golden, const std::string &name, const ExecutionPlans &pla
     if (family.ffnKind != model::QwenFfnKind::SparseMoe) return;
     const std::string f(family.family);
     for (const MoeFormatSet &set : sets) {
-      const MoeShape shape = family.moeBlockShape();
-      const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set));
+      MoeShape shape = family.moeBlockShape();
+      const auto [routerFormat, int8Experts] = routerFormatOf(moeBlocks(shape, set));
+      shape.int8Experts = int8Experts;
       Group &decode = golden.group(name, "moe-decode", f);
       Group &prefill = golden.group(name, "moe-prefill", f);
       Group &workspace = golden.group(name, "moe-workspace", f);
@@ -916,7 +926,7 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
       const MoeShape shape = family.moeBlockShape();
       std::vector<uint32_t> seen;
       for (const MoeFormatSet &set : moeFormatSets()) {
-        const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set));
+        const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set)).first;
         if (std::ranges::find(seen, routerFormat) != seen.end()) continue;
         seen.push_back(routerFormat);
         const auto config = [&](uint32_t rows) {
@@ -1001,7 +1011,7 @@ void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std
     const MoeShape shape = family.moeBlockShape();
     std::vector<uint32_t> seen;
     for (const MoeFormatSet &set : moeFormatSets()) {
-      const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set));
+      const uint32_t routerFormat = routerFormatOf(moeBlocks(shape, set)).first;
       if (std::ranges::find(seen, routerFormat) != seen.end()) continue;
       seen.push_back(routerFormat);
       const std::vector<uint32_t> classes = plans.decodeRowClasses(most, std::pair{shape, routerFormat});
