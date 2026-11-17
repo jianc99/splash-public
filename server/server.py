@@ -1385,6 +1385,8 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
+        # Its vocabulary, which the grammars' table covers (ConstraintFactory).
+        vocabulary = assembly.vocabulary(model_root)
         if args.reasoning_effort is not None and not (
             family.chat_format.reasoning_switch
         ):
@@ -1457,6 +1459,11 @@ def main():
             thinking_end = thinking_end_tokens(
                 tokenizer, chat_templates.select(None).thinking_end, family.chat_format
             )
+        # The grammars' table, built while the engine loads (0.82 s on a
+        # 32-core M5 Max); the factory checks it against the Ready.
+        grammar_table = ConstraintFactory.table(
+            tokenizer, family.chat_format, vocabulary
+        )
 
         def engine_recovering(recovering):
             # The record follows the engine once the server is ready, for
@@ -1490,7 +1497,7 @@ def main():
             # No deadline unless given, as in vLLM and SGLang; a request still
             # ends when its client disconnects.
             math.inf if args.request_timeout is None else args.request_timeout,
-            constraint_factory=ConstraintFactory(tokenizer, served),
+            constraint_factory=ConstraintFactory(grammar_table, served),
             chat_templates=chat_templates,
             chat_format=family.chat_format,
             sampling_defaults=_sampling_defaults(family, args),
