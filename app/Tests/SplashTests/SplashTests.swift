@@ -829,6 +829,29 @@ struct ServerTests {
         #expect(ServedRequest.taking(try line("12:01:02 Done · input 5 · cached 0 · output 1"), at: at(62), into: earlier).map(\.id) == [-1])
     }
 
+    /// A request for one token is a read ahead of a message's sending, whoever sent it: its row
+    /// says so while it runs, counts as running, and leaves the list as it ends, by its line or by
+    /// a status that no longer has it. A request for two tokens is an ordinary row.
+    @Test func aReadAheadsRowSaysSoAndGoesAsItEnds() throws {
+        let now = Date(timeIntervalSince1970: 1_000)
+        func status(_ limit: Int) throws -> Server.Report {
+            try #require(Server.report(Data(#"{"active_requests": [{"id": 7, "phase": "prefill", "prompt_tokens": 5600, "prompt_processed": 2048, "generated_tokens": 0, "max_new_tokens": \#(limit), "age_ms": 100}]}"#.utf8), at: now))
+        }
+        let read = try status(1), message = try status(2)
+        #expect(read.live.map(\.ahead) == [true] && message.live.map(\.ahead) == [false])
+        var rows = ServedRequest.taking(read.live, taken: now, into: [])
+        #expect(rows.count == 1 && rows[0].running && rows[0].reading(2048) == "Reading ahead 36%")
+        // Gone from the next status: no row is left.
+        #expect(ServedRequest.taking([], taken: now + 2, into: rows).isEmpty)
+        // Ended by its line: no row either.
+        let done = try #require(RequestEntry("12:00:05 Done · request 7 · input 5,600 · cached 0 · output 1"))
+        #expect(ServedRequest.taking(done, at: now + 3, into: rows).isEmpty)
+        // A message's request reads as it did, and stays once ended.
+        rows = ServedRequest.taking(message.live, taken: now, into: [])
+        #expect(rows[0].reading(2048) == "Reading 36%")
+        #expect(ServedRequest.taking([], taken: now + 2, into: rows).map(\.gone) == [true])
+    }
+
     /// Each status says where each running request seen before its snapshot was taken is, back
     /// too, as the engine suspends a request for memory and later reads its prompt again, and that
     /// one it no longer has has ended, its line not come; it adds the requests it has first. One
