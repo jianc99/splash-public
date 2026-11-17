@@ -263,7 +263,8 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybri
 // holds the rest of what the kernels compute; a GGUF's is what the installer
 // derived from the GGUF's metadata, which the GGUF planner checks
 // (gguf::planImages).
-void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source) {
+void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source,
+                        bool statesAttentionGate = true) {
   const std::string_view name = sourceName(source);
   if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
   if (source != TargetSource::Safetensors) return;
@@ -288,13 +289,11 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
   requireBooleans(text, "text config",
                   {{"attention_bias", false},
                    {"tie_word_embeddings", false}});
-  // Qwen3.8-Flash-Next's config names its attention's output gate by its
-  // function, the sigmoid the others' attn_output_gate is.
+  if (statesAttentionGate) requireBooleans(text, "text config", {{"attn_output_gate", true}});
+  // The gate of the GDN's gated norm, where a config names it.
   if (text[@"output_gate_type"])
-    requireEqual(requireString(text, @"output_gate_type", "text config output_gate_type"), "sigmoid", name,
-                 "text config output_gate_type");
-  else
-    requireBooleans(text, "text config", {{"attn_output_gate", true}});
+    requireEqual(requireString(text, @"output_gate_type", "text config output_gate_type"),
+                 target.gdnSigmoidGate ? "sigmoid" : "swish", name, "text config output_gate_type");
   requireEqual(requireString(text, @"hidden_act", "text config hidden_act"),
                "silu", name, "text config hidden_act");
   requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"),
@@ -329,14 +328,16 @@ void requireWholes(NSArray *values, std::span<const uint32_t> expected, std::str
 }
 
 // Qwen3.8-Flash-Next's text configuration: the hybrid's (validateTextConfig
-// above), then, where a safetensors config states them (a GGUF's metadata
+// above) but attn_output_gate, which it leaves unstated (its attention is
+// gated: Qwen4ExpLayout's packedFullWidth), then, where a safetensors config
+// states them (a GGUF's metadata
 // does, which its planner checks), its hyper-connections, its QSA indexer
 // (its heads, head width, one key head, the tokens of a block and the tokens
 // its blocks select), its PLE n-gram embedding (n-grams, heads, convolution,
 // width, its layer by its 1-based id), and the end-of-sequence token its
 // hash reads (Qwen4ExpLayout::pleEosToken).
 void validateTextConfig(NSDictionary *text, const Qwen4ExpLayout &target, TargetSource source) {
-  validateTextConfig(text, static_cast<const QwenHybridLayout &>(target), source);
+  validateTextConfig(text, static_cast<const QwenHybridLayout &>(target), source, false);
   if (source != TargetSource::Safetensors) return;
   requireNumbers(text, sourceName(source), "text config",
                  {{"hc_count", target.hyperConnections},

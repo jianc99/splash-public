@@ -34,12 +34,20 @@ Qwen4HyperWeights readHyper(WeightFile &file, const Qwen4ExpLayout &layout, bool
   return hyper;
 }
 
+// The indexer's projections are float segments (Qwen4ExpTarget.cpp
+// addIndexerProjections): a GGUF's F32 or BF16 values, an MLX checkpoint's
+// native rows.
 Qwen4IndexerWeights readIndexer(WeightFile &file, const Qwen4ExpLayout &layout) {
   const BlockTargetFormat format;
+  const auto floatProjection = [&](uint32_t outputSize, std::string_view label) {
+    ops::QuantizedSegment segment = readFloatSegment(file, label);
+    if (segment.outputSize != outputSize || segment.inputSize != layout.hiddenSize)
+      throw WeightStoreError("GGUF tensor does not match the layout: " + std::string(label));
+    return ops::Projection{outputSize, layout.hiddenSize, ops::BlockWeights{{std::move(segment)}}};
+  };
   Qwen4IndexerWeights indexer;
-  indexer.query = format.projection(file, layout.indexerHeads * layout.indexerHeadDimension, layout.hiddenSize,
-                                    "indexer-query");
-  indexer.key = format.projection(file, layout.indexerHeadDimension, layout.hiddenSize, "indexer-key");
+  indexer.query = floatProjection(layout.indexerHeads * layout.indexerHeadDimension, "indexer-query");
+  indexer.key = floatProjection(layout.indexerHeadDimension, "indexer-key");
   // The indexer scores in fp32 (ops::BlockIndexer).
   indexer.query.destination = ops::FloatOutput::Float32;
   indexer.key.destination = ops::FloatOutput::Float32;
