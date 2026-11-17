@@ -228,7 +228,10 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # runtime/engine's production lines: the budget only goes down, unless the
 # owner raises it. 30,605: +11 for /status disk.off_reason (Cache.hpp 4,
 # RuntimeResources.mm 4, Status.cpp 3), the reason the SSD cache is off.
-ENGINE_LINE_BUDGET = 30_605
+# 30,632: +27 for what a request's start found in the cache, in usage
+# (Types.hpp 15: StateSource and StartFound; Protocol.hpp 4, Protocol.cpp 3:
+# the Start frame's three fields; Engine.cpp 4: filling them; NativeRuntime.cpp 1).
+ENGINE_LINE_BUDGET = 30_632
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
