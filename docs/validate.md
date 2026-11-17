@@ -75,6 +75,24 @@ that compacts the conversation, whose summary request and the request after it
 share only the system prompt and tools. Replay points of unfinished requests
 evicted during a phase only print a warning.
 
+In both scenarios each client also fixes a seeded bug, in a project and
+session of its own (`bugfix`): the shop package of
+`dev/tests/fixtures/agent_bugfix/project`, whose `money.to_cents` reads "8.5"
+as 805 cents, so that three cart tests fail and the cause is found only by
+running the tests and following the cart into `shop/money.py`. It passes when
+the client ran the test command, changed `shop/money.py` alone by at most 6
+lines, and the project's tests pass, as do amounts the tests do not use. A
+failure the engine's own record explains (a failed native request, a restart,
+a lost replay point, no cached prompt token reused, a minute of held work
+without progress) fails at once; any other is the model's answer and gets one
+more try in a fresh session; the report names each failure's kind. A try's
+requests must stay within what `dev/tests/fixtures/agent_bugfix/bounds.json`
+records for the model and the client, twice the largest of three runs; a
+client of another version than the one recorded is reported, not bounded. The
+runs' wall times are recorded there, not bounded: they follow the Mac's speed,
+which the timing gates judge. `agent_real.py --calibrate-bugfix 3`,
+with the run's model options, records them again; the file keeps the command.
+
 `benchmark-backend` and `benchmark-decode-profile` take `MODEL` the same way.
 The models they are run with, one per family and source format:
 

@@ -1,0 +1,184 @@
+{
+  "commands": {
+    "mlx-community/Qwen3.8-27B-4bit": [
+      "dev/tests/agent_real.py",
+      "--model",
+      "mlx-community/Qwen3.8-27B-4bit",
+      "--revision",
+      "10c35caafbb80f7dc6a7a432cdd11af10a6d4818",
+      "--clients",
+      "claude,codex,pi,hermes",
+      "--calibrate-bugfix",
+      "3"
+    ],
+    "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M": [
+      "dev/tests/agent_real.py",
+      "--model",
+      "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M",
+      "--revision",
+      "a483e9e6cbd595906af30beda3187c2663a1118c",
+      "--clients",
+      "claude,codex,pi,hermes",
+      "--calibrate-bugfix",
+      "3"
+    ]
+  },
+  "models": {
+    "mlx-community/Qwen3.8-27B-4bit": {
+      "claude": {
+        "version": "2.1.325 (Claude Code)",
+        "build_id": "src-90952b2ba4d49c0472535a95c46a840dc96cd6755fc91462905226bc98975ac7",
+        "runs": [
+          {
+            "requests": 8,
+            "wall_seconds": 55.1
+          },
+          {
+            "requests": 9,
+            "wall_seconds": 64.3
+          },
+          {
+            "requests": 8,
+            "wall_seconds": 41.7
+          }
+        ],
+        "requests": 18
+      },
+      "codex": {
+        "version": "codex-cli 0.163.0",
+        "build_id": "src-90952b2ba4d49c0472535a95c46a840dc96cd6755fc91462905226bc98975ac7",
+        "runs": [
+          {
+            "requests": 6,
+            "wall_seconds": 46.8
+          },
+          {
+            "requests": 7,
+            "wall_seconds": 38.4
+          },
+          {
+            "requests": 7,
+            "wall_seconds": 24.9
+          }
+        ],
+        "requests": 14
+      },
+      "pi": {
+        "version": "1.3.0",
+        "build_id": "src-90952b2ba4d49c0472535a95c46a840dc96cd6755fc91462905226bc98975ac7",
+        "runs": [
+          {
+            "requests": 6,
+            "wall_seconds": 11.4
+          },
+          {
+            "requests": 11,
+            "wall_seconds": 30.1
+          },
+          {
+            "requests": 5,
+            "wall_seconds": 10.4
+          }
+        ],
+        "requests": 22
+      },
+      "hermes": {
+        "version": "Hermes Agent v0.22.2 (2026.9.24) \u00b7 stable \u00b7 local d923a5eb487a",
+        "build_id": "src-90952b2ba4d49c0472535a95c46a840dc96cd6755fc91462905226bc98975ac7",
+        "runs": [
+          {
+            "requests": 7,
+            "wall_seconds": 47.7
+          },
+          {
+            "requests": 6,
+            "wall_seconds": 43.5
+          },
+          {
+            "requests": 8,
+            "wall_seconds": 45.7
+          }
+        ],
+        "requests": 16
+      }
+    },
+    "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M": {
+      "claude": {
+        "version": "2.1.325 (Claude Code)",
+        "build_id": "src-90952b2ba4d49c0472535a95c46a840dc96cd6755fc91462905226bc98975ac7",
+        "runs": [
+          {
+            "requests": 7,
+            "wall_seconds": 17.6
+          },
+          {
+            "requests": 17,
+            "wall_seconds": 86.3
+          },
+          {
+            "requests": 9,
+            "wall_seconds": 22.9
+          }
+        ],
+        "requests": 34
+      },
+      "codex": {
+        "version": "codex-cli 0.163.0",
+        "build_id": "src-90952b2ba4d49c0472535a95c46a840dc96cd6755fc91462905226bc98975ac7",
+        "runs": [
+          {
+            "requests": 6,
+            "wall_seconds": 26.0
+          },
+          {
+            "requests": 8,
+            "wall_seconds": 15.6
+          },
+          {
+            "requests": 7,
+            "wall_seconds": 13.5
+          }
+        ],
+        "requests": 16
+      },
+      "pi": {
+        "version": "1.3.0",
+        "build_id": "src-90952b2ba4d49c0472535a95c46a840dc96cd6755fc91462905226bc98975ac7",
+        "runs": [
+          {
+            "requests": 8,
+            "wall_seconds": 11.4
+          },
+          {
+            "requests": 7,
+            "wall_seconds": 20.9
+          },
+          {
+            "requests": 8,
+            "wall_seconds": 10.4
+          }
+        ],
+        "requests": 16
+      },
+      "hermes": {
+        "version": "Hermes Agent v0.22.2 (2026.9.24) \u00b7 stable \u00b7 local d923a5eb487a",
+        "build_id": "src-90952b2ba4d49c0472535a95c46a840dc96cd6755fc91462905226bc98975ac7",
+        "runs": [
+          {
+            "requests": 12,
+            "wall_seconds": 52.9
+          },
+          {
+            "requests": 6,
+            "wall_seconds": 14.6
+          },
+          {
+            "requests": 7,
+            "wall_seconds": 16.7
+          }
+        ],
+        "requests": 24
+      }
+    }
+  }
+}
