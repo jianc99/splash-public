@@ -641,7 +641,12 @@ The rules:
    of up to 32 rows of every family) and 32-row tiles beyond. One plan per
    step serves every block, so its router follows rule 3 in the format of
    most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
-   are the step's routes', packed (`ops::MoeScratch`).
+   are the step's routes', packed (`ops::MoeScratch`). With int8 activations
+   on, a prefill chunk whose dense projections run the
+   [int8-activation tile](#int8-activation-prefill) runs its experts there too
+   where every block's experts are resident and each projection's routed and
+   shared experts share a format the tile takes (`ops::moeInt8Experts`,
+   `MoeConfig::int8Passes`).
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's of
    up to 8 rows, takes one history split per 16 pages its rows read, between
@@ -1200,6 +1205,23 @@ rounded within the bf16 tile's error, also with an outlier input per row, and bo
 it adds over the bf16 tile on dense inputs at 1%, that a fused projection quantizes once and runs a
 GEMM per segment, and an up on its gate's codes bitwise its own run; `gguf-projection-benchmark`
 times it as `prefill int8`.
+
+A MoE target's experts run on the same tile in such a chunk where every block's experts are
+resident and each projection's routed and shared experts share af4g64 or af5g64
+(`ops::moeInt8Experts`; Qwen3.6-35B-A3B MLX 4-bit, not Flint's af3g64 nor a set
+with Q8_0 shared experts): `gguf_prefill_int8_quantize` rounds the chunk's MoE input rows once,
+`moe_gather_int8` copies each route's codes and scales into the grouping's tiles, and
+`moe_expert_int8_<format>_<gate|up|down>` (`kernels/shared/moe_int8.metal`) run the tile over them,
+each tile's expert reached as the staged passes reach it, with the SwiGLU intermediate rounded by the
+same rule before down. Decode steps, chunks of 64 rows or fewer (at 64 the int8 passes took the
+35B's chunk 5% longer on a 32-core M5 Max), streamed experts and other formats keep the staged
+tile. On the 35B MLX it takes a 2,048-row chunk 9% less time on a 32-core M5 Max and 11% on a
+20-core M5 Pro, 32K tokens of context 5% and 8%, a 128-row chunk the same. Against 1.7.0, whose dense
+projections already round, the next-token KL over 96 prefixes of six greedy transcripts is 1.3e-3
+(the same prefixes scored four at a time: 6.9e-4), the most likely token unchanged at every prefix;
+at 2K and 32K tokens of real text it is about that of a cache hit against a cold prefill (1.7e-2
+against 1.3e-2 at 2K, 6.7e-2 against 6.2e-2 at 32K), and a second turn does not add to it. The
+prefill arena holds the codes, 47 MB at 2,048 rows on the 35B.
 
 ## Sparse attention
 
