@@ -291,8 +291,14 @@ struct ViewAnchor: NSViewRepresentable {
 }
 
 /// A view to scroll the scroll view it lies in to, brought to the top while the content under it
-/// unfolds: each frame it eases toward the top, as far as the content reaches by then, so that it
-/// rises as the content grows rather than after. The reader's own scrolling takes over.
+/// unfolds: on `glide`'s curve from rest, from where its first frame found it, toward the top, as
+/// far as the content reaches by then, so that it rises as the content grows rather than after.
+/// The curve is followed by the time each frame shows, not by the frames run: a busy main thread
+/// skips frames, never the distance, and the first frame moves a fraction of a point, not a tenth
+/// of the way (with a step of a tenth a frame, the first drew the section under the opened options
+/// 14.5 points up before their growth pushed it down, and a busy main thread left a scroll of 258
+/// points at 48.5 to 69 when it stopped after 1 s, on the 48 GB M5 Pro). The reader's own
+/// scrolling takes over.
 @MainActor
 final class ScrollTarget: NSObject {
     weak var view: NSView?
@@ -300,7 +306,8 @@ final class ScrollTarget: NSObject {
     /// Where it is to end up, and where it put the content last, to tell the reader's scrolling.
     private var top: CGFloat = 0
     private var placed: CGFloat?
-    private var began: CFTimeInterval = 0
+    /// Where its first frame found the content, and when.
+    private var start: (y: CGFloat, time: CFTimeInterval)?
 
     /// Puts the view at the top of its scroll view, as far as the content goes.
     func scrollToTop(margin: CGFloat = 12) {
@@ -309,7 +316,7 @@ final class ScrollTarget: NSObject {
         let frame = view.convert(view.bounds, to: document), inset = scrollView.contentInsets.top
         top = document.isFlipped ? frame.minY - margin - inset : frame.maxY + margin - scrollView.contentView.bounds.height + inset
         placed = nil
-        began = CACurrentMediaTime()
+        start = nil
         link?.invalidate()
         link = scrollView.displayLink(target: self, selector: #selector(step))
         link?.add(to: .main, forMode: .common)
@@ -323,14 +330,18 @@ final class ScrollTarget: NSObject {
         if let placed, abs(y - placed) > 0.5 { return stop() }
         let lowest = -scrollView.contentInsets.top
         let reach = min(max(top, lowest), max(document.frame.height - clip.bounds.height + scrollView.contentInsets.bottom, lowest))
-        // Motion.glide's travel: most of the way in 0.4 s; at once with Reduce Motion.
-        let next = Motion.reduced ? reach : y + (reach - y) * (1 - exp(-(link.targetTimestamp - link.timestamp) / 0.08))
+        // Motion.glide's travel, at the time this frame shows; at once with Reduce Motion.
+        let start = start ?? (y, link.timestamp)
+        self.start = start
+        let elapsed = link.targetTimestamp - start.time
+        let next = Motion.reduced ? reach : start.y + (reach - start.y) * Motion.glideSpring.value(target: 1.0, time: elapsed)
         clip.setBoundsOrigin(NSPoint(x: clip.bounds.minX, y: abs(reach - next) < 0.5 ? reach : next))
         scrollView.reflectScrolledClipView(clip)
         let now = clip.bounds.minY
         placed = now
-        // There, or as far as the content goes once it has stopped growing.
-        if abs(top - now) < 0.5 || CACurrentMediaTime() - began > 1 { stop() }
+        // There, or as far as the content goes once the curve has settled, the content's growth
+        // (`settle`) done well before.
+        if abs(top - now) < 0.5 || Motion.reduced || elapsed >= Motion.glideSpring.settlingDuration { stop() }
     }
 
     private func stop() {
