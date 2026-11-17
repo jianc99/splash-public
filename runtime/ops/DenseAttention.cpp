@@ -1,0 +1,55 @@
+#include "DenseAttention.hpp"
+
+#include "metal/abi/DenseAttention.h"
+#include "ops/BufferExtent.hpp"
+
+#include <array>
+#include <stdexcept>
+#include <string>
+
+namespace splash::ops {
+namespace {
+
+uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept { return (value + multiple - 1) / multiple * multiple; }
+
+// The bytes of `tensor` the kernel reaches over `rows` rows of `width`
+// dimensions of every head.
+void requireTensor(const HeadTensor &tensor, uint32_t heads, uint32_t rows, uint32_t width, const char *what) {
+  if (tensor.rowStride < width) throw std::invalid_argument(std::string(what) + " rows are narrower than a head");
+  const uint64_t last = uint64_t{heads - 1} * tensor.headStride + uint64_t{rows - 1} * tensor.rowStride + width;
+  requireBytes(tensor.buffer, last * 2, what);
+}
+
+} // namespace
+
+uint32_t DenseAttention::paddedQueries(uint32_t rows) noexcept { return roundUp(rows, SPLASH_DENSE_ATTENTION_ROWS); }
+
+uint32_t DenseAttention::paddedKeys(uint32_t rows) noexcept { return roundUp(rows, SPLASH_DENSE_ATTENTION_KEYS); }
+
+void DenseAttention::add(metal::CommandGraph &graph, const DenseAttentionTensors &tensors, uint32_t heads,
+                         uint32_t dimensions, uint32_t rows, float scale) {
+  if (dimensions != 72) throw std::invalid_argument("dense attention takes heads of 72 dimensions");
+  if (!heads || !rows) throw std::invalid_argument("dense attention takes heads and rows");
+  const uint32_t padded = roundUp(dimensions, 16);
+  requireTensor(tensors.queries, heads, paddedQueries(rows), padded, "dense attention query");
+  requireTensor(tensors.keys, heads, paddedKeys(rows), padded, "dense attention key");
+  requireTensor(tensors.values, heads, paddedKeys(rows), dimensions, "dense attention value");
+  requireTensor(tensors.output, heads, rows, dimensions, "dense attention output");
+  const DenseAttentionParams params{rows,
+                                    scale,
+                                    tensors.queries.headStride,
+                                    tensors.keys.headStride,
+                                    tensors.values.headStride,
+                                    tensors.output.headStride};
+  graph.add("dense_attention_" + std::to_string(dimensions),
+            {tensors.queries.buffer, tensors.keys.buffer, tensors.values.buffer, tensors.output.buffer}, params,
+            {paddedQueries(rows) / SPLASH_DENSE_ATTENTION_ROWS, heads, 1}, {SPLASH_DENSE_ATTENTION_THREADS, 1, 1});
+  // A caller's row strides are fixed by its layout: as function constants
+  // they make a tile's addresses compile-time offsets, which took 0.5% off
+  // the vision tower's attention of 4096 patches on an M5 Max.
+  const std::array<uint32_t, 4> rowStrides{tensors.queries.rowStride, tensors.keys.rowStride,
+                                           tensors.values.rowStride, tensors.output.rowStride};
+  graph.specialize(rowStrides);
+}
+
+} // namespace splash::ops
