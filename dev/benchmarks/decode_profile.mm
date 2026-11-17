@@ -37,6 +37,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/SsdReaders.hpp"
 #include "model/VisionLoader.hpp"
 #include "model/WeightImages.hpp"
@@ -726,6 +727,25 @@ int main(int argc, char **argv) {
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
 
+      // A streamed table's stages and reads over the whole run (--ple-memory),
+      // which tell what reading its rows from its source costs.
+      if (const model::SparseRowStore *store = model.streamedTable()) {
+        const model::SparseRowStats stats = store->stats();
+        for (uint32_t use = 0; use < model::kSparseRowUses; ++use) {
+          const model::SparseRowStats::Use &u = stats.uses[use];
+          std::printf("table %s %s: %llu stages, %llu ids, %llu distinct, %llu hit, %llu read; stage mean %.3f "
+                      "p50 %.3f p95 %.3f p99 %.3f max %.3f ms\n",
+                      stats.table.c_str(), use == 0 ? "prefill" : "decode", (unsigned long long)u.stages,
+                      (unsigned long long)u.requestedRows, (unsigned long long)u.uniqueRows,
+                      (unsigned long long)u.hitRows, (unsigned long long)u.readRows,
+                      u.stage.count ? u.stage.totalMilliseconds / u.stage.count : 0.0, u.stage.p50Milliseconds,
+                      u.stage.p95Milliseconds, u.stage.p99Milliseconds, u.stage.maximumMilliseconds);
+        }
+        std::printf("table %s reads: %llu bytes, %llu prefetched rows; a row's read p50 %.3f p95 %.3f p99 %.3f ms\n",
+                    stats.table.c_str(), (unsigned long long)stats.readBytes,
+                    (unsigned long long)stats.prefetchReadRows, stats.read.p50Milliseconds, stats.read.p95Milliseconds,
+                    stats.read.p99Milliseconds);
+      }
       for (uint32_t index = 0; index < widths; ++index)
         executor.end(lanes[index].id);
       return 0;
