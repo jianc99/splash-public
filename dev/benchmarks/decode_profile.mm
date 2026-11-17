@@ -37,6 +37,7 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/ExpertStore.hpp"
 #include "model/SparseRowStore.hpp"
 #include "model/SsdReaders.hpp"
 #include "model/VisionLoader.hpp"
@@ -719,7 +720,27 @@ int main(int argc, char **argv) {
         accumulate(table, timings);
         print(title, table, cycles, median.gpuSeconds);
       };
+      // The streamed experts the B1 cycles read (--expert-memory): per
+      // cycle, the routed experts, those not resident, the bytes read, and
+      // the loads' host steps (work: reading and staging them), which tell
+      // what a cycle waits for the SSD.
+      const model::ExpertStore *experts = model.expertStore();
+      const model::ExpertStoreStats expertsBefore = experts ? experts->stats() : model::ExpertStoreStats{};
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
+      if (experts) {
+        const model::ExpertStoreStats after = experts->stats();
+        const model::ExpertStoreStats::Use &u = after.uses[1], &b = expertsBefore.uses[1];
+        const double perCycle = 1.0 / cycles;
+        std::printf("experts B1: %llu of %llu resident in %llu MiB; per cycle %.1f block loads, %.1f routed, %.1f "
+                    "not resident, %.1f read ahead, %.2f MiB read; host step work mean %.3f p50 %.3f p95 %.3f ms "
+                    "over the run\n",
+                    (unsigned long long)after.resident, (unsigned long long)after.experts,
+                    (unsigned long long)(after.capBytes >> 20), (u.loads - b.loads) * perCycle,
+                    (u.routed - b.routed) * perCycle, (u.read - b.read) * perCycle,
+                    (u.readAhead - b.readAhead) * perCycle, (u.readBytes - b.readBytes) * perCycle / (1 << 20),
+                    u.work.count ? u.work.totalMilliseconds / u.work.count : 0.0, u.work.p50Milliseconds,
+                    u.work.p95Milliseconds);
+      }
       // Add one lane at a time so M16 and M24 paths are measured too.
       for (uint32_t index = 1; index < widths; ++index) {
         prefill(executor, lanes[index], promptOf(index), answer);
