@@ -11,6 +11,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include <mach/mach.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -1001,6 +1002,39 @@ void buffersStayResident(const std::string &metallibPath) {
             "a command on a resident buffer produced the wrong result");
     std::cout << "PASS buffers stay resident keep_alive_seconds=" << kKeepAliveSeconds
               << " lapsed_after_seconds=" << lapsedAfter.count() << '\n';
+}
+
+// A buffer shows in the host's page counters as it is allocated, before any
+// command uses it: the backend's set is held while it serves and wires each
+// buffer it takes (Residency::add). The memory governor weighs what follows
+// against those counters, with nothing counted aside for allocations they do
+// not show yet. Without a residency set a buffer shows only once a command
+// uses it (M6, M5 Max and M4, 512 MiB, shared and private alike).
+void aBufferShowsInTheHostAsItIsAllocated(const std::string &metallibPath) {
+    constexpr uint64_t kBytes = 256ull << 20;
+    MetalBackend backend(metallibPath);
+    MetalBuffer used = sharedBuffer(backend, static_cast<uint64_t>(getpagesize()));
+    const uint32_t count = 1, increment = 1;
+    ComputeDispatch dispatch{"test_add_u32", {{0, used}},
+        {{1, &count, sizeof(count)}, {2, &increment, sizeof(increment)}},
+        {1, 1, 1}, {1, 1, 1}};
+    (void)backend.submitCommandAsync({&dispatch, 1}).wait();
+    const auto wired = [] {
+        vm_statistics64_data_t pages{};
+        mach_msg_type_number_t size = HOST_VM_INFO64_COUNT;
+        require(host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&pages),
+                                  &size) == KERN_SUCCESS,
+                "host_statistics64 failed");
+        return uint64_t{pages.wire_count} * vm_kernel_page_size;
+    };
+    const uint64_t before = wired();
+    MetalBuffer buffer = backend.allocateBuffer(kBytes, BufferStorage::Private, "allocated, never used");
+    const uint64_t after = wired();
+    require(after >= before + kBytes / 4 * 3,
+            "a buffer no command used did not show in the host's wired pages: " +
+                std::to_string((after - std::min(after, before)) >> 20) + " MiB of " + std::to_string(kBytes >> 20));
+    std::cout << "PASS a buffer shows in the host as it is allocated wired_mib="
+              << ((after - std::min(after, before)) >> 20) << '\n';
 }
 
 // An infinite keep-alive (--idle-release off) holds the set while the backend
@@ -3495,6 +3529,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"functionConstantsSpecializePipelines", [] { functionConstantsSpecializePipelines(metallib); }},
         {"pipelinesCreatedTogether", [] { pipelinesCreatedTogether(metallib); }},
         {"buffersStayResident", [] { buffersStayResident(metallib); }},
+        {"aBufferShowsInTheHostAsItIsAllocated", [] { aBufferShowsInTheHostAsItIsAllocated(metallib); }},
         {"infiniteKeepAliveHoldsResidency", [] { infiniteKeepAliveHoldsResidency(metallib); }},
         {"releasedMemory", [] { releasedMemory(metallib); }},
         {"reservedMemory", [] { reservedMemory(metallib); }},
