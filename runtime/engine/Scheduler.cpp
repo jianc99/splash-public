@@ -18,6 +18,16 @@ constexpr uint32_t kFloorRows = 512;
 // prefill commands in a row: the other lanes of a full batch, each finishing
 // one short prompt.
 constexpr uint32_t kMaximumOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
+// A Background request held back this long, unserved since its first tick, its
+// last command or its last suspension, is ordered as Normal, so that attended
+// work cannot starve it. On the 35B (a 64 GB M5 Pro) a chat's title alone takes
+// 0.15 s, far inside it, so a title never outranks a user where nothing
+// competes; beside a 4,000-token stream strict priority held one 28.4 s, the
+// stream's length, and aged it ends in 10.2 s. An attended turn of four agent
+// sessions at once takes 4.0 s at the median and 7.8 s at p90, so a
+// Background request yields to a turn in progress, not to a session's stream of
+// turns.
+constexpr double kBackgroundAgeMilliseconds = 10'000.0;
 
 // A command excludes at most the lanes of a full batch: a linear search.
 bool listed(std::span<const uint64_t> ids, uint64_t id) noexcept {
@@ -107,6 +117,8 @@ void Scheduler::suspendForResources(uint64_t id) {
   }
   request.suspended = true;
   request.phase = Phase::WaitingResources;
+  // Suspended, it waits again from its next tick (age).
+  request.waitingSince.reset();
   dropStaleDecodeDebt();
 }
 
@@ -212,7 +224,8 @@ std::vector<uint64_t> Scheduler::admissionOrder() const {
       ready.push_back(&request);
     }
   }
-  std::sort(ready.begin(), ready.end(), byPriorityThenOrder);
+  std::sort(ready.begin(), ready.end(),
+            [this](const Request *a, const Request *b) { return byPriorityThenOrder(a, b); });
   std::vector<uint64_t> result;
   result.reserve(ready.size());
   for (const Request *request : ready)
@@ -256,8 +269,8 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
         processed += item->tokenCount;
     if (processed != request.spec.prefillTokens)
       lanes.push_back(lane(request, processed, in));
-    else if (shapeOf(id, in).spill && (!spillEnds || request.spec.priority < *spillEnds))
-      spillEnds = request.spec.priority;
+    else if (shapeOf(id, in).spill && (!spillEnds || priorityOf(request) < *spillEnds))
+      spillEnds = priorityOf(request);
   }
   // The requests restoring their prefix, which prefill once it lands, in no
   // command planned before then.
@@ -302,7 +315,7 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
       if (view.overdue || item->tokenCount == view.remaining())
         return false;
       const Lane landed = in.passes ? view : lane(*view.request, view.processed + item->tokenCount, in);
-      return (spillEnds && *spillEnds <= view.request->spec.priority) ||
+      return (spillEnds && *spillEnds <= priorityOf(*view.request)) ||
              std::ranges::any_of(ready,
                                  [&](const Lane &other) {
                                    return other.request != view.request && leadsBefore(other, view) &&
@@ -314,8 +327,8 @@ std::vector<uint64_t> Scheduler::prefillAdmissionOrder(std::span<const PrefillAd
   // Admission ranks candidates against every decoder, left out of a plan or
   // not.
   const auto decode = nextDecode({});
-  if (decode && get(decode->items.front().requestId).spec.priority <
-                    get(planned->plan.items.front().requestId).spec.priority)
+  if (decode && priorityOf(get(decode->items.front().requestId)) <
+                    priorityOf(get(planned->plan.items.front().requestId)))
     return result;
   for (const auto &item : planned->plan.items)
     if (std::ranges::any_of(pending, [&](const Lane &view) { return view.request->spec.id == item.requestId; }))
@@ -327,14 +340,14 @@ std::optional<RequestPriority> Scheduler::highestRunnablePriority() const noexce
   std::optional<RequestPriority> result;
   for (const auto &[_, request] : requests_) {
     if ((request.phase == Phase::Prefill || request.phase == Phase::Decode) &&
-        (!result || request.spec.priority < *result))
-      result = request.spec.priority;
+        (!result || priorityOf(request) < *result))
+      result = priorityOf(request);
   }
   return result;
 }
 
 bool Scheduler::yieldsTo(RequestPriority priority, const PlanInputs &in) const {
-  return in.passes && priority < get(in.passes->plan.items.front().requestId).spec.priority;
+  return in.passes && priority < priorityOf(get(in.passes->plan.items.front().requestId));
 }
 
 bool Scheduler::abandonsPasses(const BatchPlan &plan, const PlanInputs &in) const {
@@ -352,9 +365,9 @@ std::optional<BatchPlan> Scheduler::next(const PlanInputs &in) const {
     return decode;
 
   const RequestPriority decodePriority =
-      get(decode->items.front().requestId).spec.priority;
+      priorityOf(get(decode->items.front().requestId));
   const RequestPriority prefillPriority =
-      get(prefill->items.front().requestId).spec.priority;
+      priorityOf(get(prefill->items.front().requestId));
   if (decodePriority != prefillPriority) {
     return decodePriority < prefillPriority ? std::move(decode)
                                              : std::move(prefill);
@@ -393,11 +406,11 @@ std::optional<double> Scheduler::waitsForDecoders(const BatchPlan &prefill, cons
   // whatever commits meanwhile, and nothing has to end it.
   if (!(decodeDebtMilliseconds_ > 0.0) || !(in.now < waitEndMilliseconds_))
     return std::nullopt;
-  const RequestPriority priority = get(prefill.items.front().requestId).spec.priority;
+  const RequestPriority priority = priorityOf(get(prefill.items.front().requestId));
   const bool owed = std::ranges::any_of(in.landing, [&](uint64_t id) {
     const auto found = requests_.find(id);
     return found != requests_.end() && found->second.phase == Phase::Decode &&
-           found->second.spec.priority <= priority && found->second.lastDecodeDispatch <= prefillDispatchOrder_;
+           priorityOf(found->second) <= priority && found->second.lastDecodeDispatch <= prefillDispatchOrder_;
   });
   return owed ? std::optional(waitEndMilliseconds_) : std::nullopt;
 }
@@ -414,7 +427,7 @@ std::optional<BatchPlan> Scheduler::nextPrefill(const PlanInputs &in) const {
   // rows would take the model's prefill memory its rows' work is in, but one
   // of a higher priority. One of its priority waits for its end: abandoning
   // it would run its passes again for the rows it started.
-  if (!in.passes || (planned && yieldsTo(get(planned->plan.items.front().requestId).spec.priority, in)))
+  if (!in.passes || (planned && yieldsTo(priorityOf(get(planned->plan.items.front().requestId)), in)))
     return planned ? std::optional(std::move(planned->plan)) : std::nullopt;
   for (const BatchItem &item : in.passes->plan.items)
     if (listed(in.excluded, item.requestId))
@@ -430,6 +443,7 @@ LaneShape Scheduler::shapeOf(uint64_t id, const PlanInputs &in) const {
 
 Scheduler::Lane Scheduler::lane(const Request &request, uint32_t processed, const PlanInputs &in) const {
   return {.request = &request,
+          .priority = priorityOf(request),
           .processed = processed,
           .shape = shapeOf(request.spec.id, in),
           .overdue = request.overtaken >= kMaximumOvertakes};
@@ -462,7 +476,7 @@ bool Scheduler::contended(RequestPriority priority) const {
   // memory lands.
   return std::ranges::any_of(requests_, [&](const auto &entry) {
     const Request &peer = entry.second;
-    return (peer.phase == Phase::Decode || peer.phase == Phase::WaitingMask) && peer.spec.priority <= priority;
+    return (peer.phase == Phase::Decode || peer.phase == Phase::WaitingMask) && priorityOf(peer) <= priority;
   });
 }
 
@@ -535,7 +549,7 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
     return std::nullopt;
   std::sort(ready.begin(), ready.end(), leadsBefore);
   const Lane &leader = ready.front();
-  const RequestPriority tier = leader.request->spec.priority;
+  const RequestPriority tier = leader.priority;
   // A group command runs in passes, contended or not; any other runs whole,
   // cut while a lane of its priority or a higher one decodes.
   const bool group = groups(leader);
@@ -561,7 +575,7 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   };
   std::vector<Lane> members{leader};
   for (auto view = ready.begin() + 1; view != ready.end(); ++view) {
-    if (view->request->spec.priority != tier || lanes.size() == model::ExecutionLimits::maximumBatchWidth)
+    if (view->priority != tier || lanes.size() == model::ExecutionLimits::maximumBatchWidth)
       break;
     // A lane that runs in passes joins only a command that does.
     if (groups(*view) && !group)
@@ -600,20 +614,20 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
   }
   if (ready.empty())
     return std::nullopt;
-  std::sort(ready.begin(), ready.end(), [](const Request *a, const Request *b) {
-    if (a->spec.priority != b->spec.priority)
-      return a->spec.priority < b->spec.priority;
+  std::sort(ready.begin(), ready.end(), [this](const Request *a, const Request *b) {
+    if (priorityOf(*a) != priorityOf(*b))
+      return priorityOf(*a) < priorityOf(*b);
     if (a->lastDecodeDispatch != b->lastDecodeDispatch)
       return a->lastDecodeDispatch < b->lastDecodeDispatch;
     return a->order < b->order;
   });
   const DecodeStage decodeStage = ready.front()->decodeStage;
-  const RequestPriority selectedPriority = ready.front()->spec.priority;
+  const RequestPriority selectedPriority = priorityOf(*ready.front());
   BatchPlan plan;
   plan.kind = WorkKind::Decode;
   plan.decodeStage = decodeStage;
   for (const Request *request : ready) {
-    if (request->spec.priority != selectedPriority ||
+    if (priorityOf(*request) != selectedPriority ||
         request->decodeStage != decodeStage)
       continue;
     plan.items.push_back({request->spec.id, 0, 0});
@@ -643,7 +657,12 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
   if (in.passes ? prefill && !samePlan(plan, in.passes->plan)
                 : plan.pass || (plan.passes > 1 && !prefill))
     throw std::logic_error("batch no longer matches scheduler state");
-  const RequestPriority priority = get(plan.items.front().requestId).spec.priority;
+  const RequestPriority priority = priorityOf(get(plan.items.front().requestId));
+  // A request served before it has aged was not held back: its wait starts
+  // again. Aged, it stays Normal until a suspension.
+  for (const BatchItem &item : plan.items)
+    if (Request &request = get(item.requestId); priorityOf(request) == request.spec.priority)
+      request.waitingSince = now_;
   if (prefill)
     prefillDispatchOrder_ = decodeDispatchOrder_;
   if (prefill && !plan.pass) {
@@ -670,7 +689,7 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
     for (const BatchItem &item : plan.items)
       youngestServed = std::max(youngestServed, get(item.requestId).order);
     for (auto &[id, request] : requests_) {
-      if (request.spec.priority != priority || request.suspended || listed(in.excluded, id) ||
+      if (priorityOf(request) != priority || request.suspended || listed(in.excluded, id) ||
           (request.phase != Phase::Queued && request.phase != Phase::WaitingResources &&
            request.phase != Phase::WaitingPrefix && request.phase != Phase::Prefill))
         continue;
@@ -744,13 +763,13 @@ void Scheduler::complete(const BatchPlan &plan, std::span<const StepResult> resu
       request.phase = result.finished ? Phase::Completed : Phase::Decode;
     }
   }
-  const RequestPriority priority = get(plan.items.front().requestId).spec.priority;
+  const RequestPriority priority = priorityOf(get(plan.items.front().requestId));
   // Whether lanes of its priority or a higher one decode beside it now, those
   // it finished included, not counting decoders it was planned without, which
   // could not run either.
   const bool owesDecode = prefill && std::ranges::any_of(requests_, [&](const auto &entry) {
                             const auto &[id, peer] = entry;
-                            return peer.phase == Phase::Decode && peer.spec.priority <= priority &&
+                            return peer.phase == Phase::Decode && priorityOf(peer) <= priority &&
                                    !listed(excluded_, id);
                           });
   if (prefill) {
@@ -824,6 +843,21 @@ void Scheduler::dropStaleDecodeDebt() noexcept {
     decodeDebtMilliseconds_ = 0.0;
 }
 
+void Scheduler::age(double now) noexcept {
+  now_ = now;
+  for (auto &[_, request] : requests_)
+    if (!request.waitingSince && !terminal(request.phase))
+      request.waitingSince = now;
+}
+
+RequestPriority Scheduler::priorityOf(const Request &request) const noexcept {
+  const bool aged = request.spec.priority == RequestPriority::Background && request.waitingSince &&
+                    now_ - *request.waitingSince >= kBackgroundAgeMilliseconds;
+  return aged ? RequestPriority::Normal : request.spec.priority;
+}
+
+RequestPriority Scheduler::priority(uint64_t id) const { return priorityOf(get(id)); }
+
 Phase Scheduler::phase(uint64_t id) const { return get(id).phase; }
 
 DecodeStage Scheduler::decodeStage(uint64_t id) const { return get(id).decodeStage; }
@@ -888,18 +922,17 @@ bool Scheduler::terminal(Phase phase) noexcept {
          phase == Phase::Failed;
 }
 
-bool Scheduler::byPriorityThenOrder(const Request *a,
-                                    const Request *b) noexcept {
-  if (a->spec.priority != b->spec.priority)
-    return a->spec.priority < b->spec.priority;
+bool Scheduler::byPriorityThenOrder(const Request *a, const Request *b) const noexcept {
+  if (priorityOf(*a) != priorityOf(*b))
+    return priorityOf(*a) < priorityOf(*b);
   return a->order < b->order;
 }
 
 bool Scheduler::leadsBefore(const Lane &a, const Lane &b) noexcept {
   // Priority first; then overdue lanes, oldest first; then the fewest
   // remaining rows, then submission order.
-  if (a.request->spec.priority != b.request->spec.priority)
-    return a.request->spec.priority < b.request->spec.priority;
+  if (a.priority != b.priority)
+    return a.priority < b.priority;
   if (a.overdue != b.overdue)
     return a.overdue;
   if (!a.overdue && a.remaining() != b.remaining())
