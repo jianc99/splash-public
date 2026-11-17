@@ -13,6 +13,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -91,6 +92,22 @@ std::vector<float> tensorScales(const gguf::TensorRows &rows, uint64_t start, ui
   return result;
 }
 
+// The host bytes a row reader reads its source into, kept by a load thread
+// from read to read, so that a load does not allocate and fault in new
+// pages for every read of up to kLoadStepBytes.
+struct RowScratch {
+  std::vector<uint8_t> source, scales, biases, converted;
+  std::vector<float> values;
+};
+
+// The first `count` elements of `buffer`, which grows to hold them and never
+// shrinks.
+template <class T>
+std::span<T> sized(std::vector<T> &buffer, uint64_t count) {
+  if (buffer.size() < count) buffer.resize(count);
+  return {buffer.data(), count};
+}
+
 // Native bytes [column, column + span) of `count` source rows of a quantized
 // safetensors tensor from source row `start` on, back to back, read from its
 // tensors: per native block an affine tensor's scale, bias and codes; an
@@ -100,7 +117,7 @@ std::vector<float> tensorScales(const gguf::TensorRows &rows, uint64_t start, ui
 // its row's tensor scale and its codes as stored; an fp8 tensor's row's tensor
 // scale and its E4M3 values (metal/abi/QuantFormat.h).
 void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
-                 uint8_t *to) {
+                 uint8_t *to, RowScratch &scratch) {
   const QuantFormat &format = nativeFormat(rows);
   const uint32_t id = gguf_format_of(rows.type);
   const bool affine = quant_affine_format(id);
@@ -114,8 +131,9 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
     throw GgufError("quantized safetensors rows are read by whole blocks: " + rows.name);
   // One read of each tensor per run of rows when they are read whole, else per row.
   const uint64_t perRead = span == rows.rowBytes ? count : 1, spanBlocks = span / block;
-  std::vector<uint8_t> codeBytes(perRead * spanBlocks * codes), scales(perRead * spanBlocks * scaleBytes),
-      biases(affine ? perRead * spanBlocks * 2 : 0);
+  const std::span<uint8_t> codeBytes = sized(scratch.source, perRead * spanBlocks * codes),
+                           scales = sized(scratch.scales, perRead * spanBlocks * scaleBytes),
+                           biases = sized(scratch.biases, affine ? perRead * spanBlocks * 2 : 0);
   const std::vector<float> g = tensorScales(rows, start, count);
   for (uint64_t row = 0; row < count; row += perRead) {
     const uint64_t at = (start + row) * groups + column / block;
@@ -201,13 +219,13 @@ void quantizeGroup(const uint8_t *weights, uint8_t *block) {
 // MLX's affine quantization rounds it. One read per run of rows when they are
 // read whole, else per row.
 void quantizeRows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
-                  uint8_t *to) {
+                  uint8_t *to, RowScratch &scratch) {
   const QuantFormat &format = kQuantFormats[GGUF_FMT_AF4G64];
   if (gguf_format_of(rows.type) != GGUF_FMT_AF4G64 || column % format.block_bytes || span % format.block_bytes)
     throw GgufError("a BF16 weight is quantized into whole af4g64 groups: " + rows.name);
   const uint64_t groupBytes = format.block_elements * 2, groups = rows.rowBytes / format.block_bytes;
   const uint64_t perRead = span == rows.rowBytes ? count : 1, spanGroups = span / format.block_bytes;
-  std::vector<uint8_t> weights(perRead * spanGroups * groupBytes);
+  const std::span<uint8_t> weights = sized(scratch.source, perRead * spanGroups * groupBytes);
   for (uint64_t row = 0; row < count; row += perRead) {
     rows.safetensors.bfloat16->read(((start + row) * groups + column / format.block_bytes) * groupBytes, weights);
     for (uint64_t group = 0; group < perRead * spanGroups; ++group)
@@ -249,14 +267,14 @@ void quantizeQ8_0Block(const float *values, uint8_t *block, const std::string &n
 // values quantized as quantizeQ8_0Block rounds them. One read per run of rows
 // when they are read whole, else per row.
 void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
-                      uint8_t *to) {
+                      uint8_t *to, RowScratch &scratch) {
   const QuantFormat &format = kQuantFormats[GGUF_FMT_Q80];
   if (column % format.block_bytes || span % format.block_bytes)
     throw GgufError("Q8_0 rows are built by whole blocks: " + rows.name);
   const bool float16 = rows.ggufFloatType == ggml::kF16;
   const uint64_t perRead = span == rows.rowBytes ? count : 1, blocks = span / format.block_bytes;
-  std::vector<uint8_t> source(perRead * blocks * format.block_elements * 2);
-  std::vector<float> values(source.size() / 2);
+  const std::span<uint8_t> source = sized(scratch.source, perRead * blocks * format.block_elements * 2);
+  const std::span<float> values = sized(scratch.values, source.size() / 2);
   for (uint64_t row = 0; row < count; row += perRead) {
     rows.file->readData(rows.offset + (start + row) * rows.ggufFloatRowBytes +
                             column / format.block_bytes * format.block_elements * 2,
@@ -280,14 +298,14 @@ void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t cou
 // one (metal/abi/QuantFormat.h), where a block_nvfp4 holds element j of each
 // 16 in the low nibble of byte j and element j + 8 in its high one.
 void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
-                       uint8_t *to) {
+                       uint8_t *to, RowScratch &scratch) {
   const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
   const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
   const uint64_t perNative = format.block_elements / blocks.blockElements, nativeBlocks = span / format.block_bytes,
                  sourceSpan = nativeBlocks * perNative * blocks.blockBytes;
   // One read per run of rows when they are read whole (contiguous in the file), else per row.
   const uint64_t perRead = span == rows.rowBytes ? count : 1;
-  std::vector<uint8_t> source(perRead * sourceSpan);
+  const std::span<uint8_t> source = sized(scratch.source, perRead * sourceSpan);
   const std::vector<float> g = tensorScales(rows, start, count);
   for (uint64_t row = 0; row < count; row += perRead) {
     rows.file->readData(rows.offset + (start + row) * rows.ggufNvfp4RowBytes +
@@ -317,7 +335,7 @@ void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t co
 // of each, back to back, from their column window on. Consecutive whole
 // source rows are read together.
 void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint64_t column, uint64_t span,
-              uint8_t *to) {
+              uint8_t *to, RowScratch &scratch) {
   if (!validWindow(rows) || first > rows.rows || count > rows.rows - first || column > rows.imageRowBytes() ||
       span > rows.imageRowBytes() - column)
     throw GgufError("prepared weight rows are out of bounds");
@@ -330,10 +348,10 @@ void readRows(const gguf::TensorRows &rows, uint64_t first, uint64_t count, uint
     uint8_t *out = to + row * span;
     switch (rowReader(rows)) {
     case RowReader::Stored: rows.file->readData(rows.offset + start * rows.rowBytes + column, {out, run * span}); break;
-    case RowReader::Safetensors: readSafetensorsRows(rows, start, run, column, span, out); break;
-    case RowReader::GgufNvfp4: readGgufNvfp4Rows(rows, start, run, column, span, out); break;
-    case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out); break;
-    case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out); break;
+    case RowReader::Safetensors: readSafetensorsRows(rows, start, run, column, span, out, scratch); break;
+    case RowReader::GgufNvfp4: readGgufNvfp4Rows(rows, start, run, column, span, out, scratch); break;
+    case RowReader::QuantizedBfloat16: quantizeRows(rows, start, run, column, span, out, scratch); break;
+    case RowReader::QuantizedGgufFloat: quantizeQ8_0Rows(rows, start, run, column, span, out, scratch); break;
     }
     row += run;
   }
@@ -384,8 +402,7 @@ uint64_t copyBytes(const gguf::Copy &copy) {
 // kLoadStepBytes or, for a wider row, a piece of whole values (whole native
 // blocks of rows a reader builds) of one row: a copy as stored reads in
 // place, a converted one through its thread's staging.
-void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
-                  std::vector<std::function<void(std::vector<uint8_t> &)>> &tasks) {
+void addCopyTasks(uint8_t *image, const gguf::Copy &copy, std::vector<std::function<void(RowScratch &)>> &tasks) {
   const gguf::TensorRows &rows = copy.source;
   const uint64_t unit = rowReader(rows) == RowReader::Stored ? 4 : nativeFormat(rows).block_bytes;
   const uint64_t span = std::min<uint64_t>(rows.rowBytes, kLoadStepBytes / unit * unit);
@@ -395,14 +412,14 @@ void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
     for (uint64_t column = 0; column < rows.rowBytes; column += span) {
       const uint64_t width = std::min(span, rows.rowBytes - column);
       uint8_t *to = image + copy.destination + copiedBytes(copy, first * rows.rowBytes + column);
-      tasks.push_back([&copy, first, count, column, width, to](std::vector<uint8_t> &staging) {
+      tasks.push_back([&copy, first, count, column, width, to](RowScratch &scratch) {
         const gguf::TensorRows &rows = copy.source;
         if (copy.conversion == gguf::Conversion::None) {
-          readRows(rows, first, count, column, width, to);
+          readRows(rows, first, count, column, width, to, scratch);
           return;
         }
-        if (staging.size() < count * width) staging.resize(count * width);
-        readRows(rows, first, count, column, width, staging.data());
+        const std::span<uint8_t> staging = sized(scratch.converted, count * width);
+        readRows(rows, first, count, column, width, staging.data(), scratch);
         switch (copy.conversion) {
         case gguf::Conversion::NarrowToBfloat16:
           narrowToBfloat16(staging.data(), count * width / 4, to, rows.name);
@@ -416,7 +433,7 @@ void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
           writeGdnDecay(staging.data(), count * width / (bfloat16 ? 2 : 4), bfloat16, to);
           break;
         }
-        case gguf::Conversion::DequantizeToFloat32: // decoded on the GPU (writeDecoded)
+        case gguf::Conversion::DequantizeToFloat32: // decoded on the GPU (addDecodedChunks)
         case gguf::Conversion::None: break;
         }
       });
@@ -477,43 +494,39 @@ void requireRepack(const gguf::Repack &repack, uint64_t imageBytes) {
   for (size_t plane = 0; plane < sizes.size(); ++plane) requireRange(offsets[plane], sizes[plane], imageBytes);
 }
 
-// Repacks a repack's rows chunk by chunk: threads read the rows into the
-// input staging, and the GPU writes their planes in place into image.
-void writeRepack(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Repack &repack,
-                 const RepackChunk &chunk, const metal::MetalBuffer &input) {
+// A chunk of an image's GPU writes: `stage` reads its rows into a staging
+// buffer's host bytes on the load threads, each with its own scratch, and
+// the dispatch of `pipeline` writes them from there into the image, the
+// staging buffer bound at index `input` beside `buffers`.
+struct GpuChunk {
+  std::function<void(uint8_t *host, std::vector<RowScratch> &scratch)> stage;
+  std::string pipeline;
+  uint32_t input = 0;
+  std::vector<metal::BufferBinding> buffers;
+  uint32_t paramsIndex = 0;
+  std::vector<uint8_t> params;
+  uint64_t items = 0;
+};
+
+template <class Params>
+std::vector<uint8_t> paramBytes(const Params &params) {
+  std::vector<uint8_t> bytes(sizeof(params));
+  std::memcpy(bytes.data(), &params, sizeof(params));
+  return bytes;
+}
+
+// A repack's chunks: threads read a chunk's rows into the staging, and the
+// GPU writes their planes in place into image.
+void addRepackChunks(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Repack &repack,
+                     const RepackChunk &chunk, std::vector<GpuChunk> &chunks) {
   const QuantFormat &format = kQuantFormats[repack.format];
   const auto offsets = planeOffsets(repack);
-  auto *host = static_cast<uint8_t *>(input.contents());
   for (uint64_t firstRow = 0; firstRow < repack.rows; firstRow += chunk.rows) {
     const uint64_t rows = std::min(chunk.rows, repack.rows - firstRow);
     for (uint64_t firstColumn = 0; firstColumn < repack.columns; firstColumn += chunk.columns) {
       const uint64_t columns = std::min(chunk.columns, repack.columns - firstColumn);
       const uint64_t chunkRowBytes = ggufRowBytes(format, columns);
       const uint64_t column = ggufRowBytes(format, firstColumn);
-      // The sources' rows in image order, then zero rows, a task for each
-      // run of rows within kLoadStepBytes.
-      struct Read {
-        const gguf::TensorRows *tensor;
-        uint64_t first, count;
-        uint8_t *to;
-      };
-      std::vector<Read> reads;
-      const uint64_t batch = std::max<uint64_t>(1, kLoadStepBytes / chunkRowBytes);
-      uint64_t start = 0;
-      for (const gguf::TensorRows &tensor : repack.sources) {
-        const uint64_t begin = std::max(firstRow, start), end = std::min(firstRow + rows, start + tensor.rows);
-        for (uint64_t row = begin; row < end; row += batch)
-          reads.push_back({&tensor, row - start, std::min(batch, end - row), host + (row - firstRow) * chunkRowBytes});
-        start += tensor.rows;
-      }
-      parallelFor(reads.size(), [&](size_t index, unsigned) {
-        const Read &read = reads[index];
-        readRows(*read.tensor, read.first, read.count, column, chunkRowBytes, read.to);
-      });
-      if (start < firstRow + rows) {
-        const uint64_t zero = std::max(start, firstRow);
-        std::memset(host + (zero - firstRow) * chunkRowBytes, 0, (firstRow + rows - zero) * chunkRowBytes);
-      }
       // A plane is [rows / QUANT_TILE_ROWS][units][QUANT_TILE_ROWS] tiles and
       // a chunk starts on a tile: after the planes of the rows above it and,
       // in its tile rows, of the columns before it. The kernel writes plane1
@@ -534,13 +547,39 @@ void writeRepack(metal::MetalBackend &backend, const metal::MetalBuffer &image, 
       params.src_row_bytes = static_cast<uint32_t>(chunkRowBytes);
       params.dst_plane1 = lengths[1] ? static_cast<uint32_t>(at[1] - at[0]) : 0;
       params.dst_meta = static_cast<uint32_t>(at[2] - at[0]);
+      // The sources' rows in image order, then zero rows, a task for each
+      // run of rows within kLoadStepBytes.
+      const auto stage = [&repack, firstRow, rows, column, chunkRowBytes](uint8_t *host,
+                                                                         std::vector<RowScratch> &scratch) {
+        struct Read {
+          const gguf::TensorRows *tensor;
+          uint64_t first, count;
+          uint8_t *to;
+        };
+        std::vector<Read> reads;
+        const uint64_t batch = std::max<uint64_t>(1, kLoadStepBytes / chunkRowBytes);
+        uint64_t start = 0;
+        for (const gguf::TensorRows &tensor : repack.sources) {
+          const uint64_t begin = std::max(firstRow, start), end = std::min(firstRow + rows, start + tensor.rows);
+          for (uint64_t row = begin; row < end; row += batch)
+            reads.push_back(
+                {&tensor, row - start, std::min(batch, end - row), host + (row - firstRow) * chunkRowBytes});
+          start += tensor.rows;
+        }
+        parallelFor(reads.size(), [&](size_t index, unsigned thread) {
+          const Read &read = reads[index];
+          readRows(*read.tensor, read.first, read.count, column, chunkRowBytes, read.to, scratch[thread]);
+        });
+        if (start < firstRow + rows) {
+          const uint64_t zero = std::max(start, firstRow);
+          std::memset(host + (zero - firstRow) * chunkRowBytes, 0, (firstRow + rows - zero) * chunkRowBytes);
+        }
+      };
       // One thread per row and 32-column group, rounded up to whole
       // threadgroups: an odd number of 64-row tiles by an odd number of
       // 64-column spans leaves half a threadgroup, which the kernel bounds.
-      const uint64_t items = rows * (columns / 32);
-      static_cast<void>(backend.submit({"gguf_repack", {{0, input}, {1, backend.view(image, at[0], extent)}},
-                                        {{2, &params, sizeof(params)}}, {(items + 255) / 256, 1, 1},
-                                        {256, 1, 1}}));
+      chunks.push_back({stage, "gguf_repack", 0, {{1, backend.view(image, at[0], extent)}}, 2, paramBytes(params),
+                        rows * (columns / 32)});
     }
   }
 }
@@ -555,26 +594,26 @@ uint64_t decodedRun(const gguf::Copy &copy) {
   return run;
 }
 
-// Writes a DequantizeToFloat32 copy: runs of its rows as stored staged in
-// input, each gathered on the GPU (kernels/shared/embedding.metal,
-// gguf_embed_f32_<format>) into the F32 values of its format's decode, the run's
-// rows by their ids in `ids` (0, 1, ...).
-void writeDecoded(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Copy &copy,
-                  const metal::MetalBuffer &input, const metal::MetalBuffer &ids) {
+// A DequantizeToFloat32 copy's chunks: runs of its rows as stored staged,
+// each gathered on the GPU (kernels/shared/embedding.metal,
+// gguf_embed_f32_<format>) into the F32 values of its format's decode, the
+// run's rows by their ids in `ids` (0, 1, ...).
+void addDecodedChunks(metal::MetalBackend &backend, const metal::MetalBuffer &image, const gguf::Copy &copy,
+                      const metal::MetalBuffer &ids, std::vector<GpuChunk> &chunks) {
   const gguf::TensorRows &rows = copy.source;
   const uint64_t columns = gguf::decodedColumns(rows), run = decodedRun(copy);
   const QuantFormat &format = kQuantFormats[gguf_format_of(rows.type)];
   for (uint64_t first = 0; first < rows.rows; first += run) {
     const uint64_t count = std::min(run, rows.rows - first);
-    readRows(rows, first, count, 0, rows.rowBytes, static_cast<uint8_t *>(input.contents()));
     const GgufEmbedParams params{static_cast<uint32_t>(count), static_cast<uint32_t>(count),
                                  static_cast<uint32_t>(columns)};
     const metal::MetalBuffer output = backend.view(image, copy.destination + first * columns * sizeof(float),
                                                    count * columns * sizeof(float));
-    static_cast<void>(backend.submit({std::string("gguf_embed_f32_") + format.name,
-                                      {{0, ids}, {1, input}, {2, output}},
-                                      {{3, &params, sizeof(params)}}, {(count * columns + 255) / 256, 1, 1},
-                                      {256, 1, 1}}));
+    const auto stage = [&rows, first, count](uint8_t *host, std::vector<RowScratch> &scratch) {
+      readRows(rows, first, count, 0, rows.rowBytes, host, scratch[0]);
+    };
+    chunks.push_back({stage, std::string("gguf_embed_f32_") + format.name, 1, {{0, ids}, {2, output}}, 3,
+                      paramBytes(params), count * columns});
   }
 }
 
@@ -585,10 +624,12 @@ void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, 
   for (const gguf::TensorRows &tensor : repack.sources) sourceRows += tensor.rows;
   if (first > sourceRows || count > sourceRows - first) throw GgufError("repack rows are out of bounds");
   const uint64_t rowBytes = ggufRowBytes(kQuantFormats[repack.format], repack.columns);
+  RowScratch scratch;
   uint64_t start = 0;
   for (const gguf::TensorRows &tensor : repack.sources) {
     const uint64_t begin = std::max(first, start), end = std::min(first + count, start + tensor.rows);
-    if (begin < end) readRows(tensor, begin - start, end - begin, 0, rowBytes, to + (begin - first) * rowBytes);
+    if (begin < end)
+      readRows(tensor, begin - start, end - begin, 0, rowBytes, to + (begin - first) * rowBytes, scratch);
     start += tensor.rows;
   }
 }
@@ -644,20 +685,43 @@ void writeGgufImage(metal::MetalBackend &backend, const metal::MetalBuffer &imag
     std::memcpy(destination.data() + fill.offset, fill.bytes.data(), fill.bytes.size());
   // Copies keep their source precision and never pass through a
   // quantization operation.
-  std::vector<std::function<void(std::vector<uint8_t> &)>> tasks;
+  std::vector<std::function<void(RowScratch &)>> tasks;
   for (const gguf::Copy &copy : plan.copies)
     if (copy.conversion != gguf::Conversion::DequantizeToFloat32) addCopyTasks(destination.data(), copy, tasks);
-  std::vector<std::vector<uint8_t>> copyStaging(loadThreads());
-  parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](copyStaging[thread]); });
-  // One staging buffer serves every repack and decoded copy of the image.
+  std::vector<RowScratch> scratch(loadThreads());
+  parallelFor(tasks.size(), [&](size_t index, unsigned thread) { tasks[index](scratch[thread]); });
   if (plan.repacks.empty() && decoded.empty()) return;
-  const auto input = backend.allocateBuffer(staging, metal::BufferStorage::Shared, "load/rows");
-  for (size_t i = 0; i < plan.repacks.size(); ++i) writeRepack(backend, image, plan.repacks[i], chunks[i], input);
-  if (decoded.empty()) return;
-  const auto rowIds = backend.allocateBuffer(ids * sizeof(uint32_t), metal::BufferStorage::Shared, "load/row-ids");
-  auto *id = static_cast<uint32_t *>(rowIds.contents());
-  for (uint32_t row = 0; row < ids; ++row) id[row] = row;
-  for (const gguf::Copy *copy : decoded) writeDecoded(backend, image, *copy, input, rowIds);
+  metal::MetalBuffer rowIds;
+  if (!decoded.empty()) {
+    rowIds = backend.allocateBuffer(ids * sizeof(uint32_t), metal::BufferStorage::Shared, "load/row-ids");
+    auto *id = static_cast<uint32_t *>(rowIds.contents());
+    for (uint32_t row = 0; row < ids; ++row) id[row] = row;
+  }
+  std::vector<GpuChunk> gpuChunks;
+  for (size_t i = 0; i < plan.repacks.size(); ++i)
+    addRepackChunks(backend, image, plan.repacks[i], chunks[i], gpuChunks);
+  for (const gguf::Copy *copy : decoded) addDecodedChunks(backend, image, *copy, rowIds, gpuChunks);
+  // Two staging buffers serve every repack and decoded copy of the image,
+  // one while a single chunk has nothing to overlap.
+  std::array<metal::MetalBuffer, 2> inputs;
+  for (size_t i = 0; i < std::min<size_t>(2, gpuChunks.size()); ++i)
+    inputs[i] = backend.allocateBuffer(staging, metal::BufferStorage::Shared, "load/rows");
+  pipelineChunks(
+      gpuChunks.size(),
+      [&](size_t index, unsigned buffer) {
+        gpuChunks[index].stage(static_cast<uint8_t *>(inputs[buffer].contents()), scratch);
+      },
+      [&](size_t index, unsigned buffer) {
+        const GpuChunk &chunk = gpuChunks[index];
+        std::vector<metal::BufferBinding> buffers = chunk.buffers;
+        buffers.push_back({chunk.input, inputs[buffer]});
+        const metal::ComputeDispatch dispatch{chunk.pipeline,
+                                              std::move(buffers),
+                                              {{chunk.paramsIndex, chunk.params.data(), chunk.params.size()}},
+                                              {(chunk.items + 255) / 256, 1, 1},
+                                              {256, 1, 1}};
+        return backend.submitCommandAsync(std::span<const metal::ComputeDispatch>(&dispatch, 1));
+      });
 }
 
 WeightFile loadImage(metal::MetalBackend &backend, WeightImages &images, std::string_view prefix,
