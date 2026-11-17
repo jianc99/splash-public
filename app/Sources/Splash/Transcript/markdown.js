@@ -191,10 +191,31 @@ const markdown = (() => {
     return {cut, open: fence?.map[1] === lines && fence.map[1] - fence.map[0] === code + 1};
   }
 
+  // `text` without the table that only begins at its end: a line that starts with a bar, alone
+  // or with as much of the line under it, the one of dashes, as has come. Until that line has a
+  // cell for each of the header's the two are a paragraph to the parser, and a reply that streamed
+  // drew them as text, bars and dashes, then again as the table. They wait for it; a line of bars
+  // that never becomes a table draws as the reply ends.
+  function settled(text) {
+    let tokens = [];
+    try {
+      tokens = parser.parse(text, {});
+    } catch {}
+    const last = tokens.findLast(token => token.level === 0 && token.map);
+    if (last?.type !== 'paragraph_open') return text;
+    const lines = [...text.matchAll(/[^\r\n]*(?:\r\n?|\n|$)/g)].map(([line]) => line);
+    const bars = line => /^ {0,3}\|/.test(line);
+    const end = last.map[1] - 1;
+    const under = end > last.map[0] && bars(lines[end - 1]) && /^ {0,3}[|:\- ]+\s*$/.test(lines[end]);
+    const from = under ? end - 1 : bars(lines[end]) ? end : -1;
+    return from < 0 ? text : lines.slice(0, from).join('');
+  }
+
   // Draws `text` into `container` as Markdown. Whole, it changes only the nodes that differ from
   // what the container shows, so that a reply drawn again keeps its selection and its place. While
   // it streams, `live`, what it has finished, up to where `scan` cuts it, stays as it was drawn,
-  // and only the rest is drawn again: each frame draws the end of a reply, never all of it.
+  // and only the rest is drawn again: each frame draws the end of a reply, never all of it, and
+  // not yet a table that only begins there (`settled`).
   function draw(container, text, live = false) {
     container.wanted = undefined;
     const last = container.markdown;
@@ -212,7 +233,7 @@ const markdown = (() => {
     const kept = last?.live && text.startsWith(last.frozen) ? last : {frozen: '', count: 0};
     const {cut, open} = scan(text, kept.frozen.length);
     const finished = cut > kept.frozen.length ? nodes(render(text.slice(kept.frozen.length, cut))) : [];
-    replace(container, kept.count, [...finished, ...nodes(render(text.slice(cut), open))]);
+    replace(container, kept.count, [...finished, ...nodes(render(settled(text.slice(cut)), open))]);
     container.markdown = {text, live, frozen: text.slice(0, cut), count: kept.count + finished.length};
   }
 
