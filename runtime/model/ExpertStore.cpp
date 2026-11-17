@@ -368,6 +368,11 @@ struct ExpertStore::Impl {
   // have moved or given back; no slot is staged, as no load is under way;
   // and every load table entry names slot 0, inside every size's floor.
   void forgetRepack();
+  // No expert of the sizes it forgets (every size, or those that stream) is
+  // resident: their blocks name no slot, every slot of them is free, their
+  // recyclers start over, and a read-ahead in flight is forgotten (its
+  // readers end the pieces they took).
+  void forgetExperts(bool everySize);
   // The live chunks' count, bytes and slots in the counters, none while the
   // store is released.
   void countLive();
@@ -1355,30 +1360,47 @@ uint64_t ExpertStore::readBytes() const {
 
 bool ExpertStore::released() const noexcept { return impl_->released; }
 
-void ExpertStore::release() {
-  std::lock_guard lock(impl_->mutex);
-  Impl &impl = *impl_;
-  if (impl.released) return;
-  // A read-ahead in flight writes into the memory released below: its
-  // readers end the pieces they took, and it is forgotten.
-  impl.retireAhead();
-  impl.ahead.block = impl.plan.block = kNoSlot;
-  for (Impl::Block &block : impl.blocks) {
+void ExpertStore::Impl::forgetExperts(bool everySize) {
+  retireAhead();
+  ahead.block = plan.block = kNoSlot;
+  auto *table = static_cast<uint32_t *>(tables.contents());
+  for (uint32_t index = 0; index < blocks.size(); ++index) {
+    Block &block = blocks[index];
+    if (!everySize && !sizes[block.size].streams) continue;
     std::ranges::fill(block.slot, kNoSlot);
+    counters.resident -= block.resident;
     block.resident = 0;
+    std::fill_n(table + uint64_t{index} * shape.experts, shape.experts, MOE_SLOT_ABSENT);
   }
-  std::fill_n(static_cast<uint32_t *>(impl.tables.contents()), impl.tables.sizeBytes() / sizeof(uint32_t),
-              MOE_SLOT_ABSENT);
-  // The chunks past the live ones were given back already.
-  for (Impl::Size &size : impl.sizes) {
-    for (uint32_t chunk = 0; chunk < size.chunks.liveChunks(); ++chunk) impl.backend.releaseMemory(size.buffers[chunk]);
+  for (Size &size : sizes) {
+    if (!everySize && !size.streams) continue;
     std::ranges::fill(size.ownerBlock, kNoSlot);
     std::ranges::fill(size.ownerExpert, kNoSlot);
     size.recycling.reset();
   }
+  forgetRepack();
+}
+
+void ExpertStore::forget() {
+  std::lock_guard lock(impl_->mutex);
+  Impl &impl = *impl_;
+  if (impl.released) return;
+  if (impl.backend.commandInFlight())
+    throw std::logic_error("an expert store forgets its experts while a command is in flight");
+  impl.forgetExperts(false);
+  impl.publish();
+}
+
+void ExpertStore::release() {
+  std::lock_guard lock(impl_->mutex);
+  Impl &impl = *impl_;
+  if (impl.released) return;
+  // A read-ahead in flight writes into the memory released below.
+  impl.forgetExperts(true);
+  // The chunks past the live ones were given back already.
+  for (Impl::Size &size : impl.sizes)
+    for (uint32_t chunk = 0; chunk < size.chunks.liveChunks(); ++chunk) impl.backend.releaseMemory(size.buffers[chunk]);
   impl.backend.releaseMemory(impl.staging);
-  impl.forgetRepack();
-  impl.counters.resident = 0;
   impl.released = true;
   impl.countLive();
   impl.publish();

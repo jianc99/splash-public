@@ -4458,6 +4458,11 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
           wallSeconds, std::move(lanes)};
 }
 
+void Runtime::endWarmups() {
+  if (ExpertStore *store = impl_->model.expertStore())
+    store->forget();
+}
+
 WarmupStepResult Runtime::warmupCompositeStateRestore() {
   constexpr uint64_t id = std::numeric_limits<uint64_t>::max() - 121;
   constexpr uint32_t prefixTokens = 2 * kv::kPageTokens;
