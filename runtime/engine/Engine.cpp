@@ -198,6 +198,8 @@ bool Engine::tick(double now) {
   // however the tick ends, what holds each from now on is as it leaves the
   // engine.
   holds(now);
+  // Order decisions read the priorities as they stand now (Scheduler::age).
+  scheduler_.age(now);
   // The wait the last tick left the next prefill unit in, for a decoder whose
   // memory lands, is this tick's to decide again: one that plans it again
   // goes on with it, and any other ends it, however it ends, the time it
@@ -411,7 +413,7 @@ bool Engine::tick(double now) {
     // pass comes after that plan: the command goes on, its other lanes
     // keeping the passes they ran, and the lane ends at its last pass.
     if (passCommand_.anyEnded() && !plan->pass &&
-        scheduler_.yieldsTo(requests_.at(plan->items.front().requestId).request.priority, in)) {
+        scheduler_.yieldsTo(scheduler_.priority(plan->items.front().requestId), in)) {
       settleEnded(passCommand_.yield());
       sweepTerminal(now);
       return true;
@@ -498,8 +500,8 @@ std::optional<RequestPriority> Engine::suspendedTier() const {
   for (const auto &[id, active] : requests_) {
     // A finalized request keeps the scheduler's flag until it is swept.
     if (!active.finalized && scheduler_.suspended(id) &&
-        (!tier || active.request.priority < *tier))
-      tier = active.request.priority;
+        (!tier || scheduler_.priority(id) < *tier))
+      tier = scheduler_.priority(id);
   }
   return tier;
 }
@@ -508,13 +510,13 @@ bool Engine::admissionTries(const Request &active, std::optional<RequestPriority
                             bool draining) const {
   if (!tier)
     return !draining;
-  return active.request.priority < *tier ||
+  return scheduler_.priority(active.request.id) < *tier ||
          (scheduler_.suspended(active.request.id) && !draining);
 }
 
 bool Engine::belowRunnable(const Request &active) const {
   const std::optional<RequestPriority> runnable = scheduler_.highestRunnablePriority();
-  return runnable && active.request.priority > *runnable;
+  return runnable && scheduler_.priority(active.request.id) > *runnable;
 }
 
 void Engine::holds(double now) noexcept {
@@ -902,7 +904,7 @@ bool Engine::pendingSharedPrefill(const Request &active,
   if (active.skipCache)
     return false;
   for (const auto &[id, peer] : requests_) {
-    if (!peer.lane || peer.request.priority > active.request.priority)
+    if (!peer.lane || scheduler_.priority(id) > scheduler_.priority(active.request.id))
       continue;
     // A peer still restoring its prefix from disk has planned its boundaries
     // at admission; siblings wait for it rather than each reading the same
@@ -940,7 +942,7 @@ uint32_t Engine::awaitedBoundary(const Request &producer, uint32_t end) const {
     // it waits for are published, resuming where its probe last found; one
     // of a lower priority waits for the producer's priority to be done.
     if (waiter.lane || waiter.finalized || waiter.skipCache || scheduler_.suspended(id) ||
-        waiter.request.priority != producer.request.priority)
+        scheduler_.priority(id) != scheduler_.priority(producer.request.id))
       continue;
     const uint32_t resumeBoundary =
         waiter.admissionProbe ? waiter.admissionProbe->cachedTokens() : 0;
@@ -955,7 +957,8 @@ bool Engine::admit(Request &active, double now) {
   // A start of a higher priority than the command between its passes may
   // take that command, as its prompt's command does once it runs
   // (ClaimSpec::supersedes).
-  const bool supersedes = scheduler_.yieldsTo(active.request.priority, {.passes = passCommand_.progress()});
+  const bool supersedes =
+      scheduler_.yieldsTo(scheduler_.priority(active.request.id), {.passes = passCommand_.progress()});
   ModelRequest modelRequest = active.request.modelView();
   modelRequest.prompt = active.exactTokens;
   CacheLookup lookup =
@@ -1311,7 +1314,7 @@ bool Engine::addSharedPrefillBoundaries(Request &active, uint32_t after, bool co
     // until the pass ends. A request that ignores the cache uses no junction.
     if (id == active.request.id || peer.lane || scheduler_.suspended(id) ||
         peer.finalized || peer.skipCache ||
-        peer.request.priority < active.request.priority)
+        scheduler_.priority(id) < scheduler_.priority(active.request.id))
       continue;
     changed = addStateBoundary(active, after, sharedPrefillBoundary(active, peer), false,
                                completeAfter) ||

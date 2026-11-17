@@ -597,6 +597,89 @@ void testHighestRunnablePriority() {
           "a mask wait or a queued request set the runnable tier");
 }
 
+// The order a Background request is aged to Normal after (Scheduler.cpp).
+constexpr double kBackgroundAge = 10'000.0;
+
+// A chat's title (a Background prompt of 600 rows and 32 tokens) asked while
+// a Normal stream decodes: strict priority would hold it for the stream's
+// whole length. It waits out the age, then its unit follows the stream's next
+// decode command, and it ends with four decode commands beside the stream.
+void testATitleBesideAStreamEndsWithinItsAge() {
+  DenseSim sim(0.5);
+  sim.decoder(1);
+  sim.lane(2, 0, 600, RequestPriority::Background);
+  std::optional<double> started;
+  double longestDecode = 0.0, unit = 0.0;
+  uint32_t decodes = 0;
+  while (sim.scheduler.phase(2) != Phase::Completed) {
+    require(sim.now < 2 * kBackgroundAge, "the title waited past twice its age beside the stream");
+    sim.scheduler.age(sim.now);
+    const BatchPlan plan = sim.plan();
+    const bool title = std::ranges::any_of(plan.items, [](const BatchItem &item) { return item.requestId == 2; });
+    if (title && plan.kind == WorkKind::Prefill && !started)
+      started = sim.now;
+    const double wall = sim.run(plan);
+    if (plan.kind == WorkKind::Decode)
+      longestDecode = std::max(longestDecode, wall);
+    else
+      unit += wall;
+    if (title && plan.kind == WorkKind::Decode && ++decodes == 4)
+      sim.scheduler.finish(2);
+  }
+  require(started && *started >= kBackgroundAge && *started <= kBackgroundAge + longestDecode,
+          "the title's unit did not follow the stream's first decode command past its age");
+  require(sim.now <= *started + unit + 5 * longestDecode,
+          "the title ended " + std::to_string(sim.now - *started) + " ms after its unit began");
+}
+
+// A title with nothing beside it runs at once and keeps its own priority;
+// one aged, then suspended, is Background again and ages from its suspension.
+void testABackgroundRequestAgesFromItsWaitOnly() {
+  DenseSim sim;
+  sim.lane(1, 0, 600, RequestPriority::Background);
+  sim.scheduler.age(0.0);
+  require(sim.plan().kind == WorkKind::Prefill, "a lone Background prompt waited");
+  sim.scheduler.age(kBackgroundAge - 1.0);
+  require(sim.scheduler.priority(1) == RequestPriority::Background, "a Background request aged before its time");
+  sim.scheduler.age(kBackgroundAge);
+  require(sim.scheduler.priority(1) == RequestPriority::Normal, "a Background request did not age");
+  sim.scheduler.suspendForResources(1);
+  sim.scheduler.age(kBackgroundAge + 100.0);
+  require(sim.scheduler.priority(1) == RequestPriority::Background, "a suspended request kept its age");
+  sim.scheduler.age(2 * kBackgroundAge + 100.0);
+  require(sim.scheduler.priority(1) == RequestPriority::Normal, "a suspended request did not age from its suspension");
+  sim.decoder(2, RequestPriority::Foreground);
+  sim.scheduler.age(10 * kBackgroundAge);
+  require(sim.scheduler.priority(2) == RequestPriority::Foreground, "aging changed a Foreground request");
+}
+
+// A Background stream served alone for longer than its age is still
+// Background when a Normal turn arrives: it yields to the turn, and is
+// ordered as Normal once it has been held back for its age, not before.
+void testAServedBackgroundRequestYieldsToALaterArrival() {
+  DenseSim sim(0.5);
+  sim.decoder(1, RequestPriority::Background);
+  double served = 0.0;
+  while (sim.now < 1.5 * kBackgroundAge) {
+    sim.scheduler.age(sim.now);
+    served = sim.now;
+    sim.run(sim.plan());
+  }
+  require(sim.scheduler.priority(1) == RequestPriority::Background, "a Background request served alone aged");
+  sim.lane(2, 8192, 300);
+  std::optional<double> resumed;
+  while (!resumed) {
+    require(sim.now < served + 2 * kBackgroundAge, "the held-back Background stream never aged");
+    sim.scheduler.age(sim.now);
+    const BatchPlan plan = sim.plan();
+    if (std::ranges::any_of(plan.items, [](const BatchItem &item) { return item.requestId == 1; }))
+      resumed = sim.now;
+    sim.run(plan);
+  }
+  require(*resumed >= served + kBackgroundAge && sim.scheduler.priority(1) == RequestPriority::Normal,
+          "the Background stream ran beside the Normal turn before it was held back for its age");
+}
+
 void testResourceSuspensionReplaysFromCache() {
   DenseSim sim;
   sim.lane(1, 0, 4096);
@@ -1911,6 +1994,9 @@ constexpr test::TestCase kTests[] = {
     {"testPriorityPrecedesWorkKindAlternation", testPriorityPrecedesWorkKindAlternation},
     {"testPrefillCommandContainsOnePriorityTier", testPrefillCommandContainsOnePriorityTier},
     {"testHighestRunnablePriority", testHighestRunnablePriority},
+    {"testATitleBesideAStreamEndsWithinItsAge", testATitleBesideAStreamEndsWithinItsAge},
+    {"testABackgroundRequestAgesFromItsWaitOnly", testABackgroundRequestAgesFromItsWaitOnly},
+    {"testAServedBackgroundRequestYieldsToALaterArrival", testAServedBackgroundRequestYieldsToALaterArrival},
     {"testResourceSuspensionReplaysFromCache", testResourceSuspensionReplaysFromCache},
     {"testAdmissionStartsTheLanesOfTheNextCommand", testAdmissionStartsTheLanesOfTheNextCommand},
     {"testAdmissionStartsAtMostAFullBatch", testAdmissionStartsAtMostAFullBatch},

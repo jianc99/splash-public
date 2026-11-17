@@ -45,7 +45,11 @@ Completions, text completions, Responses and Messages share these fields:
 - `priority`: `foreground`, `normal` (the default) or `background`. A request
   waits while one of a higher priority runs, and when lanes or memory run short
   a higher priority suspends a running request of a lower one
-  ([admission and eviction](internals.md#admission-and-eviction)).
+  ([admission and eviction](internals.md#admission-and-eviction)). A
+  `background` request held back for 10 s (not served since its arrival or
+  its last step) is served as `normal` from then on, so that attended work
+  cannot starve it; for memory it stays `background`, and a suspension makes
+  it `background` again.
 - `timeout`: the seconds a request may take from its arrival; it can only
   shorten `--request-timeout`. A request that runs out returns 504
   `request_timeout`.

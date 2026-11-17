@@ -232,6 +232,13 @@ public:
   // The command between its passes was abandoned.
   void abandoned();
 
+  // The clock order decisions read (priority), from each tick: a request is
+  // held back from the first tick that finds it.
+  void age(double now) noexcept;
+  // The priority the request is ordered by now: Normal for a Background one
+  // held back kBackgroundAgeMilliseconds, else its own. Admission,
+  // prefill and decode order read it; memory reads the declared priority.
+  [[nodiscard]] RequestPriority priority(uint64_t requestId) const;
   [[nodiscard]] Phase phase(uint64_t requestId) const;
   // The stage of its decode commands, which a suspension keeps.
   [[nodiscard]] DecodeStage decodeStage(uint64_t requestId) const;
@@ -265,11 +272,15 @@ private:
     // again the rows it runs that ran before it, and none it runs that were
     // counted and never ran.
     uint32_t rowsCounted = 0;
+    // Since when it is held back (age): its first tick, its last command
+    // before it aged, or the first tick after its suspension.
+    std::optional<double> waitingSince;
   };
 
   // A prefill lane as planning weighs it.
   struct Lane final {
     const Request *request = nullptr;
+    RequestPriority priority = RequestPriority::Normal;
     uint32_t processed = 0;
     LaneShape shape;
     bool overdue = false;
@@ -286,8 +297,8 @@ private:
   [[nodiscard]] Request &get(uint64_t requestId);
   [[nodiscard]] const Request &get(uint64_t requestId) const;
   [[nodiscard]] static bool terminal(Phase phase) noexcept;
-  [[nodiscard]] static bool byPriorityThenOrder(const Request *a,
-                                                const Request *b) noexcept;
+  [[nodiscard]] RequestPriority priorityOf(const Request &request) const noexcept;
+  [[nodiscard]] bool byPriorityThenOrder(const Request *a, const Request *b) const noexcept;
   [[nodiscard]] static bool samePlan(const BatchPlan &a, const BatchPlan &b) noexcept;
   // Whether prefill takes lane `a` before lane `b`: the order planning leads
   // by and joins in.
@@ -356,6 +367,7 @@ private:
   // The lanes the active command was planned without.
   std::vector<uint64_t> excluded_;
   uint64_t order_ = 0;
+  double now_ = 0.0;
   uint64_t decodeDispatchOrder_ = 0;
   double decodeShare_;
   // Decode time that prefill still owes the lanes that decoded beside it

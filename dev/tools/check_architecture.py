@@ -233,7 +233,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # the Start frame's three fields; Engine.cpp 4: filling them; NativeRuntime.cpp 1).
 # 30,643: +11 for /status disk.spilled_kv_read_bytes and
 # disk.weights_read_bytes (Status.cpp).
-ENGINE_LINE_BUDGET = 30_643
+# 30,691: +48 for a Background request held back 10 s being ordered as Normal
+# (Scheduler.cpp 33, Scheduler.hpp 12, Engine.cpp 3).
+ENGINE_LINE_BUDGET = 30_691
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
