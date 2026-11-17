@@ -624,7 +624,10 @@ void readRepackRows(const gguf::Repack &repack, uint64_t first, uint64_t count, 
   for (const gguf::TensorRows &tensor : repack.sources) sourceRows += tensor.rows;
   if (first > sourceRows || count > sourceRows - first) throw GgufError("repack rows are out of bounds");
   const uint64_t rowBytes = ggufRowBytes(kQuantFormats[repack.format], repack.columns);
-  RowScratch scratch;
+  // Its callers, the streamed experts' readers, read rows load after load on
+  // threads that live with the store: each thread keeps its scratch, at most
+  // a read's source (kLoadStepBytes of rows).
+  thread_local RowScratch scratch;
   uint64_t start = 0;
   for (const gguf::TensorRows &tensor : repack.sources) {
     const uint64_t begin = std::max(first, start), end = std::min(first + count, start + tensor.rows);
