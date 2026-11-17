@@ -1438,6 +1438,13 @@ struct OutputTests {
         #expect(try words("auth")
             == "Hugging Face refused access to a/b. Sign in with an account that can read it (hf auth login) and, "
                 + "if the model asks, accept its terms at huggingface.co/a/b, then try again.")
+        // A disk without room is worded by its numbers, not by the message, which names the
+        // repository downloading (the draft, first) and the cache's path for the log.
+        let disk = try #require(Installer.Failure(line: #"{"event": "error", "kind": "disk", "needed": 3870000000, "#
+            + #""available": 310000000, "message": "not enough disk space for incoai/b-DFlash2: the installation "#
+            + #"needs 3.87 GB and 0.31 GB is available in /Users/x/.cache/huggingface/hub"}"#))
+        #expect(Installer.problem(disk, model: "a/b:Q4")
+            == "It needs 3.9 GB of disk space, and 310 MB is free. Free some space, then try again.")
         let unclassed = try #require(Installer.Failure(
             line: #"{"event": "error", "kind": null, "message": "cannot install a/b: no supported model"}"#))
         #expect(Installer.problem(unclassed, model: "a/b") == "cannot install a/b: no supported model")

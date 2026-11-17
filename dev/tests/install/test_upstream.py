@@ -1920,6 +1920,32 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(text_only)
         self.assertEqual(upstream._selections_of(plain), [text_only.link, plain.link])
 
+    def test_a_download_the_disk_has_no_room_for_is_refused_for_the_whole_model(self):
+        # The draft downloads first, and its check counts the target's files
+        # too: freeing what the refusal names is enough, so a second try
+        # does not stop again at the target. The error event says so in
+        # numbers, classed for the app.
+        fake = fake_hub(self, self.cache)
+        with mock.patch.object(hub, "_available_bytes", lambda path: 0):
+            status, events, _ = self.run_installer("prepare")
+        self.assertEqual(status, 1)
+        [event] = events
+        needed = event["needed"]
+        self.assertEqual(
+            {k: event[k] for k in ("event", "kind", "available")},
+            {"event": "error", "kind": "disk", "available": 0},
+        )
+        self.assertFalse([d for d in fake.downloads if d.endswith(".safetensors")])
+        draft = fake.remote / DENSE.draft_repo / DRAFT_COMMIT
+        self.assertGreater(
+            needed, sum(p.stat().st_size for p in draft.glob("*.safetensors"))
+        )
+        with mock.patch.object(hub, "_available_bytes", lambda path: needed - 1):
+            status, events, _ = self.run_installer("prepare")
+        self.assertEqual((status, events[0]["needed"]), (1, needed))
+        with mock.patch.object(hub, "_available_bytes", lambda path: needed):
+            self.assertEqual(self.run_installer("prepare")[0], 0)
+
     def test_the_remove_command_reports_the_bytes_freed(self):
         fake_hub(self, self.cache)
         chosen = selection(self.root)
