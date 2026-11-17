@@ -137,6 +137,26 @@ def engine_factory(first, order=None):
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_start_spawns_the_engine_and_returns_before_its_ready(self):
+        """The server starts the engine and loads its tokenizer meanwhile:
+        start() spawns it without waiting for Ready, and wait_ready() then
+        waits for that same engine."""
+        process = FakeProcess(initial_output=b"")
+        made = []
+
+        def factory():
+            made.append(process)
+            return process
+
+        runtime = engine_runtime.MultiplexedRuntime(process_factory=factory)
+        self.addCleanup(runtime.close)
+        runtime.start()
+        self.assertEqual(made, [process])
+        self.assertFalse(runtime.ready)
+        process.send(READY)
+        self.assertTrue(runtime.wait_ready(timeout=5))
+        self.assertEqual(made, [process])
+
     def test_direct_admission_and_out_of_order_demultiplexing(self):
         factory = FakeFactory()
         runtime = engine_runtime.MultiplexedRuntime(
