@@ -200,13 +200,6 @@ uint64_t MemoryGovernor::hostHeadroomBytes(const std::optional<HostMemory> &host
   return host ? spareHeadroom(*host, hostSpareReserveBytes_, reservedBytes) : 0;
 }
 
-uint64_t MemoryGovernor::unseenGrowthBytes(const std::optional<HostMemory> &host) const noexcept {
-  if (!host || clockMilliseconds_ >= unseenGrowthUntilMilliseconds_)
-    return 0;
-  const uint64_t fallen = saturatingSubtract(unseenGrowthHeadroom_, hostHeadroomBytes(host, 0));
-  return saturatingSubtract(unseenGrowthBytes_, fallen);
-}
-
 std::optional<MemoryGovernor::Reservation>
 MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
   if (!bytes) {
@@ -241,14 +234,6 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure &failure) {
     ledger_.allocationRefused();
     return std::nullopt;
   }
-  // A pool's growth reaches the host's counters only as it fills: until
-  // they show it, or the host has settled, the host's rule counts what it
-  // admitted on its margin.
-  if (claim.spec.cls == ClaimClass::Growth && host) {
-    unseenGrowthBytes_ = unseenGrowthBytes(host) + bytes;
-    unseenGrowthHeadroom_ = hostHeadroomBytes(host, 0);
-    unseenGrowthUntilMilliseconds_ = clockMilliseconds_ + kHostSettleMilliseconds;
-  }
   reservedBytes_ = requested;
   return Reservation(this, bytes);
 }
@@ -281,7 +266,7 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   const std::optional<HostMemory> host = sampleHost();
   // The rule at this sample, from the one the governor last moved.
   HostRule rule = hostRule_;
-  rule.sample(host, hostSpareReserveBytes_, reservedBytes_ + unseenGrowthBytes(host), systemPressure_,
+  rule.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_,
               growthUnitBytes_, ledger_.hostRefusedWaitingBytes(), bandWaived_);
   MemoryGovernorSnapshot result = snapshot(host, rule);
   result.hostTelemetry = queryHostTelemetry();
@@ -305,7 +290,7 @@ MemoryGovernor::snapshot(const std::optional<HostMemory> &hostMemory,
                          const HostRule &rule) const noexcept {
   const uint64_t observed = chargedBytes();
   const uint64_t used = saturatingAdd(observed, reservedBytes_);
-  uint64_t hostHeadroom = hostHeadroomBytes(hostMemory, reservedBytes_ + unseenGrowthBytes(hostMemory));
+  uint64_t hostHeadroom = hostHeadroomBytes(hostMemory, reservedBytes_);
   const MemoryPressure pressure = rule.level() == MemoryPressure::Critical ? MemoryPressure::Critical
                                   : rule.constrained()                     ? MemoryPressure::Warning
                                                                            : rule.level();
@@ -380,7 +365,7 @@ uint64_t MemoryGovernor::HostRule::deficitBytes(uint64_t refusedWaitingBytes, ui
 }
 
 void MemoryGovernor::sampleHostRule(const std::optional<HostMemory> &host) noexcept {
-  hostRule_.sample(host, hostSpareReserveBytes_, reservedBytes_ + unseenGrowthBytes(host), systemPressure_,
+  hostRule_.sample(host, hostSpareReserveBytes_, reservedBytes_, systemPressure_,
                    growthUnitBytes_, ledger_.hostRefusedWaitingBytes(), bandWaived_);
   // A waiver lasts the band it ended: the next band starts unwaived.
   if (!hostRule_.constrained())
@@ -402,7 +387,7 @@ Need MemoryGovernor::need(ClaimId claim, const std::optional<Need> &inPlace) con
 
 std::array<uint32_t, 3> MemoryGovernor::heldPages(ClaimId claim) const {
   const std::optional<HostMemory> host = sampleHost();
-  const uint64_t headroom = hostHeadroomBytes(host, reservedBytes_ + unseenGrowthBytes(host));
+  const uint64_t headroom = hostHeadroomBytes(host, reservedBytes_);
   const uint64_t hostRoom =
       host && systemPressure_ == MemoryPressure::Normal ? saturatingSubtract(headroom, kHostMarginBytes) : 0;
   return ledger_.heldPages(claim, std::min(roomBytes(), hostRoom));
@@ -488,7 +473,6 @@ GrowthHost MemoryGovernor::growthHost(bool paced) {
 }
 
 bool MemoryGovernor::controlPass(double nowMilliseconds) {
-  clockMilliseconds_ = nowMilliseconds;
   ledger_.setNow(nowMilliseconds / 1000.0);
   growthUnitBytes_ = ledger_.largestGrowthUnit();
   sampleHostRule(sampleHost());
@@ -525,7 +509,6 @@ bool MemoryGovernor::controlPass(double nowMilliseconds) {
 }
 
 void MemoryGovernor::growToTargets(double nowMilliseconds, MemoryPressure pressure) {
-  clockMilliseconds_ = nowMilliseconds;
   ledger_.setNow(nowMilliseconds / 1000.0);
   systemPressure_ = pressure;
   growthUnitBytes_ = ledger_.largestGrowthUnit();

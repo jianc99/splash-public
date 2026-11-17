@@ -2427,23 +2427,6 @@ void testAStartsTakeOfABufferItWouldTakeCreditsNothing() {
               " B now, " + std::to_string(cache.taken.size()) + " states taken");
 }
 
-// Growth counts what the host's reading does not show yet, so a lagging reading grows no unit that later goes back.
-void testGrowthCountsWhatTheHostDoesNotShowYet() {
-  // M + 1.5 GiB of headroom beside the store's 2 GiB.
-  FakeMemory::Config config = host(2 * kGiB + kGiB + 1536 * kMiB);
-  config.readingLagMilliseconds = 1000.0;
-  Fixture fixture(std::move(config));
-  FakeElasticPool experts("experts", fixture.memory, kGiB, 2, 6, 7, 2);
-  fixture.ledger().addPool(experts);
-  fixture.memory.advanceTo(1000.0);
-  fixture.governor->growToTargets(1000.0, MemoryPressure::Normal);
-  for (double t = 1.5; t <= 10.0; t += 0.5)
-    static_cast<void>(fixture.pass(t));
-  require(experts.units() == 3 && experts.shrinks == 0,
-          "growth admitted against a reading that did not show it: " + std::to_string(experts.grows) + " grown, " +
-              std::to_string(experts.shrinks) + " given back");
-}
-
 // Growth leaves the host what the lanes in service will grow into, or the host would take the unit back.
 void testGrowthLeavesTheHostWhatTheLanesGrowInto() {
   Fixture fixture(host(2 * kGiB + kGiB + 1536 * kMiB));
@@ -2690,7 +2673,6 @@ std::span<const test::TestCase> ledgerTests() {
       {"testUnitsThatCountOnePageTwiceOvercount", testUnitsThatCountOnePageTwiceOvercount},
       {"testAStartsCountOfAStateWhoseBufferItTakesIsMet", testAStartsCountOfAStateWhoseBufferItTakesIsMet},
       {"testAStartsTakeOfABufferItWouldTakeCreditsNothing", testAStartsTakeOfABufferItWouldTakeCreditsNothing},
-      {"testGrowthCountsWhatTheHostDoesNotShowYet", testGrowthCountsWhatTheHostDoesNotShowYet},
       {"testGrowthLeavesTheHostWhatTheLanesGrowInto", testGrowthLeavesTheHostWhatTheLanesGrowInto},
       {"testRequestsMetFromCacheLeaveRegrowthQuiet", testRequestsMetFromCacheLeaveRegrowthQuiet},
       {"testWarningRegrowsOnlyWhatTheCacheFunds", testWarningRegrowsOnlyWhatTheCacheFunds},

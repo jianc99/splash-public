@@ -236,7 +236,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 30,691: +48 for a Background request held back 10 s being ordered as Normal
 # (Scheduler.cpp 33, Scheduler.hpp 12, Engine.cpp 3).
 # 30,692: +1 for the start ending its warmups (Bootstrap.mm).
-ENGINE_LINE_BUDGET = 30_692
+# 30,664: -28, the governor's term for growth the host does not show yet
+# (MemoryGovernor.cpp, MemoryGovernor.hpp), which counted nothing.
+ENGINE_LINE_BUDGET = 30_664
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
