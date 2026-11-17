@@ -9,6 +9,11 @@
 // production Metal library, and checks the bf16 embeddings against the fp32
 // numpy reference. It then verifies determinism, a second grid through the
 // same scratch arena, and reports the encode time of a 64x64-patch image.
+// The embeddings' SHA-256 of the fixture and of synthetic grids must equal
+// those FIXTURE_DIR/embedding_digests.txt pins, a line `GRID SHA-256` each,
+// where it pins them: a change that keeps the tower's arithmetic keeps its
+// bits. A family's vision weights, GGUF or MLX, are its upstream bf16 values,
+// so one family's pins hold for each.
 
 #include "LinearNumerics.hpp"
 #include "TestChecks.hpp"
@@ -29,6 +34,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -132,6 +138,21 @@ void verifyComparison() {
   }
 }
 
+std::string embeddingDigest(const std::vector<float> &embeddings) {
+  return splash::model::weightDigest(
+      {reinterpret_cast<const uint8_t *>(embeddings.data()), embeddings.size() * sizeof(float)});
+}
+
+// The digests embedding_digests.txt pins, by grid name; none without the
+// file.
+std::map<std::string, std::string> pinnedDigests(const std::string &fixture) {
+  std::map<std::string, std::string> pinned;
+  std::ifstream file(fixture + "/embedding_digests.txt");
+  std::string grid, digest;
+  while (file >> grid >> digest) pinned[grid] = digest;
+  return pinned;
+}
+
 std::vector<uint8_t> syntheticPixels(ImageGrid grid) {
   const uint32_t height = grid.height * 16, width = grid.width * 16;
   std::vector<uint8_t> pixels(uint64_t{height} * width * 3);
@@ -194,9 +215,13 @@ int main(int argc, char **argv) {
       const std::vector<float> first =
           encodeOnce(backend, encoder, grid, pixels,
                      model.tensors.layout.outputHiddenSize, &gpuSeconds);
-      const std::string digest = splash::model::weightDigest(
-          {reinterpret_cast<const uint8_t *>(first.data()), first.size() * sizeof(float)});
-      std::printf("embedding SHA-256: %s\n", digest.c_str());
+      // The fixture's and synthetic grids' embeddings, by grid name.
+      std::map<std::string, std::string> digests{{"fixture", embeddingDigest(first)}};
+      for (const ImageGrid synthetic : {ImageGrid{6, 8}, ImageGrid{16, 24}, ImageGrid{32, 32}, ImageGrid{64, 64}}) {
+        MetalBuffer syntheticBuffer = upload(backend, syntheticPixels(synthetic), "synthetic pixels");
+        digests[std::to_string(synthetic.height) + "x" + std::to_string(synthetic.width)] = embeddingDigest(
+            encodeOnce(backend, encoder, synthetic, syntheticBuffer, model.tensors.layout.outputHiddenSize, nullptr));
+      }
       const Parity parity =
           compare(first, expected, descriptor.vision.outputHiddenSize);
       std::printf("grid %ux%u: relative_error %.4f max_abs %.4f "
@@ -209,6 +234,14 @@ int main(int argc, char **argv) {
       // at most 0.018 for the 27B, against 0.15; a corrupted row is off by
       // about its whole norm.
       bool pass = parity.relativeError < 0.03 && parity.worstRowError < 0.15;
+      const std::map<std::string, std::string> pinned = pinnedDigests(fixture);
+      for (const auto &[name, digest] : digests) {
+        const auto found = pinned.find(name);
+        const bool matches = found != pinned.end() && found->second == digest;
+        std::printf("embedding digest %s %s%s\n", name.c_str(), digest.c_str(),
+                    pinned.empty() ? " (none pinned)" : matches ? " (pinned)" : " (DIFFERS from the pinned)");
+        if (!pinned.empty() && !matches) pass = false;
+      }
 
       const std::vector<float> second =
           encodeOnce(backend, encoder, grid, pixels,
