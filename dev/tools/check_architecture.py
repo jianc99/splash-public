@@ -238,7 +238,8 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 30,692: +1 for the start ending its warmups (Bootstrap.mm).
 # 30,664: -28, the governor's term for growth the host does not show yet
 # (MemoryGovernor.cpp, MemoryGovernor.hpp), which counted nothing.
-ENGINE_LINE_BUDGET = 30_664
+# 30,676: +12 for the automatic budget's unwired tenth (MemoryPlan.hpp).
+ENGINE_LINE_BUDGET = 30_676
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
