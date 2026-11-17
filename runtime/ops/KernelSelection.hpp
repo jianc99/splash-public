@@ -81,6 +81,10 @@ struct SplitChoice final {
 // every block (QwenTarget.cpp), at the format of most routers' rows, F32 for
 // none.
 [[nodiscard]] uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcept;
+// Whether every block's experts are resident and each projection's routed and
+// shared experts are in one format the int8 prefill tile takes
+// (MoeShape::int8Experts).
+[[nodiscard]] bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept;
 // A MoE plan's configuration of `rows` rows, its routers in `routerFormat`.
 [[nodiscard]] MoeConfig selectMoe(const KernelCalibration &calibration, const MoeShape &shape,
                                   uint32_t routerFormat, uint32_t rows) noexcept;

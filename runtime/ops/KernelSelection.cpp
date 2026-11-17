@@ -303,6 +303,15 @@ uint32_t moeRouterFormat(std::span<const BlockMoeWeights *const> blocks) noexcep
   return *router && router < routers.end() - 1 ? uint32_t(router - routers.begin()) : QuantizedSegment::kFloat32;
 }
 
+bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept {
+  const auto takes = [](const BlockExpertProjection &p) {
+    return p.routed.formatId == p.shared.formatId && quant_prefill_int8_format(p.routed.formatId);
+  };
+  return !blocks.empty() && std::ranges::all_of(blocks, [&](const BlockMoeWeights *block) {
+    return !block->stream && takes(block->gate) && takes(block->up) && takes(block->down);
+  });
+}
+
 // Every GPU runs the experts on the staged tile: against the register tile, a
 // 35B-shaped layer takes 16-42% less time on a 10-core M4 at one to four
 // decode lanes of random routes; Apple9 GPUs of 11 to 40 cores are

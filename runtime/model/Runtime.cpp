@@ -745,7 +745,7 @@ struct Runtime::Impl {
     // pricing its rows (CostLine), whose steps end at the classes' last rows.
     std::optional<std::pair<ops::MoeShape, uint32_t>> moe;
     if (geometry.target.ffnKind == QwenFfnKind::SparseMoe)
-      moe.emplace(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat);
+      moe.emplace(geometry.target.moeShape(), geometry.target.moeRouterFormat);
     if (model.expertStore())
       mostStepRows = std::min(kDecodeStepRows, ExpertStore::cycleRows());
     stepClasses = operators.decodeRowClasses(mostStepRows, moe);
