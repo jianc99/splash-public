@@ -384,17 +384,17 @@ extension ServerScreenTests {
 }
 
 extension ServerScreenTests {
-    /// The page of `window` drawn through `change`: as drawn before it, every 30 ms or so for 0.3 s
-    /// after it, each with how long after, and once it has stopped changing, which a slow Mac
-    /// reaches long after the animations' length.
-    static func pictures(of window: NSWindow, through change: () -> Void) async throws
+    /// The page of `window` drawn through `change`: as drawn before it, ten times after it, each
+    /// after `every` seconds of the run loop (30 ms: 0.3 s in all), with how long after, and once it
+    /// has stopped changing, which a slow Mac reaches long after the animations' length.
+    static func pictures(of window: NSWindow, every interval: TimeInterval = 0.03, through change: () -> Void) async throws
         -> (before: NSBitmapImageRep, drawn: [(at: Duration, picture: NSBitmapImageRep)], after: NSBitmapImageRep) {
         let before = try #require(await Snapshot.picture(of: window))
         let start = ContinuousClock.now
         change()
         var drawn: [(at: Duration, picture: NSBitmapImageRep)] = []
         for _ in 0..<10 {
-            pump(0.03)
+            pump(interval)
             drawn.append((ContinuousClock.now - start, try #require(await Snapshot.picture(of: window))))
         }
         var after = try #require(await Snapshot.picture(of: window))
@@ -717,7 +717,10 @@ extension ServerScreenTests {
     /// Opening Advanced with the page at its end moves nothing under the launch options up: the
     /// options it opens push the section under them down. The frame after the click drew the
     /// card without Advanced's row, the section under it moved up by the row's height, as the
-    /// switches among the options came in.
+    /// switches among the options came in. The pictures start at the first frame after the
+    /// click's update and come every 5 ms: the scroll to Advanced's first step drew the section
+    /// 14.5 points up in that frame (+25.5 points of scroll, +11 of push), which pictures 30 ms
+    /// apart missed unless other tests' work on the main thread shifted them.
     @Test func openingAdvancedAtThePagesEndMovesNothingUp() async throws {
         let (state, folder) = AppState.forTests()
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -738,11 +741,13 @@ extension ServerScreenTests {
         let frame = row.convert(row.bounds, to: nil)
         let point = NSPoint(x: frame.minX + 40, y: frame.midY)
         let closed = scroll.documentView!.frame.height
-        let change = try await Self.pictures(of: window) {
+        let change = try await Self.pictures(of: window, every: 0.005) {
             for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
                 window.sendEvent(NSEvent.mouseEvent(with: type, location: point, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
                                                     windowNumber: window.windowNumber, context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!)
             }
+            // The click's update.
+            pump(0)
         }
         let before = try #require(Self.redTop(change.before, of: window))
         let tops = change.drawn.map { Self.redTop($0.picture, of: window) }
