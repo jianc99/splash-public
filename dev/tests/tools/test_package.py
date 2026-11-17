@@ -76,7 +76,7 @@ class PackageTests(unittest.TestCase):
                     mock.patch("sys.stdout"),
                 ):
                     package.main(["--version", version, "--macos-min", "26.4"])
-                self.assertEqual(run.call_count, 4)
+                self.assertEqual(run.call_count, 5)
                 with tarfile.open(
                     root / f"dist/splash-{version}-arm64-macos26.tar.gz"
                 ) as archive:
@@ -241,12 +241,19 @@ class PackageTests(unittest.TestCase):
             )
             self.assertTrue((stage / library / "os.py").is_file())
             self.assertEqual(list(stage.rglob("__pycache__")), [])
-            # The smoke tests run the stage as Splash does, writing no bytecode.
-            pip, *smoke = (call.args[0] for call in runs.call_args_list)
+            # The smoke tests run the stage as Splash does, writing no
+            # bytecode; then its bytecode is compiled anew, the same bytes at
+            # each build: checked by no time stamp, named by its path in the
+            # stage, its sets in one order.
+            pip, *smoke, compiled = (call.args[0] for call in runs.call_args_list)
             self.assertEqual(pip[1:4], ["-m", "pip", "install"])
             self.assertEqual(len(smoke), 3)
             for command in smoke:
                 self.assertIn("-B", command)
+            self.assertEqual(compiled[1:6], ["-B", "-s", "-P", "-m", "compileall"])
+            self.assertIn("--invalidation-mode=unchecked-hash", compiled)
+            self.assertEqual(compiled[-2:], [f"-s{stage}", str(stage)])
+            self.assertEqual(runs.call_args.kwargs["env"], {"PYTHONHASHSEED": "0"})
 
     def test_every_installer_and_server_module_and_the_suggested_models_ship(self):
         # The packaged launcher, installer and server import these by module
