@@ -734,8 +734,9 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
                                             test::qwen3_8Vision(), model::TargetSource::Safetensors,
                                             model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
-  const uint64_t device =
-      EngineMemoryPolicy::hardBudgetBytes(metal::probeDeviceCapabilities().recommendedMaxWorkingSetBytes, 0);
+  const DeviceCapabilities capabilities = metal::probeDeviceCapabilities();
+  const uint64_t device = EngineMemoryPolicy::hardBudgetBytes(capabilities.recommendedMaxWorkingSetBytes, 0,
+                                                              capabilities.physicalMemoryBytes);
   const uint64_t above = model::streamableWeights(root.path(), config.model, {}).loadedBytes + kGiB / 2;
   std::vector<uint64_t> limits{above};
   if (above >= device)
