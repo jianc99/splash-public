@@ -2,6 +2,8 @@ import io
 import unittest
 from unittest import mock
 
+import transformers
+
 from dev.tests.server_fixtures import READY, console_written, unprepared_hold
 from server import constraints as generation_constraints
 from server import server
@@ -102,7 +104,9 @@ class TokenizerContractTests(unittest.TestCase):
         ):
             generation_constraints.check_capabilities(tokenizer, QWEN, READY)
 
-    def test_startup_rejects_tokenizer_before_starting_the_native_worker(self):
+    def test_startup_rejects_tokenizer_and_stops_the_native_worker_it_started(self):
+        # The engine starts before the tokenizer loads, so that it reads its
+        # weights meanwhile; the refusal stops it before it is waited for.
         args = server.parse_args(["model", "--model", "owner/model"])
         tokenizer = self.tokenizer()
         tokenizer.get_vocab()["</think>"] = 0
@@ -113,7 +117,7 @@ class TokenizerContractTests(unittest.TestCase):
             mock.patch.object(server.signal, "signal"),
             mock.patch.object(server, "load_thinking_key", return_value=None),
             mock.patch.object(
-                server.AutoTokenizer, "from_pretrained", return_value=tokenizer
+                transformers.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(server, "FrontendServer", return_value=http),
             mock.patch.object(server.engine_runtime, "MultiplexedRuntime") as native,
@@ -125,7 +129,8 @@ class TokenizerContractTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 1)
         console_written()
         self.assertIn("tokenizer must encode", stderr.getvalue())
-        native.assert_not_called()
+        native.return_value.close.assert_called_once_with()
+        native.return_value.wait_ready.assert_not_called()
         http.server_activate.assert_not_called()
         http.server_close.assert_called_once()
 

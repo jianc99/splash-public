@@ -650,6 +650,13 @@ class MultiplexedRuntime:
         path = self._crash_trace.last_dump
         return str(path) if path is not None else None
 
+    def start(self) -> None:
+        """Start an engine unless one serves or starts, without waiting for
+        its Ready: the server loads its tokenizer while the engine loads its
+        weights, and wait_ready() then waits for it and raises why its
+        startup failed, if it did."""
+        self._ensure_process(wait=False)
+
     def wait_ready(self, timeout: float | None = None) -> bool:
         """Start an engine unless one serves, and wait for its Ready.
 
@@ -839,7 +846,7 @@ class MultiplexedRuntime:
             return EngineUnhealthy(issue.describe())
         return ProtocolFatal(issue.describe())
 
-    def _ensure_process(self, timeout: float | None = None) -> None:
+    def _ensure_process(self, timeout: float | None = None, wait: bool = True) -> None:
         if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
             raise ValueError("ready timeout must be positive")
         caller_deadline = None if timeout is None else time.monotonic() + timeout
@@ -888,6 +895,8 @@ class MultiplexedRuntime:
                     name="splash-native-startup",
                     daemon=True,
                 ).start()
+            if not wait:
+                return
             deadline = min(attempt.deadline, caller_deadline or attempt.deadline)
             if not attempt.event.wait(max(0.0, deadline - time.monotonic())):
                 if time.monotonic() < attempt.deadline:
