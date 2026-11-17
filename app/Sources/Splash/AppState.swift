@@ -38,6 +38,7 @@ final class AppState {
     let chats: ChatStore
     /// The count of the next prompt, which the composer's ring shows.
     let chatContext = ChatContext()
+    let readAhead = ReadAhead()
     /// The message being written in each chat, kept while the window shows something else.
     let draft: Draft
     /// The open conversation's page, kept while the window shows something else, so that the Chat

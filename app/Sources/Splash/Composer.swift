@@ -397,9 +397,10 @@ struct Composer: View {
             draft.attach(images, unreadable: files.count - images.count)
             draft.attach(pdfs: pdfs)
         }
-        // The ring counts the next prompt as it is written.
+        // The ring counts the next prompt as it is written, and the model reads it ahead.
         .onChange(of: state.contextRequest, initial: true) { _, request in
             state.chatContext.refresh(request)
+            state.readAhead.refresh(request)
         }
     }
 
