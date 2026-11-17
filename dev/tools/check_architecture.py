@@ -231,7 +231,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 30,632: +27 for what a request's start found in the cache, in usage
 # (Types.hpp 15: StateSource and StartFound; Protocol.hpp 4, Protocol.cpp 3:
 # the Start frame's three fields; Engine.cpp 4: filling them; NativeRuntime.cpp 1).
-ENGINE_LINE_BUDGET = 30_632
+# 30,643: +11 for /status disk.spilled_kv_read_bytes and
+# disk.weights_read_bytes (Status.cpp).
+ENGINE_LINE_BUDGET = 30_643
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
