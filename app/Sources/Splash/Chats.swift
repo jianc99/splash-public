@@ -586,6 +586,17 @@ enum ChatClient {
         return count.input_tokens
     }
 
+    /// Has the model read `request`'s prompt ahead of its sending (`ReadAhead`): the request for
+    /// its reply, for one token, which is dropped; cancelling the task closes the connection, which
+    /// stops the read.
+    static func readAhead(_ request: ChatContext.Request, session: URLSession = .shared) async {
+        let server = request.target
+        var body = prompt(request.messages, effort: server.effort, vision: server.acceptsImages, files: request.files)
+        body["max_tokens"] = 1
+        guard let json = try? JSONSerialization.data(withJSONObject: body) else { return }
+        _ = try? await session.data(for: self.request("v1/chat/completions", json, to: server, timeout: 3600))
+    }
+
     /// The request counting `messages`, their attachments in `files`: the prompt `reply` sends, as
     /// it sends it.
     static func countRequest(_ messages: [ChatMessage], with server: ChatTarget, files: URL) throws -> URLRequest {
