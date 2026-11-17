@@ -514,7 +514,8 @@ final class Server {
                     LiveRequest(id: id, time: LiveRequest.time(of: taken.addingTimeInterval(-(request.age_ms ?? 0) / 1000)),
                                 input: request.prompt_tokens ?? 0,
                                 stage: LiveRequest.stage(phase: request.phase, read: request.prompt_processed ?? 0,
-                                                         written: request.generated_tokens ?? 0))
+                                                         written: request.generated_tokens ?? 0),
+                                ahead: request.max_new_tokens == 1)
                 }
             },
             taken: status.active_requests == nil ? nil : taken
@@ -537,6 +538,7 @@ final class Server {
             let prompt_tokens: Int?
             let prompt_processed: Int?
             let generated_tokens: Int?
+            let max_new_tokens: Int?
             let age_ms: Double?
         }
         struct Metrics: Decodable {
@@ -603,6 +605,9 @@ struct LiveRequest: Equatable, Identifiable {
     let time: String
     let input: Int
     let stage: Stage
+    /// Whether it asks for one token: a read of a prompt ahead of its sending, the app's
+    /// (`ReadAhead`) or any client's, which writes nothing worth showing.
+    var ahead = false
 
     /// What a request in the engine's `phase` does, having read `read` tokens of its prompt and
     /// written `written`.
@@ -658,9 +663,21 @@ struct ServedRequest: Equatable, Identifiable {
     /// come, as the server's console drops lines while 1024 wait. Its line, should it come later,
     /// still ends it.
     var gone = false
+    /// Whether it is a read ahead (`LiveRequest.ahead`), which leaves the list as it ends.
+    var ahead = false
 
     /// Whether it still runs: no line has ended it, and the statuses still have it.
     var running: Bool { end == nil && !gone }
+
+    /// What it does while it reads its prompt, `read` tokens of it read.
+    func reading(_ read: Int) -> String {
+        "\(ahead ? "Reading ahead" : "Reading") \(Int(Double(read) / Double(max(input ?? 0, 1)) * 100))%"
+    }
+
+    /// The rows a list keeps of `requests`: the latest, without the reads ahead that ended.
+    private static func listed(_ requests: [ServedRequest]) -> [ServedRequest] {
+        Array(requests.filter { !$0.ahead || $0.running }.suffix(kept))
+    }
 
     /// The rows a list keeps, the latest.
     static let kept = 1000
@@ -687,7 +704,7 @@ struct ServedRequest: Equatable, Identifiable {
             requests.append(ServedRequest(id: id, time: line.time, input: line.input, stage: .answering(line.output ?? 0),
                                           seen: now, end: line))
         }
-        return Array(requests.suffix(kept))
+        return Self.listed(requests)
     }
 
     /// `requests` with a status's `live` ones taken, as they were at `taken`: where each row
@@ -703,6 +720,7 @@ struct ServedRequest: Equatable, Identifiable {
             if let request = live.first(where: { $0.id == requests[index].id }) {
                 requests[index].input = requests[index].input ?? request.input
                 requests[index].stage = request.stage
+                requests[index].ahead = request.ahead
                 requests[index].seen = taken
             } else {
                 requests[index].gone = true
@@ -710,9 +728,9 @@ struct ServedRequest: Equatable, Identifiable {
         }
         for request in live where !requests.contains(where: { $0.id == request.id }) {
             requests.append(ServedRequest(id: request.id, time: request.time, input: request.input, stage: request.stage,
-                                          seen: taken))
+                                          seen: taken, ahead: request.ahead))
         }
-        return Array(requests.suffix(kept))
+        return Self.listed(requests)
     }
 
     /// Takes a start's `stage`, as its line came `now`, where the row has it no further on: a

@@ -437,7 +437,7 @@ private struct RequestRow: View {
                     Text(why)
                     Text("\(input.formatted()) in").foregroundStyle(.secondary)
                 case .reading(let read):
-                    Text("Reading \(Int(Double(read) / Double(max(input, 1)) * 100))%")
+                    Text(request.reading(read))
                     Text("\(read.formatted()) of \(input.formatted()) in").foregroundStyle(.secondary)
                 case .answering(let written):
                     Text(tokens(written))
