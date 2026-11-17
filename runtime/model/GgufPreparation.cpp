@@ -508,6 +508,18 @@ struct GpuChunk {
   uint64_t items = 0;
 };
 
+// The rows a load thread reads at once into a chunk's staging. A chunk is one
+// tensor's rows, at most kGgufRepackStagingBytes, so this sets how many reads
+// a chunk keeps in flight: 4 MiB reads left the 27B GGUF's small tensors at
+// 2-3, and the layers read 4.6-5.0 GB/s against the SSD's 6.6-7. Cold loads
+// by read size, two each (M5 Max 32-core, internal SSD; 27B MLX, then 27B
+// UD-Q4_K_M GGUF): 4 MiB 4.49, 4.59 / 4.87, 4.69 s; 2 MiB 3.82, 3.86 / 4.25,
+// 4.11; 1 MiB 3.57, 3.39 / 3.69, 3.83; 512 KiB 3.59, 3.63 / 3.85, 3.92;
+// 256 KiB 4.08, 4.12 / 4.23, 4.24. Staging several chunks together in rounds
+// of 64 or 128 MiB with 4 MiB reads gave 4.30, 4.19 and 4.50, 4.21 / 4.74,
+// 4.48 and 4.52, 4.46 s, for four times the staging memory.
+constexpr uint64_t kChunkReadBytes = 1 << 20;
+
 template <class Params>
 std::vector<uint8_t> paramBytes(const Params &params) {
   std::vector<uint8_t> bytes(sizeof(params));
@@ -548,7 +560,7 @@ void addRepackChunks(metal::MetalBackend &backend, const metal::MetalBuffer &ima
       params.dst_plane1 = lengths[1] ? static_cast<uint32_t>(at[1] - at[0]) : 0;
       params.dst_meta = static_cast<uint32_t>(at[2] - at[0]);
       // The sources' rows in image order, then zero rows, a task for each
-      // run of rows within kLoadStepBytes.
+      // run of rows within kChunkReadBytes.
       const auto stage = [&repack, firstRow, rows, column, chunkRowBytes](uint8_t *host,
                                                                          std::vector<RowScratch> &scratch) {
         struct Read {
@@ -557,7 +569,7 @@ void addRepackChunks(metal::MetalBackend &backend, const metal::MetalBuffer &ima
           uint8_t *to;
         };
         std::vector<Read> reads;
-        const uint64_t batch = std::max<uint64_t>(1, kLoadStepBytes / chunkRowBytes);
+        const uint64_t batch = std::max<uint64_t>(1, kChunkReadBytes / chunkRowBytes);
         uint64_t start = 0;
         for (const gguf::TensorRows &tensor : repack.sources) {
           const uint64_t begin = std::max(firstRow, start), end = std::min(firstRow + rows, start + tensor.rows);
@@ -609,8 +621,14 @@ void addDecodedChunks(metal::MetalBackend &backend, const metal::MetalBuffer &im
                                  static_cast<uint32_t>(columns)};
     const metal::MetalBuffer output = backend.view(image, copy.destination + first * columns * sizeof(float),
                                                    count * columns * sizeof(float));
+    // A task for each run of rows within kChunkReadBytes.
     const auto stage = [&rows, first, count](uint8_t *host, std::vector<RowScratch> &scratch) {
-      readRows(rows, first, count, 0, rows.rowBytes, host, scratch[0]);
+      const uint64_t batch = std::max<uint64_t>(1, kChunkReadBytes / rows.rowBytes);
+      parallelFor((count + batch - 1) / batch, [&](size_t index, unsigned thread) {
+        const uint64_t row = index * batch;
+        readRows(rows, first + row, std::min(batch, count - row), 0, rows.rowBytes, host + row * rows.rowBytes,
+                 scratch[thread]);
+      });
     };
     chunks.push_back({stage, std::string("gguf_embed_f32_") + format.name, 1, {{0, ids}, {2, output}}, 3,
                       paramBytes(params), count * columns});
