@@ -89,7 +89,8 @@ The MoE router keeps its format too, a quantized one as native rows, an
 unquantized one as its bf16 or F32 rows, which the float projection runs
 ([Kernels](internals.md#kernels)). The MoE selection reads the shared-expert gate in F32,
 so it loads as the F32 values of its quantization, and so do GDN alpha and
-beta unless both are in one format. Norms stay bf16 and the GDN value heads in
+beta unless both are in one format. A Qwen hybrid's norms stay bf16 (Flint's
+widen to the F32 its kernels are compiled for) and the GDN value heads in
 MLX's grouped order. A checkpoint's names are mlx-vlm's (`language_model.model.*`,
 as the Qwen releases') or mlx-lm's (`model.*` and `lm_head`, as
 `mlx-community/flint-mixed-3-4bit`'s), told apart by where its token table is,
