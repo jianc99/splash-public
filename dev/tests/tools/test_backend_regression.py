@@ -13,12 +13,14 @@ from dev.benchmarks import weights
 from dev.tests import smoke_real as smoke
 
 CONTEXT = 262144
+FOUR_LANES = (1, 2, 3, 4)
 
 
 def benchmark_document(
-    scenarios=regression.SCENARIOS, build="build", layout="layout", step=10.0
+    scenarios=regression.SCENARIOS, build="build", layout="layout", step=10.0, lanes=4
 ):
-    """backend-benchmark output of two samples for these scenarios."""
+    """backend-benchmark output of two samples for these scenarios, on a start
+    that ran `lanes` lanes."""
     samples = [
         {
             "width": width,
@@ -32,7 +34,7 @@ def benchmark_document(
             "decode_wall_ms": 1.25 * 64 * width,
         }
         for sample in range(2)
-        for width in regression.WIDTHS
+        for width in range(1, lanes + 1)
     ]
     requests = (
         [(scenario, 14096) for scenario in regression.PARTIAL if "partial" in scenarios]
@@ -99,7 +101,7 @@ class BackendRegressionTests(unittest.TestCase):
         self.assertTrue(summary["pass"])
         decode_and_partial = [
             f"decode_B{width}_{metric}"
-            for width in regression.WIDTHS
+            for width in FOUR_LANES
             for metric in ("gpu_ms_per_step", "wall_ms_per_token")
         ] + [
             "partial_4k_cold_prefill_gpu_ms",
@@ -258,6 +260,23 @@ class BackendRegressionTests(unittest.TestCase):
         with self.assertRaisesRegex(regression.RegressionError, "ABBA order"):
             first, second, third, fourth = rounds()
             regression.summarize([first, fourth, second, third], False)
+
+    def test_widths_are_compared_where_both_builds_decode_them(self):
+        # An eight-lane candidate against a four-lane baseline: B1-B4 compared.
+        def eight(document):
+            document["decode_throughput"] = benchmark_document(
+                build=document["build_id"], lanes=8
+            )["decode_throughput"]
+
+        summary = regression.summarize(rounds({1: eight, 2: eight}), False)
+        self.assertEqual(summary["failures"], [])
+        self.assertEqual(sorted(summary["acceptance"]), [f"B{w}" for w in FOUR_LANES])
+        self.assertNotIn("decode_B5_gpu_ms_per_step", summary["speed"])
+        # A build whose starts ran different lanes compares nothing it can trust.
+        summary = regression.summarize(rounds({2: eight}), False)
+        self.assertIn(
+            "the candidate build's starts ran different lanes", summary["failures"]
+        )
 
     def test_a_baseline_with_the_candidates_build_id_fails(self):
         # The candidate's checkout, or another build of its sources: the ABBA

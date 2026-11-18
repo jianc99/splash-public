@@ -21,7 +21,9 @@ this machine, which must be otherwise idle:
   from timings, so the first share and least chunk rows a round reports are
   those every later round runs.
 - speed (abba.compare): decode GPU milliseconds per step and wall
-  milliseconds per output token for B1-B4, the GPU time and the wall time of
+  milliseconds per output token for every width all four rounds decode (B1-B4
+  against a four-lane build: an eight-lane start's B5-B8 are its own until the
+  baseline runs them too), the GPU time and the wall time of
   the 14,096-token cold prefill (partial_4k_cold), the TTFT of its partial
   hit (partial_4k_hit), and the GPU time and the TTFT of each short cold
   prefill (short_<rows>_rows_*, by the rows of its one chunk). The wall times
@@ -62,7 +64,6 @@ from dev.tests import smoke_real as smoke
 ROOT = Path(__file__).resolve().parents[2]
 ROUNDS = ("baseline", "candidate", "candidate", "baseline")
 SCENARIOS = ("decode", "partial", "short", "transcripts")
-WIDTHS = (1, 2, 3, 4)
 ACCEPTANCE_TOLERANCE = 0.02
 BENCHMARK = Path("build/engine-tests/backend-benchmark")
 METALLIB = Path("build/splash.metallib")
@@ -171,12 +172,12 @@ def round_record(version: str, document: dict) -> dict:
     """What one round measured: decode samples per width, partial and
     transcript requests per scenario and short requests per chunk, with the
     identity and memory plan its load reported."""
-    decode = {width: [] for width in WIDTHS}
+    decode = {}
     partial = {scenario: [] for scenario in PARTIAL}
     short = {rows: [] for rows in SHORT}
     transcripts = {name: [] for name in TRANSCRIPTS}
     for sample in document["decode_throughput"]["samples"]:
-        decode[sample["width"]].append(
+        decode.setdefault(sample["width"], []).append(
             {
                 "sample": sample["sample"],
                 "output_token_hash": sample["output_token_hash"],
@@ -223,10 +224,16 @@ def round_record(version: str, document: dict) -> dict:
     }
 
 
+def widths(rounds: list[dict]) -> list[int]:
+    """The decode widths every round measured: as many as the fewest lanes a
+    round's start ran."""
+    return sorted(set.intersection(*(set(record["decode"]) for record in rounds)))
+
+
 def metrics(rounds: list[dict]) -> dict:
     """Each speed metric's samples per round, in ABBA order."""
     result = {}
-    for width in WIDTHS:
+    for width in widths(rounds):
         result[f"decode_B{width}_gpu_ms_per_step"] = [
             [sample["gpu_ms_per_step"] for sample in record["decode"][width]]
             for record in rounds
@@ -259,12 +266,13 @@ def metrics(rounds: list[dict]) -> dict:
     return result
 
 
-def outputs(record: dict) -> dict:
-    """What must repeat: per width and sample the output hash and draft
-    counts, per partial, short and transcript request its output tokens."""
+def outputs(record: dict, decoded: list[int]) -> dict:
+    """What must repeat: per width of `decoded` and sample the output hash and
+    draft counts, per partial, short and transcript request its output
+    tokens."""
     result = {}
-    for width, samples in record["decode"].items():
-        for sample in samples:
+    for width in decoded:
+        for sample in record["decode"][width]:
             result[f"B{width} sample {sample['sample']}"] = (
                 sample["output_token_hash"],
                 sample["accepted_draft_tokens"],
@@ -335,7 +343,11 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
         if records[0]["memory_plan"] != records[1]["memory_plan"]:
             failures.append(f"the {name} build's memory plan changed between rounds")
         plans[name] = records[0]["memory_plan"]
-        if changed := differences(outputs(records[0]), outputs(records[1])):
+        if set(records[0]["decode"]) != set(records[1]["decode"]):
+            failures.append(f"the {name} build's starts ran different lanes")
+        if changed := differences(
+            outputs(records[0], widths(records)), outputs(records[1], widths(records))
+        ):
             failures.append(f"the {name} build did not repeat its outputs: {changed}")
     if builds["baseline"] == builds["candidate"]:
         failures.append(
@@ -360,7 +372,7 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
             "baseline": acceptance(baseline, width),
             "candidate": acceptance(candidate, width),
         }
-        for width in WIDTHS
+        for width in widths(rounds)
     }
     if expect_output_change:
         for width, rate in rates.items():
@@ -369,7 +381,9 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
                     f"{width} acceptance fell from {rate['baseline']:.4f} "
                     f"to {rate['candidate']:.4f}"
                 )
-    elif changed := differences(outputs(rounds[0]), outputs(rounds[1])):
+    elif changed := differences(
+        outputs(rounds[0], widths(rounds)), outputs(rounds[1], widths(rounds))
+    ):
         failures.append(f"candidate outputs or acceptance differ: {changed}")
     if invariants := sorted(
         {f for record in candidate for f in record["performance_failures"]}
