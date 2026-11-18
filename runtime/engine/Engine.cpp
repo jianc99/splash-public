@@ -2216,15 +2216,15 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
   // is then superseded, which a reclaim drops rather than writes. Kept as checkpoints that a reclaim wrote, the
   // 384-token replies of 12 agent conversations at a 27 GB limit wrote 24% more to the SSD to save 2.4% of their
   // prefill; left opportunistic, a reply capture at the budget gave way first, and a turn read its reply again.
-  // Its conversation's newest point falls due for its copy ahead from now (WriteBehind::ended): its prompt's replay
-  // point, or the reply's state that supersedes it.
+  // The points it kept fall due for their copies ahead from now (WriteBehind::ended): its prompt's replay point, and
+  // the reply's state after it, which a reclaim keeps both of (StateCache::kKeptBehind).
   if (!keepContinuation) {
     const uint64_t reply = active.latestCheckpoint.kvBlock;
+    if (const uint64_t replay = active.replayPoint.kvBlock())
+      writeBehind_.ended(replay, promptReplayBoundary(active));
     if (active.rendersReplies && cache_.keepReplyAsPoint(active.latestCheckpoint))
       writeBehind_.ended(reply, static_cast<uint32_t>(active.exactTokens.size()) / KvCache::pageTokens *
                                     KvCache::pageTokens);
-    else if (const uint64_t replay = active.replayPoint.kvBlock())
-      writeBehind_.ended(replay, promptReplayBoundary(active));
   }
   if (passCommand_.holds(id))
     settleEnded(passCommand_.yield());

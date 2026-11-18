@@ -46,9 +46,9 @@ struct WriteBehindSnapshot final {
 // while claims recently reached cache a copy would have let go at once, and
 // only as far as the cache's victims that go at once do not cover the claims
 // ahead. Until its request ends the request may go on from its chain, and
-// reclaims take the point last. Without demand nothing is written ahead. A point its
-// conversation went on from by its turn is given up then, unwritten
-// (Cache::newestPoint).
+// reclaims take the point last. Without demand nothing is written ahead. A point
+// the tier no longer copies by its turn is given up then, unwritten
+// (Cache::copiedAhead).
 //
 // Points are copied one at a time, in publication order, skipping those
 // that wait, and none while a claim waits for memory on its way back: what

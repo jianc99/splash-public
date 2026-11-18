@@ -986,35 +986,69 @@ void testDurablePointsStayInRam() {
           "the next process did not take the durable point back whole");
 }
 
-// Only the newest points are copied: none a conversation went on from, a gone one or a checkpoint;
-// one two conversations share, or only a checkpoint follows, is.
-void testOnlyTheNewestPointsAreKept() {
+// A tier copies ahead what it brings back (Cache::copiedAhead): a conversation's newest point, a
+// junction, a point only a checkpoint follows, and in a persistent tier the one behind the newest
+// too (StateCache::kKeptBehind); never a point two turns behind, a gone one or a checkpoint.
+void testOnlyTheKeptPointsAreCopied() {
   const std::vector<uint32_t> prompt = promptOf(1000, 4);
   for (const bool persistent : {true, false}) {
     Process process(persistent);
     const std::vector<uint64_t> blocks = process.cachePrompt(1, prompt);
+    process.publish(blocks[0]);
     process.publish(blocks[1]);
     process.publish(blocks[2], true);
     process.publish(blocks[3]);
-    require(process.cache.persist(blocks[1]) == PersistStatus::Unneeded &&
+    require(process.cache.persist(blocks[0]) == PersistStatus::Unneeded &&
                 process.cache.persist(blocks[2]) == PersistStatus::Unneeded &&
                 process.cache.persist(blocks[3] + 100) == PersistStatus::Unneeded &&
                 !process.tier.demotions,
             "a superseded point, a checkpoint or a gone point was written");
-    std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + 2 * KvCache::pageTokens);
-    const std::vector<uint32_t> own = promptOf(5000, 2);
+    std::vector<uint32_t> branch(prompt.begin(), prompt.begin() + KvCache::pageTokens);
+    const std::vector<uint32_t> own = promptOf(5000, 3);
     branch.insert(branch.end(), own.begin(), own.end());
     process.publish(process.cachePrompt(2, branch)[3]);
-    require(process.cache.persist(blocks[1]) == PersistStatus::Started,
+    require(process.cache.persist(blocks[0]) == PersistStatus::Started,
             "a point two conversations went on from was not kept");
 
+    Process behind(persistent);
+    const std::vector<uint64_t> chain = behind.cachePrompt(1, prompt);
+    behind.publish(chain[1]);
+    behind.publish(chain[3]);
+    require(behind.cache.persist(chain[1]) == (persistent ? PersistStatus::Started : PersistStatus::Unneeded),
+            "the point behind the newest was copied in a temporary tier or not in a persistent one");
+
     Process followed(persistent);
-    const std::vector<uint64_t> chain = followed.cachePrompt(1, prompt);
-    followed.publish(chain[1]);
-    followed.publish(chain[3], true);
-    require(followed.cache.persist(chain[1]) == PersistStatus::Started,
+    const std::vector<uint64_t> checkpointed = followed.cachePrompt(1, prompt);
+    followed.publish(checkpointed[1]);
+    followed.publish(checkpointed[3], true);
+    require(followed.cache.persist(checkpointed[1]) == PersistStatus::Started,
             "a point only a checkpoint follows was not kept");
   }
+}
+
+// After a restart a regenerate of the last turn resumes at that turn's prompt-end point. Write-behind
+// copies the conversation's newest point, the reply's state, and the prompt-end point behind it, which
+// a reclaim keeps too; the turn before stays behind. Copying only the newest, a regenerate after a
+// restart found no state before the reply and read the conversation again.
+void testARegenerateAfterARestartResumesAtItsPromptEnd() {
+  const std::vector<uint32_t> prompt = promptOf(1000, 4);
+  Process earlier(true);
+  const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt);
+  // The turn before's prompt-end, the last turn's prompt-end, and its reply's state.
+  earlier.publish(blocks[0]);
+  earlier.publish(blocks[1]);
+  earlier.publish(blocks[3]);
+  require(earlier.persist(blocks[0]) == PersistStatus::Unneeded && earlier.persist(blocks[1]) == PersistStatus::Durable &&
+              earlier.persist(blocks[3]) == PersistStatus::Durable,
+          "write-behind did not copy what a reclaim keeps, and only that");
+  Process next(true);
+  const CacheAdoption adoption = next.adopt(earlier.kvLabels(), earlier.stateLabels());
+  require(adoption.states == 2 && adoption.dropped == 0, "the next process did not take back both kept points");
+  std::vector<uint32_t> regenerate(prompt.begin(), prompt.begin() + 2 * KvCache::pageTokens);
+  regenerate.push_back(7);
+  const CacheLookup lookup = next.cache.lookup(regenerate, {});
+  require(lookup.state && lookup.state->kvBlock() == blocks[1] && lookup.resumeBoundary() == 2 * KvCache::pageTokens,
+          "a regenerate after the restart did not resume at the last turn's prompt-end");
 }
 
 // Nothing is copied while a restore waits on the tier.
@@ -1171,14 +1205,17 @@ void testPointsWaitTheirTurn() {
               writes.snapshot().durable == 1 && !writes.snapshot().waiting,
           "the point did not become durable once its writes landed");
 
-  // The conversation goes on before its point falls due.
+  // The conversation goes on two points past it before it falls due: it is superseded
+  // (StateCache::kKeptBehind).
   std::vector<uint32_t> longer = promptOf(3000, 2);
   const std::vector<uint64_t> turn = process.cachePrompt(3, longer);
   process.publish(turn[1]);
   writes.published(turn[1], WriteBehind::kMinimumTokens, 2 * kDelay);
-  const std::vector<uint32_t> more = promptOf(4000, 1);
+  const std::vector<uint32_t> more = promptOf(4000, 2);
   longer.insert(longer.end(), more.begin(), more.end());
-  const uint64_t next = process.cachePrompt(4, longer)[2];
+  const std::vector<uint64_t> on = process.cachePrompt(4, longer);
+  process.publish(on[2]);
+  const uint64_t next = on[3];
   process.publish(next);
   writes.published(next, WriteBehind::kMinimumTokens, 2 * kDelay + 1);
   require(writes.run(3 * kDelay, kCopiesDemanded, false) && writes.snapshot().unneeded == 1 &&
@@ -1757,7 +1794,8 @@ int main() {
     testPointLargerThanTheQuotaIsRefused();
     testPersistingStateStaysInRam();
     testDurablePointsStayInRam();
-    testOnlyTheNewestPointsAreKept();
+    testOnlyTheKeptPointsAreCopied();
+    testARegenerateAfterARestartResumesAtItsPromptEnd();
     testRestoresGoFirst();
     testCopiesWaitForWritesNeededNow();
     testTemporaryCopiesTakeOnlyFreeRoom();
