@@ -404,7 +404,7 @@ struct ServeSettingsTests {
 
     /// Whether this session can write the login Keychain, which is locked over SSH.
     static let keychainWritable: Bool = {
-        let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")
+        let keychain = Keychain.forTests()
         guard (try? keychain.write("probe")) != nil else { return false }
         try? keychain.write(nil)
         return true
@@ -412,7 +412,7 @@ struct ServeSettingsTests {
 
     @Test(.enabled(if: keychainWritable, "the login Keychain is locked, as over SSH"))
     func keepsTheKeyInTheKeychain() throws {
-        let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")
+        let keychain = Keychain.forTests()
         defer { try? keychain.write(nil) }
         #expect(try keychain.read() == nil)
         try keychain.write("first")
@@ -428,7 +428,7 @@ struct ServeSettingsTests {
 struct AppStateTests {
     @Test(.enabled(if: ServeSettingsTests.keychainWritable, "the login Keychain is locked, as over SSH"))
     func keepsTheKeyTheOptionsHave() throws {
-        let keychain = Keychain(service: "Splash Tests \(UUID().uuidString)")
+        let keychain = Keychain.forTests()
         defer { try? keychain.write(nil) }
         let root = FileManager.default.temporaryDirectory.appending(path: "splash-state-tests-\(UUID().uuidString)")
         defer { try? FileManager.default.removeItem(at: root) }
@@ -448,6 +448,26 @@ struct AppStateTests {
         state.options.apiKey = nil
         state.keepKey()
         #expect(try keychain.read() == nil)
+    }
+
+    /// No app a test builds writes in the user's Library or reads the user's API key: its logs,
+    /// chats and drafts are in its own folder, and its Keychain service is its own, apart from the
+    /// app's and from every other test app's.
+    @Test func noTestsAppReachesTheUsersPlaces() throws {
+        let (state, folder) = AppState.forTests()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        defer { state.quit() }
+        let fake = try FakeRuntime("splash-places", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let other = fake.state()
+        defer { other.quit() }
+        let library = URL.libraryDirectory.path(percentEncoded: false)
+        for app in [state, other] {
+            for place in [app.server.log, app.installer.log, app.chats.drafts] {
+                #expect(!place.path(percentEncoded: false).hasPrefix(library), "\(place.path) is in the user's Library")
+            }
+        }
+        #expect(Set([state.keychain.service, other.keychain.service, Keychain.app.service]).count == 3)
     }
 
     /// A fake server ends once the process that started it is gone, as a test run cut short by its
@@ -473,11 +493,11 @@ struct AppStateTests {
     @Test func keepsWhatModelFilesStartWith() throws {
         let fake = try FakeRuntime("splash-model-files", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         state.modelFiles["/m/q.gguf", default: AppState.ModelFiles()].projector = "/m/mmproj.gguf"
         state.modelFiles["/m/q.gguf", default: AppState.ModelFiles()].draft = "/m/draft"
-        let again = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let again = fake.state()
         defer { again.quit() }
         #expect(again.modelFiles["/m/q.gguf"] == AppState.ModelFiles(projector: "/m/mmproj.gguf", draft: "/m/draft"))
         #expect(state.settings(for: "/m/q.gguf").projector == "/m/mmproj.gguf" && state.settings(for: "a/b").projector == nil)
@@ -493,7 +513,7 @@ struct AppStateTests {
     @Test func aCheckForUpdatesSaysWhatItFound() async throws {
         let fake = try FakeRuntime("splash-check", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         let installer = fake.root.appending(path: "install/models.py")
@@ -532,7 +552,7 @@ struct AppStateTests {
         defer { try? FileManager.default.removeItem(at: fake.root) }
         try fake.install("a/b")
         try fake.install("c/d")
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         await state.listed()
@@ -576,7 +596,7 @@ struct AppStateTests {
     @Test func theStatusIsAskedLessOftenWhileNothingShowsIt() throws {
         let fake = try FakeRuntime("splash-watched", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         #expect(!state.server.unwatched)
         state.windowShows = false
@@ -653,7 +673,7 @@ struct AppStateTests {
         let first = "a/First-GGUF:Q4", second = "a/Second-GGUF:Q4"
         try fake.install(first)
         try fake.install(second)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         func step(_ name: String) { FileManager.default.createFile(atPath: fake.root.appending(path: name).path, contents: nil) }
         #expect(!state.canStart(first))
@@ -1308,7 +1328,7 @@ struct ModelFamilyTests {
         let runtime = Runtime(root: fake.root)
         try #"print('{"Flint": {"unusable": ["--state-format"], "context_tokens": 262144, "max_context_tokens": 262144}}')"#
             .write(to: runtime.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         #expect(!state.families.isEmpty)
@@ -1346,7 +1366,7 @@ struct ModelFamilyTests {
         let flint = "a/Flint-GGUF:Q4", other = "a/Other-GGUF:Q4"
         try fake.install(flint, family: "Flint")
         try fake.install(other, family: "Other")
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         #expect(state.family(of: flint) == .unknown)
         await state.launch()
@@ -1404,7 +1424,7 @@ struct ModelFamilyTests {
         try fake.install(speech, family: "Speech")
         let file = fake.root.appending(path: "Added-Q4_0.gguf")
         try Data(count: 10).write(to: file)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         state.addLocal(file)
         await state.listed()
@@ -1414,7 +1434,7 @@ struct ModelFamilyTests {
         #expect(state.selection == flint)
         // The next launch, whose report fails.
         try "import sys; sys.exit(1)".write(to: script, atomically: true, encoding: .utf8)
-        let next = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let next = fake.state()
         defer { next.quit() }
         await next.launch()
         #expect(next.installed.map(\.id) == [flint, speech, file.path])
@@ -1436,7 +1456,7 @@ struct AgentTests {
     @MainActor @Test func opensInADrawerTerminalInTheAgentsFolder() throws {
         let fake = try FakeRuntime("splash-agent", launcher: "stepped_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         let folder = fake.root.appending(path: "project")
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -1714,7 +1734,7 @@ struct ChatTests {
             + #""text": "Look", "reasoning": "", "images": ["\#(Showcase.picture.base64EncodedString())"]}]}"#
         let file = fake.chats.appending(path: "\(id).json")
         try Data(old.utf8).write(to: file)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         #expect(state.blocker != nil)
