@@ -246,7 +246,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 12, WriteBehind.cpp 9, Engine.cpp 8, StateCache.hpp 3, StateCache.cpp 1).
 # 30,792: +20 for copies ahead of what each tier brings back (StateCache.cpp
 # 10, Cache.hpp 5, StateCache.hpp 4, Cache.cpp 1).
-ENGINE_LINE_BUDGET = 30_792
+# 30,809: +17 for a state at the end of a prompt's head (Engine.cpp 5,
+# Protocol.hpp 4, Protocol.cpp 4, Types.hpp 3, NativeRuntime.cpp 1).
+ENGINE_LINE_BUDGET = 30_809
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

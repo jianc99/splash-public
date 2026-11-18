@@ -138,6 +138,24 @@ class Prompt:
     template_effort: str | None = None
 
 
+def _head_tokens(messages, tools, tokens, marker_id, image_positions):
+    """Where the prompt's head ends: its system block, the system or
+    developer message it starts with or the tools a template renders there,
+    through the template's first message boundary (`marker_id`), which other
+    conversations of the same agent or app share. The engine keeps a state
+    there on first use, so the next conversation resumes past the head rather
+    than prefill it again. Zero without a system block, without a boundary,
+    where the head is the whole prompt, or where an image lies in it, whose
+    expansion would move it."""
+    system = bool(messages) and messages[0].get("role") in ("system", "developer")
+    if marker_id is None or not (system or tools) or marker_id not in tokens:
+        return 0
+    end = tokens.index(marker_id) + 1
+    if end >= len(tokens) or (image_positions and image_positions[0] < end):
+        return 0
+    return end
+
+
 @dataclass
 class RenderedPrompt:
     text: str
@@ -147,6 +165,8 @@ class RenderedPrompt:
     thinking: bool
     # Images precede the generation prompt; expanding them keeps this count.
     generation_prompt_tokens: int
+    # Where the head ends (_head_tokens); zero without one.
+    head_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -780,8 +800,21 @@ class Frontend:
             thinking, generation_prompt_tokens = _generation_prompt(
                 chat_template.generation_prompt(options), rendered, tokens
             )
+        head_tokens = _head_tokens(
+            prompt.messages,
+            prompt.tools,
+            tokens,
+            self.prompt_tokenizer.marker_id,
+            positions,
+        )
         return RenderedPrompt(
-            rendered, tokens, images, positions, thinking, generation_prompt_tokens
+            rendered,
+            tokens,
+            images,
+            positions,
+            thinking,
+            generation_prompt_tokens,
+            head_tokens,
         )
 
     def chat_job(
@@ -914,6 +947,7 @@ class Frontend:
             image_owner=prepared_images if prepared_images else None,
             tools_signature=tools_signature,
             generation_prompt_tokens=rendered.generation_prompt_tokens,
+            head_tokens=rendered.head_tokens,
             output_clamped_to_context=requested is not None and max_new < requested,
         )
 

@@ -1115,6 +1115,48 @@ void testATurnsKeptPointsAreCopiedTheDelayAfterItEnds() {
               " points, not its replay point and its reply's state");
 }
 
+// A conversation whose prompt starts with a head of 3,000 tokens, a system prompt and tools the server marks
+// (headTokens), keeps a state at the head's end, a junction: the next conversation sharing the head resumes there on
+// first use, and with a persistent tier the state is copied ahead, for a restart. Before, only the second
+// conversation's own junction served a third, and the second prefilled from the start. A prompt without a head,
+// or with one shorter than the draft window a state's capture costs (kMinimumJunctionGain), keeps none.
+void testASecondConversationResumesAtASharedHead() {
+  constexpr double kDelay = WriteBehind::kDelayMilliseconds;
+  for (const uint32_t headTokens : {3000U, 0U, 1024U}) {
+    test::EngineHarness h({.pages = 1024,
+                           .tier = test::TierOptions{.capacity = 1024, .transferLimit = 8,
+                                                     .bytesPerMillisecond = 1e6, .persistent = true}});
+    h.model.offloadTier = std::make_shared<OffloadControl>();
+    h.model.offloadTier->ready = true;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
+    double now = 1;
+    const auto conversation = [&](uint64_t id, uint32_t seed) {
+      std::vector<uint32_t> prompt(3000);
+      std::iota(prompt.begin(), prompt.end(), 1);
+      prompt.resize(prompt.size() + 1500, seed);
+      EngineRequest result = conversationTurn(id, prompt, 8);
+      result.headTokens = headTokens;
+      result.deadlineMilliseconds = now + 10 * kDelay;
+      return result;
+    };
+    engine.submit(conversation(1, 20'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the first conversation did not complete");
+    now += 2 * kDelay;
+    tickUntil(h, now, [&] { return !engine.snapshot().writeBehind.waiting; }, "the first conversation's points waited");
+    const bool kept = headTokens >= model::ExecutionLimits::draftContextTokens;
+    require(engine.snapshot().writeBehind.durable == (kept ? 2U : 1U),
+            "head " + std::to_string(headTokens) + ": " + std::to_string(engine.snapshot().writeBehind.durable) +
+                " points copied ahead, not the replay point" + (kept ? " and the head" : ""));
+    engine.submit(conversation(2, 30'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the second conversation did not complete");
+    const uint32_t head = kept ? headTokens / KvCache::pageTokens * KvCache::pageTokens : 0;
+    require(events.starts.back() == head, "head " + std::to_string(headTokens) +
+                                              ": the second conversation resumed from " +
+                                              std::to_string(events.starts.back()) + ", not " + std::to_string(head));
+  }
+}
+
 // A finished request's KV holds part of the budget, so a later request's KV
 // meets the wall as it grows, where each wall test's budget puts it; captured
 // states are OffloadStates from then on, which reclaim may write to the SSD
@@ -2622,6 +2664,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testAReclaimWritesNoSupersededPoint", testAReclaimWritesNoSupersededPoint},
       {"testATurnsKeptPointsAreCopiedTheDelayAfterItEnds", testATurnsKeptPointsAreCopiedTheDelayAfterItEnds},
       {"testFourConversationsKeepEachOthersPoints", testFourConversationsKeepEachOthersPoints},
+      {"testASecondConversationResumesAtASharedHead", testASecondConversationResumesAtASharedHead},
       {"testReplyCheckpointsAreNotWrittenAtTheWall", testReplyCheckpointsAreNotWrittenAtTheWall},
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},
       {"testRepliesAreKeptOnceAConversationRendersThemBack", testRepliesAreKeptOnceAConversationRendersThemBack},
