@@ -44,6 +44,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -52,6 +53,7 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -8791,24 +8793,51 @@ int main(int argc, char **argv) {
         static_cast<void>(runtime->warmupDecodeBatch(width));
       const double recalledSeconds =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - recalledStarted).count();
-      require(remembers == model::ExecutionLimits::maximumBatchWidth && remembered == first,
-              "a start that recalled its step costs measured them again");
+      constexpr uint32_t kLanes = model::ExecutionLimits::maximumBatchWidth;
+      const std::optional<double> ratio = model::RuntimeInstrumentation::levelRatio(*runtime);
+      require(ratio.has_value() && remembers == kLanes && remembered == first,
+              "a start that recalled its step costs did not check their level, or measured them again");
+      std::cout << "step_costs_level_ratio=" << *ratio << '\n';
       // That start's runtime has served no cycle: its cost of history is none.
       requireServedCyclesTeachHistoryCost(*runtime, samplingSeedTokens);
+      const auto warmups = [&] {
+        budgeted();
+        for (uint32_t width = 1; width <= kLanes; ++width) static_cast<void>(runtime->warmupDecodeBatch(width));
+      };
+      // Tables remembered at twice their cost, as a start on a busy Mac would
+      // measure them: the next start's check finds them stale and measures
+      // every lane count again.
+      for (auto &[lanes, line] : remembered) {
+        std::istringstream text(first.at(lanes));
+        std::ostringstream doubled;
+        doubled << std::setprecision(9);
+        for (std::string point; text >> point;) {
+          const size_t colon = point.rfind(':');
+          doubled << (doubled.tellp() > 0 ? " " : "") << point.substr(0, colon + 1) << 2.0 * std::stod(point.substr(colon + 1));
+        }
+        line = doubled.str();
+      }
+      const std::unordered_map<uint32_t, std::string> slowed = remembered;
+      warmups();
+      const std::optional<double> slowedRatio = model::RuntimeInstrumentation::levelRatio(*runtime);
+      require(remembers == 2 * kLanes && std::ranges::all_of(remembered, [&](const auto &entry) {
+                return entry.second != slowed.at(entry.first);
+              }),
+              "a start that recalled tables twice their cost did not measure them all again");
+      std::cout << "step_costs_slowed_ratio=" << slowedRatio.value_or(0.0) << '\n';
       // A remembered line of a point at no cost, or of points another build's
-      // classes made: a start measures the lane count again and keeps its line.
+      // classes made: the lane count is not recalled, so the start forgets
+      // the others, which another start measured, and measures them all.
       for (const std::string_view stale : {std::string_view("2:8:-1"), std::string_view("8:8:20 16:16:30")}) {
         remembered[1] = stale;
-        budgeted();
-        for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
-          static_cast<void>(runtime->warmupDecodeBatch(width));
+        warmups();
         const std::vector<model::StepCosts::Point> points = model::RuntimeInstrumentation::stepPoints(*runtime, 1);
         require(remembered[1] != stale && !points.empty() &&
                     std::ranges::all_of(points, [](const model::StepCosts::Point &p) { return p.milliseconds > 0.0; }),
                 "a start that recalled a line of no step's cost did not measure it again");
       }
-      require(remembers == model::ExecutionLimits::maximumBatchWidth + 2,
-              "the starts that recalled lines of no step's cost did not remember what they measured");
+      require(remembers == 4 * kLanes,
+              "the starts that recalled lines of no step's cost did not measure and remember every lane count");
       std::cout << "recalled_step_costs=PASS decode_warmups_seconds=" << recalledSeconds << '\n';
     }
     std::cout << "model_runtime_oracle_test: PASS\n";

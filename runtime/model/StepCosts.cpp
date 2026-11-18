@@ -128,24 +128,42 @@ bool StepCosts::fits(uint32_t lanes, uint32_t first, uint32_t runway) const {
   return first + lanes * lanePages(table(lanes).size()) <= runway;
 }
 
-double StepCosts::measure(uint32_t lanes, std::span<const std::vector<double>> replays) {
+namespace {
+
+double median(std::vector<double> times) {
+  std::ranges::sort(times);
+  const size_t half = times.size() / 2;
+  return times.size() % 2 ? times[half] : 0.5 * (times[half - 1] + times[half]);
+}
+
+bool timed(double ms) { return std::isfinite(ms) && ms > 0.0; }
+
+} // namespace
+
+void StepCosts::measure(uint32_t lanes, std::span<const std::vector<double>> replays) {
   std::vector<Point> &points = table(lanes);
   if (replays.empty() || std::ranges::any_of(replays, [&](const std::vector<double> &replay) {
         return replay.size() != points.size() ||
-               std::ranges::any_of(replay, [](double ms) { return !std::isfinite(ms) || ms <= 0.0; });
+               !std::ranges::all_of(replay, timed);
       }))
     throw std::invalid_argument("invalid step replays");
-  double spread = 0.0;
   for (size_t point = 0; point < points.size(); ++point) {
     std::vector<double> times;
     for (const std::vector<double> &replay : replays)
       times.push_back(replay[point]);
-    std::ranges::sort(times);
-    const size_t half = times.size() / 2;
-    points[point].milliseconds = times.size() % 2 ? times[half] : 0.5 * (times[half - 1] + times[half]);
-    spread = std::max(spread, points[point].milliseconds / times.front() - 1.0);
+    points[point].milliseconds = median(std::move(times));
   }
-  return spread;
+}
+
+bool StepCosts::stale(uint32_t lanes, std::span<const double> replays) const {
+  if (!measured(lanes) || replays.empty() || !std::ranges::all_of(replays, timed))
+    throw std::invalid_argument("invalid level check");
+  return table(lanes).back().milliseconds > (1.0 + kStale) * median({replays.begin(), replays.end()});
+}
+
+void StepCosts::forget() {
+  for (std::vector<Point> &points : tables_)
+    for (Point &point : points) point.milliseconds = 0.0;
 }
 
 std::string StepCosts::text(uint32_t lanes) const {
