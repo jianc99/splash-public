@@ -223,6 +223,9 @@ class CallbackStreamer:
         self.emitted = []
         self.pending_text = ""
         self.stop_sequence = None
+        # How many characters before the end of the text it was found in
+        # the stop sequence begins (StopSearch.search).
+        self._stop_back = 0
 
     def _send(self, text):
         if text:
@@ -239,6 +242,7 @@ class CallbackStreamer:
         found = self.stops.search(text)
         if found is not None:
             self.stop_sequence, back = found
+            self._stop_back = back
             self._send(self.pending_text[: len(self.pending_text) - back])
             self.pending_text = ""
             if self.on_stop is not None:
@@ -253,6 +257,7 @@ class CallbackStreamer:
     def put_tokens(self, token_ids):
         if self.stop_sequence is not None:
             return
+        first = len(self.token_ids)
         for token_id in token_ids:
             token_id = int(token_id)
             self.token_ids.append(token_id)
@@ -263,7 +268,7 @@ class CallbackStreamer:
             except Exception as error:
                 # tokenizers raises a plain Exception with this message when an
                 # incremental decode cannot continue; fall back to decoding the
-                # whole sequence at the end.
+                # whole sequence after each batch.
                 if not str(error).startswith("Invalid prefix encountered"):
                     raise
                 self.decode_stream = None
@@ -272,22 +277,44 @@ class CallbackStreamer:
                 self._emit(text)
                 if self.stop_sequence is not None:
                     break
+        if self.decode_stream is None:
+            self._decode_whole(first)
 
-    def end(self):
-        if self.stop_sequence is not None:
-            return
-        decoded = self.tokenizer.decode(
-            self.token_ids,
-            skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )
+    def _decode_whole(self, first):
+        """Without an incremental decode: the text of the whole output past
+        what was handled, as the incremental decode would have emitted it,
+        so that a stop sequence ends the request as soon as its batch
+        arrives. Where one does, the output keeps the fewest tokens from
+        `first` on whose text reaches the stop's end, as a token-by-token
+        decode would have stopped there, and the usage counts no more."""
+        decoded = self._decode(self.token_ids)
         handled = "".join(self.emitted) + self.pending_text
         if not decoded.startswith(handled):
             raise RuntimeError("incremental tokenizer output diverged")
         # Bytes of a multi-byte character the output ends inside decode to
         # U+FFFD; DecodeStream held them back for the rest. Drop the trailing
         # U+FFFD, as vLLM's detokenizer does; one that text follows stays.
-        self._emit(decoded[len(handled) :].rstrip("\ufffd"))
+        new = decoded[len(handled) :].rstrip("\ufffd")
+        self._emit(new)
+        if self.stop_sequence is None:
+            return
+        stop_end = len(handled) + len(new) - self._stop_back + len(self.stop_sequence)
+        for count in range(max(first, 1), len(self.token_ids)):
+            if len(self._decode(self.token_ids[:count]).rstrip("\ufffd")) >= stop_end:
+                del self.token_ids[count:]
+                break
+
+    def _decode(self, token_ids):
+        return self.tokenizer.decode(
+            token_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+    def end(self):
+        if self.stop_sequence is not None:
+            return
+        self._decode_whole(len(self.token_ids))
         if self.stop_sequence is None:
             self._send(self.pending_text)
             self.pending_text = ""

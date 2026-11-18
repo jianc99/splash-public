@@ -1496,10 +1496,59 @@ class CallbackStreamerTests(unittest.TestCase):
         streamer.decode_stream = SimpleNamespace(
             step=mock.Mock(side_effect=ValueError("Invalid prefix encountered"))
         )
-        streamer.put_tokens(tokenizer.token_ids)
-        self.assertEqual(chunks, [])
+        streamer.put_tokens(tokenizer.token_ids[:2])
+        self.assertEqual("".join(chunks), '{"value')
+        streamer.put_tokens(tokenizer.token_ids[2:])
         streamer.end()
         self.assertEqual("".join(chunks), tokenizer.decode(tokenizer.token_ids))
+
+    def test_an_invalid_decoder_prefix_stops_at_the_batch_that_holds_the_stop(self):
+        # Decoding the whole output after each batch, a stop ends the request
+        # with the batch that completes it, and the output keeps the tokens up
+        # to the one that does, which its usage counts.
+        tokenizer = ByteLevelTestTokenizer(
+            [b"alpha ", b"<ST", b"OP>", b"hidden", b" trailing"]
+        )
+        chunks, stopped = [], []
+        streamer = backend_api.CallbackStreamer(
+            tokenizer, chunks.append, ("<STOP>",), lambda: stopped.append(True)
+        )
+        streamer.decode_stream = SimpleNamespace(
+            step=mock.Mock(side_effect=ValueError("Invalid prefix encountered"))
+        )
+        streamer.put_tokens(tokenizer.token_ids[:2])
+        self.assertEqual(stopped, [])
+        streamer.put_tokens(tokenizer.token_ids[2:])
+        self.assertEqual(stopped, [True])
+        self.assertEqual(streamer.token_ids, tokenizer.token_ids[:3])
+        streamer.put_tokens(tokenizer.token_ids)
+        streamer.end()
+        self.assertEqual("".join(chunks), "alpha ")
+        self.assertEqual(streamer.stop_sequence, "<STOP>")
+        self.assertEqual(streamer.token_ids, tokenizer.token_ids[:3])
+
+    def test_the_stop_that_begins_first_ends_a_block_whatever_the_list_order(self):
+        # A speculative step's block can complete two stops at once.
+        tokenizer = ByteLevelTestTokenizer([b"A ST", b"OP B ", b"END and more"])
+        for stops in (("END", "STOP"), ("STOP", "END")):
+            for incremental in (True, False):
+                with self.subTest(stops=stops, incremental=incremental):
+                    chunks = []
+                    streamer = backend_api.CallbackStreamer(
+                        tokenizer, chunks.append, stops
+                    )
+                    if not incremental:
+                        streamer.decode_stream = SimpleNamespace(
+                            step=mock.Mock(
+                                side_effect=ValueError("Invalid prefix encountered")
+                            )
+                        )
+                    streamer.put_tokens(tokenizer.token_ids)
+                    streamer.end()
+                    self.assertEqual(
+                        ("".join(chunks), streamer.stop_sequence), ("A ", "STOP")
+                    )
+                    self.assertEqual(streamer.token_ids, tokenizer.token_ids[:2])
 
     def test_callback_streamer_stops_across_token_boundaries(self):
         tokenizer = ByteLevelTestTokenizer([b"alpha <ST", b"OP>hidden", b" trailing"])
