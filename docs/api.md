@@ -60,10 +60,11 @@ Completions, text completions, Responses and Messages share these fields:
   whitespace, as Anthropic requires; Anthropic sets no count, and Splash takes
   up to four, which bound the memory and time of its stop search. A stop is at
   most 16,384 characters (a longer one returns 400). A stop string ends the
-  output where the model writes it, inside a tool call or structured output too,
-  which it cuts as the token limit does: a call it cuts keeps the arguments it
-  has, and no call of the output counts as made; a cut structured answer is not
-  validated.
+  output where the model writes it in the answer: it is not searched in the
+  reasoning nor inside a tool call, where the tags' own tokens bound them
+  ([chat formats](models.md#chat-formats)), and the search starts afresh after
+  each, so a stop never spans them, and after the newlines that set the answer
+  apart from the reasoning. A structured answer a stop cuts is not validated.
 - `return_progress`, with `stream` true: prompt progress before the output
   ([output limits and streaming](#output-limits-and-streaming)).
 - `cache_salt`: a nonempty string. A request shares cached prompts, their KV and
@@ -511,7 +512,7 @@ not give: `["integer", "any"]` constrains no type, and
 | not declared | `seven` | `"seven"` |
 
 Calls are not validated against their schemas; a client reports what its tool
-rejects. A `stop` string may cut a call ([request fields](#request-fields)).
+rejects. A `stop` string leaves a call whole ([request fields](#request-fields)).
 
 The output is read as the chat template lays calls out, in the family's
 syntax ([chat formats](models.md#chat-formats)). In Qwen's XML a call opens at
