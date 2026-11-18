@@ -242,7 +242,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 30,739: +63 for what a conversation keeps and what a reclaim drops unwritten
 # (StateCache.cpp 83, StateCache.hpp 22; Cache.cpp -27, Cache.hpp -1,
 # WriteBehind.cpp -11, WriteBehind.hpp -1, Engine.cpp -2).
-ENGINE_LINE_BUDGET = 30_739
+# 30,772: +33 for copies ahead counted from a request's end (WriteBehind.hpp
+# 12, WriteBehind.cpp 9, Engine.cpp 8, StateCache.hpp 3, StateCache.cpp 1).
+ENGINE_LINE_BUDGET = 30_772
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

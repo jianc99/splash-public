@@ -356,13 +356,14 @@ void StateCache::markBranchPoint(uint64_t kvBlock) {
   markSuperseded(kvBlock);
 }
 
-void StateCache::keepReplyAsPoint(StateCheckpoint checkpoint) {
+bool StateCache::keepReplyAsPoint(StateCheckpoint checkpoint) {
   const auto found = entries_.find(checkpoint.kvBlock);
   if (found == entries_.end() || found->second.publication != checkpoint.publication ||
       !found->second.opportunistic)
-    return;
+    return false;
   makeOrdinary(checkpoint.kvBlock, found->second);
   reindex(checkpoint.kvBlock, found->second);
+  return true;
 }
 
 uint64_t StateCache::bytes(uint64_t kvBlock) const noexcept {

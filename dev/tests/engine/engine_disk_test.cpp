@@ -728,8 +728,8 @@ void testReplyStateLeavesTheReplayPointWrittenBehind() {
                                 "reply's state");
 }
 
-// A temporary tier copies a point once its request ends, a persistent one while it runs; once
-// copied, a reclaim frees the conversation at once, writing nothing.
+// Either tier copies a point only once its request has ended, the delay after its end (a persistent
+// tier copied it while it ran); once copied, a reclaim frees the conversation at once, writing nothing.
 void testFinishedConversationsLeaveAtOnce() {
   for (const bool persistent : {false, true}) {
     test::TestKvStorage storage{1024, 4096, 4};
@@ -758,12 +758,11 @@ void testFinishedConversationsLeaveAtOnce() {
     now += WriteBehind::kDelayMilliseconds;
     for (uint32_t step = 0; step < 4; ++step)
       static_cast<void>(engine.tick(now++));
-    require(engine.snapshot().writeBehind.waiting == 1 && !events.completedCount &&
-                tier.demotions == writes + (persistent ? 16u : 0u),
-            persistent ? "a persistent tier did not write a point in use"
-                       : "a temporary tier wrote a point its running request holds");
+    require(engine.snapshot().writeBehind.waiting == 1 && !events.completedCount && tier.demotions == writes,
+            "a tier wrote a point its running request holds");
     engine.cancel(1);
     tickUntil(engine, now, [&] { return idle(engine); }, "the request did not end");
+    now += WriteBehind::kDelayMilliseconds;
     if (!persistent) {
       EngineRequest ahead = request(2, std::vector<uint32_t>(16384, 9));
       ahead.deadlineMilliseconds = 1e9;

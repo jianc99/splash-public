@@ -1,14 +1,24 @@
 #include "engine/WriteBehind.hpp"
 
+#include <algorithm>
+
 namespace splash::engine {
 
 WriteBehind::WriteBehind(Cache &cache) : cache_(cache), copying_(cache.persistent()) {}
 
 void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
+  now_ = std::max(now_, now);
   if (!cache_.kvTierWritable() || tokens < kMinimumTokens || queued_.contains(block))
     return;
   queued_.insert(block);
   waiting_.push_back({block, now + kDelayMilliseconds});
+}
+
+void WriteBehind::ended(uint64_t block, uint32_t tokens) {
+  if (queued_.contains(block))
+    std::erase_if(waiting_, [&](const Point &point) { return point.block == block; });
+  queued_.erase(block);
+  published(block, tokens, now_);
 }
 
 bool WriteBehind::settle(PersistStatus status) {
@@ -52,11 +62,10 @@ bool WriteBehind::demanded(uint64_t demandBytes) const {
   return true;
 }
 
-bool WriteBehind::inUse(uint64_t block) const noexcept {
-  return !cache_.persistent() && cache_.stateInUse(block);
-}
+bool WriteBehind::inUse(uint64_t block) const noexcept { return cache_.stateInUse(block); }
 
 bool WriteBehind::run(double now, uint64_t demandBytes, bool claimWaiting) {
+  now_ = std::max(now_, now);
   demandBytes_ = demandBytes;
   copying_ = copying();
   return step(now, claimWaiting, [&] { return cache_.persistent() || demanded(demandBytes); });
