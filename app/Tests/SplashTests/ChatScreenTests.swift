@@ -461,8 +461,14 @@ extension ChatScreenTests {
         let still = try #require(Self.card(in: opening.still.card), "the card once still")
         #expect(before.height > still.height + 100, "the card before, \(before), and once still, \(still)")
         let frames = opening.drawn.map { (ms: $0.ms, card: Self.card(in: $0.card)) }
+        // A frame with no card found is kept, to tell a card not drawn from one drawn otherwise.
+        let kept = zip(opening.drawn, frames).filter { $1.card == nil }.map { drawn, _ in
+            let file = FileManager.default.temporaryDirectory.appending(path: "composer-card-\(drawn.ms)ms-\(UUID().uuidString).png")
+            try? drawn.card.representation(using: .png, properties: [:])?.write(to: file)
+            return file.path(percentEncoded: false)
+        }
         #expect(frames.allSatisfy { $0.card.map { abs($0.height - still.height) <= 2 } ?? false },
-                "the card per frame, \(frames), once still \(still)")
+                "the card per frame, \(frames), once still \(still); the frames without one in \(kept)")
         let buttons = [before.button] + frames.compactMap(\.card?.button)
         #expect(zip(buttons, buttons.dropFirst()).allSatisfy { $1 >= $0 - 1 }, "its button per frame from before: \(buttons)")
     }
