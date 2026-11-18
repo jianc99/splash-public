@@ -450,6 +450,24 @@ struct AppStateTests {
         #expect(try keychain.read() == nil)
     }
 
+    /// A fake server ends once the process that started it is gone, as a test run cut short by its
+    /// time limit is: a shell starts one, which waits for a request that never comes, and ends.
+    @Test func aFakeEndsWithTheProcessThatStartedIt() async throws {
+        let fake = try #require(Bundle.module.path(forResource: "streaming_server", ofType: "py", inDirectory: "Fakes"))
+        let shell = Process()
+        shell.executableURL = URL(filePath: "/bin/sh")
+        shell.arguments = ["-c", "/usr/bin/python3 \"$0\" > /dev/null & echo $!", fake]
+        shell.environment = ProcessInfo.processInfo.environment.filter { $0.key != "SPLASH_APP_PID" }
+        let output = Pipe()
+        shell.standardOutput = output
+        try shell.run()
+        let pid = try #require(pid_t(String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)))
+        shell.waitUntilExit()
+        defer { kill(pid, SIGKILL) }
+        try await waitFor(kill(pid, 0) != 0, "the fake to end with its shell", seconds: 5)
+    }
+
     /// What model files on this Mac start with besides is kept as it is set, joins the settings
     /// their start uses, and goes with them off the list.
     @Test func keepsWhatModelFilesStartWith() throws {
