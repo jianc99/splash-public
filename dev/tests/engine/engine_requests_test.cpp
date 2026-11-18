@@ -1157,6 +1157,40 @@ void testASecondConversationResumesAtASharedHead() {
   }
 }
 
+// A conversation that renders its replies back, three turns with an SSD tier: a reclaim of every state not in use
+// drops the points two turns behind and writes the last turn's prompt-end, the point behind the newest
+// (StateCache::kKeptBehind), so a regenerate of the last answer resumes there, from the SSD. Keeping the newest point
+// alone, the regenerate resumed at the reply before and read the last prompt's own text again.
+void testARegenerateAfterAReclaimResumesAtItsPromptEnd() {
+  test::EngineHarness h({.pages = 64, .tier = test::TierOptions{.capacity = 64, .transferLimit = 8}});
+  h.model.offloadTier = std::make_shared<OffloadControl>();
+  h.model.offloadTier->ready = true;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  std::vector<uint32_t> prompt(97);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  std::vector<uint32_t> last;
+  for (uint64_t turn = 1; turn <= 3; ++turn) {
+    engine.submit(conversationTurn(turn, prompt, 70));
+    tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+    last = prompt;
+    prompt = nextTurn(prompt, 70);
+  }
+  for (uint32_t step = 0; step < 8; ++step) {
+    reclaimUpToInUse(h.cache);
+    static_cast<void>(h.cache.pollTransfers());
+  }
+  require(!h.cache.snapshot().stateCache.bytes, "a state stayed in RAM past the reclaim");
+  h.model.restoreControl->ready = true;
+  engine.submit(conversationTurn(4, last, 1));
+  tickUntil(h, now, [&] { return idle(engine); }, "the regenerate did not complete");
+  const uint32_t replay = static_cast<uint32_t>(last.size() - 7) / KvCache::pageTokens * KvCache::pageTokens;
+  require(events.starts.back() == replay, "the regenerate after the reclaim resumed from " +
+                                              std::to_string(events.starts.back()) + ", not " + std::to_string(replay));
+}
+
 // A finished request's KV holds part of the budget, so a later request's KV
 // meets the wall as it grows, where each wall test's budget puts it; captured
 // states are OffloadStates from then on, which reclaim may write to the SSD
@@ -2662,6 +2696,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testRunningReplyCheckpointIsDropped", testRunningReplyCheckpointIsDropped},
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
       {"testAReclaimWritesNoSupersededPoint", testAReclaimWritesNoSupersededPoint},
+      {"testARegenerateAfterAReclaimResumesAtItsPromptEnd", testARegenerateAfterAReclaimResumesAtItsPromptEnd},
       {"testATurnsKeptPointsAreCopiedTheDelayAfterItEnds", testATurnsKeptPointsAreCopiedTheDelayAfterItEnds},
       {"testFourConversationsKeepEachOthersPoints", testFourConversationsKeepEachOthersPoints},
       {"testASecondConversationResumesAtASharedHead", testASecondConversationResumesAtASharedHead},
