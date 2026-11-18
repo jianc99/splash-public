@@ -44,7 +44,7 @@ SafetensorsTargetLoader::SafetensorsTargetLoader(metal::MetalBackend &backend, W
   planned_->images =
       safetensors::planImages(planned_->checkpoint, geometry, architecture,
                               {.streamExperts = experts.memoryBytes != 0, .streamTable = table_.cacheBytes != 0});
-  float32Norms_ = safetensors::float32Norms(safetensors::moduleNames(planned_->checkpoint), architecture);
+  float32Norms_ = safetensors::float32Norms(planned_->checkpoint, geometry, architecture);
 }
 
 StreamedBlocks SafetensorsTargetLoader::streamedExperts() const {

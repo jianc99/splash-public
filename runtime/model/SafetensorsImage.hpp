@@ -53,13 +53,34 @@ enum class ModuleNames : uint8_t { Mlx, MlxLm, Transformers };
 // and the like), for what a family reads beside its images.
 [[nodiscard]] std::string layerPrefix(ModuleNames names, uint32_t layer);
 
-// Whether the images hold the norms as F32 rather than bf16 as stored, by
-// the names and the family whose GGUFs are of `architecture`: a checkpoint's whose RMSNorm weights are
-// stored 1 below the weights the norm multiplies by as their F32 1 + w, but
-// the GDN's gated norm's widened (transformers' checkpoints of the Qwen3.5
-// hybrid), and Flint's widened, as its GGUF's are; an MLX hybrid's, which
-// mlx-lm stores shifted to the multipliers, as stored.
-[[nodiscard]] bool float32Norms(ModuleNames names, std::string_view architecture);
+// Whether the kernels of the family whose GGUFs are of `architecture` read
+// its norms in F32 alone (Qwen3.8-Flash-Next's and Flint's), so that its
+// images widen norms stored bf16.
+[[nodiscard]] bool widensNorms(std::string_view architecture);
+
+// Whether a checkpoint stores its RMSNorm weights 1 below the multipliers the
+// norms multiply by, as transformers does (Qwen3.5 and later), rather than
+// the multipliers. No metadata of an MLX checkpoint records it and no naming
+// decides it: mlx-vlm keeps Qwen3.8-Flash-Next's 1 below, but stores the
+// Qwen3.5 hybrids' as the multipliers, and conversions of either kind exist
+// under every naming. So a transformers checkpoint's are below by definition
+// and an MLX checkpoint's tell by their attention q and k norms, the
+// multipliers of a family's every full-attention layer: their mean is under
+// 0.95 stored below and over it stored as multipliers. Measured (48 GB and
+// 64 GB M5 Pro): 0.454 for mlx-community/Qwen3.8-Flash-Next-4bit;
+// 1.454 for its OptiQ-2bit, 1.491 Qwen3.8-27B-4bit, 1.490
+// Qwen3.6-35B-A3B-4bit and 1.707 flint-mixed-3-4bit. A mean within 0.2 of
+// 0.95 is refused, naming it: either reading would load such a checkpoint to
+// noise without an error.
+[[nodiscard]] bool storesNormsBelowMultipliers(const SafetensorsCheckpoint &checkpoint,
+                                               const QwenTargetDimensions &geometry);
+
+// Whether the images hold the norms as F32 rather than bf16 as stored: those
+// stored below their multipliers as the F32 1 + w, but the GDN's gated
+// norm's widened; else those of a family that widens its norms
+// (widensNorms) widened, any other's as stored.
+[[nodiscard]] bool float32Norms(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry,
+                                std::string_view architecture);
 
 // The layers' images, then the head's and the embedding's, of a target of
 // `geometry`, its norms as float32Norms holds them for `architecture` (its

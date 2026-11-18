@@ -1,5 +1,7 @@
 #include "model/SafetensorsImage.hpp"
 
+#include "model/Bfloat16.hpp"
+
 #include "metal/abi/QuantFormat.h"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
@@ -522,23 +524,6 @@ template <class Walk> void layer(Walk &b, const QwenTargetDimensions &g, const s
   b.floatVector(ple + "conv1d.weight", {streams, g.pleConvolutionTaps, 1});
 }
 
-// How the norms load. MLX stores them as the multipliers they are (mlx-lm's
-// conversion adds the 1), held bf16; transformers 1 below them, held as the
-// F32 1 + w. Flint's plain RMS norms (those of mlx-community/flint-mixed-3-4bit
-// equal unsloth's GGUF's, its sinks the GGUF's sinks, on the 64 GB M5 Pro)
-// widen to the F32 its GGUF's images hold, as Flint's kernel shapes are
-// compiled for F32 norms alone (dev/tests/engine/TestFamilies.hpp
-// normsOfFamilies). mlx-vlm keeps Qwen3.8-Flash-Next's RMSNorm weights as
-// transformers stores them, 1 below the multiplier, but the GDN's gated norm's:
-// the hyper, PLE, q and indexer norms of mlx-community/Qwen3.8-Flash-Next-4bit
-// are those of ISTA-DASLab's Q2_0 GGUF less 1 exactly, its gated norms and
-// convolution equal (the 48 GB M5 Pro); its images hold them as the GGUF's do, F32.
-Conversion normConversion(ModuleNames names, std::string_view architecture) {
-  if (architecture == "flint") return Conversion::WidenToFloat32;
-  if (architecture == "qwen4exp") return Conversion::CenteredNorm;
-  return names == ModuleNames::Transformers ? Conversion::CenteredNorm : Conversion::None;
-}
-
 // Walks every image, each through the walker `make(name, layer, type)` makes,
 // which `done` takes once walked: the layers', the head's (before its
 // projection a norm, or the final hyper-connection mix), the embedding's and,
@@ -583,14 +568,62 @@ std::string layerPrefix(ModuleNames names, uint32_t layer) {
   return modelPrefix(names) + "layers." + std::to_string(layer) + ".";
 }
 
-bool float32Norms(ModuleNames names, std::string_view architecture) {
-  return normConversion(names, architecture) != Conversion::None;
+bool widensNorms(std::string_view architecture) { return architecture == "flint" || architecture == "qwen4exp"; }
+
+bool storesNormsBelowMultipliers(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry) {
+  const ModuleNames names = moduleNames(checkpoint);
+  if (names == ModuleNames::Transformers) return true;
+  constexpr double kHalfway = 0.95, kAmbiguous = 0.2;
+  double sum = 0.0;
+  uint64_t count = 0;
+  for (uint32_t layer = 0; layer < geometry.layers; ++layer) {
+    if (!geometry.isFullAttentionLayer(layer)) continue;
+    for (const char *norm : {"self_attn.q_norm.weight", "self_attn.k_norm.weight"}) {
+      const std::string name = layerPrefix(names, layer) + norm;
+      const SourceTensor *tensor = checkpoint.find(name);
+      if (!tensor || tensor->dtype != "BF16" || tensor->bytes != uint64_t{geometry.attentionHeadDimension} * 2)
+        throw WeightStoreError("source tensor type or shape does not match: " + name);
+      std::vector<uint16_t> values(geometry.attentionHeadDimension);
+      tensor->read(0, {reinterpret_cast<uint8_t *>(values.data()), values.size() * sizeof(uint16_t)});
+      for (const uint16_t value : values) sum += widenBfloat16(value);
+      count += values.size();
+    }
+  }
+  if (!count) throw WeightStoreError("the checkpoint holds no attention q or k norm to tell its norms' storage by");
+  const double mean = sum / double(count);
+  if (std::abs(mean - kHalfway) < kAmbiguous)
+    throw WeightStoreError("the checkpoint's attention q and k norm weights average " + std::to_string(mean) +
+                           ", between the " + std::to_string(kHalfway - kAmbiguous) +
+                           " a conversion that stores RMSNorm weights 1 below their multipliers stays under and the " +
+                           std::to_string(kHalfway + kAmbiguous) +
+                           " one that stores the multipliers stays over, so how its norms are stored cannot be told; "
+                           "convert the model again from its original weights");
+  return mean < kHalfway;
+}
+
+namespace {
+
+// How a checkpoint's norms load: stored 1 below their multipliers
+// (storesNormsBelowMultipliers) as the F32 1 + w; else as the multipliers
+// stored, widened to F32 for a family whose kernels read F32 norms alone
+// (widensNorms).
+Conversion normConversion(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry,
+                          std::string_view architecture) {
+  if (storesNormsBelowMultipliers(checkpoint, geometry)) return Conversion::CenteredNorm;
+  return widensNorms(architecture) ? Conversion::WidenToFloat32 : Conversion::None;
+}
+
+} // namespace
+
+bool float32Norms(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry,
+                  std::string_view architecture) {
+  return normConversion(checkpoint, geometry, architecture) != Conversion::None;
 }
 
 std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry,
                                    std::string_view architecture, gguf::PlanOptions options) {
   const ModuleNames names = moduleNames(checkpoint);
-  const Conversion norms = normConversion(names, architecture);
+  const Conversion norms = normConversion(checkpoint, geometry, architecture);
   std::vector<gguf::Image> images;
   walkImages(
       geometry, names, options.streamTable,

@@ -887,6 +887,25 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
             "language_model.model.layers.0.linear_attn.conv1d.weight",
             "a raw checkpoint's convolution was accepted");
 
+    // The same checkpoint with its attention q and k norms at `value`: stored 1
+    // below their multipliers (0), it loads its norms as their F32 1 + w; at
+    // 0.95, between the two conventions, it is refused naming the mean.
+    const auto qkNorms = [&](uint16_t value) {
+        std::vector<splash::test::SyntheticTensor> tensors = splash::test::mlxTargetTensors(target, bitsAndGroup);
+        for (splash::test::SyntheticTensor &tensor : tensors)
+            if (tensor.name.ends_with("q_norm.weight") || tensor.name.ends_with("k_norm.weight"))
+                for (uint64_t at = 0; at < tensor.data.size(); at += 2)
+                    tensor.data[at] = value & 0xFF, tensor.data[at + 1] = value >> 8;
+        splash::test::writeSyntheticShard(root / "target" / "model.safetensors", tensors);
+    };
+    qkNorms(0x0000);
+    require(std::get<Qwen3_8Weights>(loadModel(backend, root, descriptor).target).layers[0].inputNorm.float32,
+            "an MLX block target whose norms are stored 1 below their multipliers did not load them as 1 + w");
+    qkNorms(0x3F73); // 0.94921875
+    rejects([&] { static_cast<void>(loadModel(backend, root, descriptor)); },
+            "the checkpoint's attention q and k norm weights average 0.949219",
+            "an MLX checkpoint whose q and k norms tell no convention was accepted");
+
     // An unquantized module: its weight in bf16, without scales and biases.
     const auto unquantized = [&](const std::string &module) {
         std::vector<splash::test::SyntheticTensor> tensors;
