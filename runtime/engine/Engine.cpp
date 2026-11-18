@@ -854,8 +854,8 @@ bool Engine::admitQueued(double now) {
 }
 
 uint32_t Engine::replayStateBoundary(const Request &active) noexcept {
-  // A later request may not share the generation prompt; generated history
-  // that a resumed lane replays is its own: the state there is a checkpoint.
+  // A later request shares the prompt up to its last text only; generated
+  // history that a resumed lane replays is its own: the state there is a checkpoint.
   if (active.replayTokens == active.promptTokens)
     return promptReplayBoundary(active);
   return (active.replayTokens - 1) / KvCache::pageTokens * KvCache::pageTokens;

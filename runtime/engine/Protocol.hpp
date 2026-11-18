@@ -176,8 +176,8 @@ struct RequestFrame {
   // 2..255 distinct token ids, logicalMaxOutputTokens must be zero, and the
   // request must be text-only, unconstrained, and greedy.
   std::vector<uint32_t> scoreTokens{};
-  // Trailing prompt tokens of the chat template's generation prompt; zero
-  // when unknown. It must leave at least one prompt token.
+  // Trailing prompt tokens after the last message's text (its end of turn and
+  // the generation prompt); zero when unknown. It must leave a prompt token.
   uint32_t generationPromptTokens = 0;
   // Where the prompt's first message (a system prompt and tools) ends; zero
   // without one. It must leave at least one prompt token.

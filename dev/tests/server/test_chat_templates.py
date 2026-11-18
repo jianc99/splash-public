@@ -12,7 +12,7 @@ from transformers import PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
 from server import chat_messages, chat_templates
-from server.chat_format import QWEN, REASONING_EFFORTS
+from server.chat_format import FLINT, QWEN, REASONING_EFFORTS
 from server.chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     NATIVE,
@@ -613,7 +613,13 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         )
         self.assertEqual(harness.tokenizer.renderer.chat_template, source("qwen36"))
 
-    def test_requests_carry_the_length_of_their_generation_prompt(self):
+    def test_requests_carry_the_tokens_after_their_last_text(self):
+        """A request carries how many of its prompt's last tokens come after
+        its last message's text: the generation prompt and, on Qwen's
+        templates, that message's end of turn before it, `<|im_end|>` and its
+        line break. Every continuation shares the prompt up to there: more of
+        the same message, a regenerate, a next turn. Flint's generation
+        prompt, its assistant role token, follows the text directly."""
         messages = [
             {"role": "user", "content": "Hi"},
             {"role": "assistant", "content": "Hello"},
@@ -631,7 +637,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             },
         ]
 
-        def frontend(name, *special):
+        def frontend(name, *special, chat_format=QWEN):
             return fixtures.make_frontend(
                 chat_tokenizer(source(name), *special),
                 None,
@@ -639,17 +645,29 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 4096,
                 10,
                 2,
-                vision=True,
+                vision=chat_format is QWEN,
+                chat_format=chat_format,
             )
+
+        def text_ids(app, body, cut):
+            """The prompt's tokens through its last message's text: the
+            history the template renders without a generation prompt, less
+            what follows `cut`'s last place in it."""
+            history = app.apply_template(
+                {**body, "add_generation_prompt": False}, deadline=fixtures.FOREVER
+            )
+            if cut:
+                history = history[: history.rindex(cut)]
+            return app.tokenizer(history, add_special_tokens=False)["input_ids"]
 
         for name in ("qwen36_gguf", "qwen38_gguf"):
             app = frontend(name, "<|im_start|>", "<|im_end|>", QWEN.image_pad)
             self.assertTrue(
                 app.chat_templates.describe().endswith("generation prompt 5-7 tokens")
             )
-            # <|im_start|> assistant \n <think> \n\n </think> \n\n; with
-            # thinking, the first four and \n.
-            for effort, expected in (("none", 7), ("high", 5)):
+            # <|im_end|> \n, then <|im_start|> assistant \n <think> \n\n
+            # </think> \n\n; with thinking, the first four and \n.
+            for effort, expected in (("none", 9), ("high", 7)):
                 with self.subTest(name=name, effort=effort):
                     body = {
                         "model": "test-model",
@@ -658,13 +676,8 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                     }
                     job = app.prepare(body, deadline=fixtures.FOREVER)
                     self.assertEqual(job.generation_prompt_tokens, expected)
-                    history = app.apply_template(
-                        {**body, "add_generation_prompt": False},
-                        deadline=fixtures.FOREVER,
-                    )
                     self.assertEqual(
-                        job.prompt_tokens[:-expected],
-                        app.tokenizer(history, add_special_tokens=False)["input_ids"],
+                        job.prompt_tokens[:-expected], text_ids(app, body, "<|im_end|>")
                     )
                     # Images precede it, so expanding them keeps its length.
                     image_job = app.prepare(
@@ -680,14 +693,24 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         app = frontend("qwen36_gguf", "<|im_end|>")
         body = {"model": "test-model", "messages": messages}
         job = app.prepare(body, deadline=fixtures.FOREVER)
-        history = app.apply_template(
-            {**body, "add_generation_prompt": False}, deadline=fixtures.FOREVER
-        )
-        self.assertGreater(job.generation_prompt_tokens, 0)
+        self.assertGreater(job.generation_prompt_tokens, 2)
         self.assertEqual(
             job.prompt_tokens[: -job.generation_prompt_tokens],
-            app.tokenizer(history, add_special_tokens=False)["input_ids"],
+            text_ids(app, body, "<|im_end|>"),
         )
+        # Flint: the role token alone, its message boundary too.
+        app = frontend(
+            "flint",
+            "<|user|>",
+            "<|assistant|>",
+            "<|system|>",
+            "<|observation|>",
+            chat_format=FLINT,
+        )
+        body = {"model": "test-model", "messages": messages}
+        job = app.prepare(body, deadline=fixtures.FOREVER)
+        self.assertEqual(job.generation_prompt_tokens, 1)
+        self.assertEqual(job.prompt_tokens[:-1], text_ids(app, body, None))
 
     def test_requests_carry_the_end_of_their_head(self):
         """A prompt that opens with a system prompt or with tools, which the
@@ -939,8 +962,10 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                     deadline=fixtures.FOREVER,
                 )
                 # Ending in the reply, the conversation is what the cache
-                # holds: its prompt without a next generation prompt.
-                end = len(job.prompt_tokens) - job.generation_prompt_tokens
+                # holds: its prompt without a next generation prompt, whose
+                # count takes the reply's end of turn too (<|im_end|> and its
+                # line break).
+                end = len(job.prompt_tokens) - job.generation_prompt_tokens + 2
                 return job.prompt_tokens[:end] if reply else job.prompt_tokens
 
             # The third reply as the model writes it after the prompt's <think>.
@@ -1038,10 +1063,11 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         qwen = source("qwen36_gguf")
         off, on = {"enable_thinking": False}, {"enable_thinking": True}
         for options, extra, kwargs, thinking, tokens in (
-            ({}, {}, off, False, 7),
-            ({"default_reasoning_effort": "high"}, {}, off, False, 7),
-            ({}, {"reasoning_effort": "high"}, off, False, 7),
-            ({}, {"reasoning_effort": "none"}, on, True, 5),
+            # The generation prompt and the message's end of turn before it.
+            ({}, {}, off, False, 9),
+            ({"default_reasoning_effort": "high"}, {}, off, False, 9),
+            ({}, {"reasoning_effort": "high"}, off, False, 9),
+            ({}, {"reasoning_effort": "none"}, on, True, 7),
         ):
             with self.subTest(options=options, extra=extra, kwargs=kwargs):
                 job = chat_frontend(qwen, **options).prepare(

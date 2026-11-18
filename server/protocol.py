@@ -297,8 +297,9 @@ class RequestFrame:
     # generation. Score tokens serialize after the image pixel bytes, and a
     # thinking budget's end tokens after them.
     score_tokens: tuple[int, ...]
-    # Trailing prompt tokens of the chat template's generation prompt; zero
-    # when unknown. It must leave at least one prompt token.
+    # Trailing prompt tokens after the last message's text (its end of turn
+    # and the generation prompt); zero when unknown. It must leave at least
+    # one prompt token.
     generation_prompt_tokens: int
     flags: RequestFlag
     # The request's cache_salt hashed to 128 bits (request_fields.cache_salt);
