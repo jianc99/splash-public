@@ -13,7 +13,13 @@
 // those FIXTURE_DIR/embedding_digests.txt pins, a line `GRID SHA-256` each,
 // where it pins them: a change that keeps the tower's arithmetic keeps its
 // bits. A family's vision weights, GGUF or MLX, are its upstream bf16 values,
-// so one family's pins hold for each.
+// so one family's pins hold for each. Under MTL_SHADER_VALIDATION the shaders
+// compile to other bits, so a validated run prints the digests and says it
+// compares none; the fp32 parity holds either way (test-real runs both). The
+// pins were taken and confirmed without validation on Apple10 GPUs of 16, 20
+// and 32 cores and on Apple11; Apple9 was not run, no Mac of that family here
+// holding vision weights: if a run there prints other digests, the pins need
+// the GPU family beside them.
 
 #include "LinearNumerics.hpp"
 #include "TestChecks.hpp"
@@ -30,6 +36,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -153,6 +160,32 @@ std::map<std::string, std::string> pinnedDigests(const std::string &fixture) {
   return pinned;
 }
 
+// Whether Metal's shader validation is on, which compiles the tower's shaders
+// to other bits: under it the embeddings of a 32-core M5 Max and of a 16-core
+// M5 Pro differ from the pins in every digest, and without it they match.
+bool shaderValidation() {
+  const char *value = std::getenv("MTL_SHADER_VALIDATION");
+  return value && *value && std::strcmp(value, "0") != 0;
+}
+
+// Whether every grid's digest equals its pin, where the fixture pins them;
+// under shader validation none is compared.
+bool digestsMatch(const std::map<std::string, std::string> &digests,
+                  const std::map<std::string, std::string> &pinned, bool validation) {
+  return pinned.empty() || validation || std::ranges::all_of(digests, [&](const auto &entry) {
+           const auto found = pinned.find(entry.first);
+           return found != pinned.end() && found->second == entry.second;
+         });
+}
+
+void verifyDigestComparison() {
+  const std::map<std::string, std::string> pinned{{"6x8", "a"}}, other{{"6x8", "b"}};
+  if (!digestsMatch(pinned, pinned, false) || digestsMatch(other, pinned, false))
+    throw std::runtime_error("the digest comparison does not compare");
+  if (!digestsMatch(other, pinned, true))
+    throw std::runtime_error("the digest comparison compared under shader validation");
+}
+
 std::vector<uint8_t> syntheticPixels(ImageGrid grid) {
   const uint32_t height = grid.height * 16, width = grid.width * 16;
   std::vector<uint8_t> pixels(uint64_t{height} * width * 3);
@@ -177,6 +210,7 @@ int main(int argc, char **argv) {
   @autoreleasepool {
     try {
       verifyComparison();
+      verifyDigestComparison();
       const auto descriptor = splash::model::inspectModelRoot(argv[2]);
       if (descriptor.visionSource == splash::model::VisionSource::None)
         throw std::runtime_error("the model has no vision role");
@@ -235,13 +269,18 @@ int main(int argc, char **argv) {
       // about its whole norm.
       bool pass = parity.relativeError < 0.03 && parity.worstRowError < 0.15;
       const std::map<std::string, std::string> pinned = pinnedDigests(fixture);
+      const bool validation = shaderValidation();
+      if (validation && !pinned.empty())
+        std::printf("embedding digests: not compared with the pins under MTL_SHADER_VALIDATION\n");
       for (const auto &[name, digest] : digests) {
         const auto found = pinned.find(name);
-        const bool matches = found != pinned.end() && found->second == digest;
         std::printf("embedding digest %s %s%s\n", name.c_str(), digest.c_str(),
-                    pinned.empty() ? " (none pinned)" : matches ? " (pinned)" : " (DIFFERS from the pinned)");
-        if (!pinned.empty() && !matches) pass = false;
+                    pinned.empty()                                     ? " (none pinned)"
+                    : validation                                       ? ""
+                    : found != pinned.end() && found->second == digest ? " (pinned)"
+                                                                       : " (DIFFERS from the pinned)");
       }
+      if (!digestsMatch(digests, pinned, validation)) pass = false;
 
       const std::vector<float> second =
           encodeOnce(backend, encoder, grid, pixels,
