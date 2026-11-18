@@ -2295,6 +2295,369 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   std::cout << "decode_capture=PASS\n";
 }
 
+// `length` tokens of `chat`, repeated as far as they need.
+std::vector<uint32_t> repeatedChat(std::span<const uint32_t> chat, uint32_t length) {
+  std::vector<uint32_t> tokens(length);
+  for (uint32_t index = 0; index < length; ++index)
+    tokens[index] = chat[index % chat.size()];
+  return tokens;
+}
+
+// A request's first decode cycle (from a prompt prefilled in one chunk on
+// lane 0): the rows it retained, its output, whether it ended the request and
+// the state it captured at a page when given one. `limit` is its output
+// limit; `ignoreEnd` lets it pass the target's stop tokens. The caller ends
+// the request.
+struct FirstCycle final {
+  uint32_t retained = 0;
+  std::vector<uint32_t> output;
+  bool finished = false;
+  std::vector<std::shared_ptr<const CompositeState>> captured;
+};
+
+FirstCycle runFirstCycle(model::Runtime &executor, const model::QwenStateStorage &states, uint64_t id,
+                         std::span<const uint32_t> tokens, uint32_t limit, bool ignoreEnd,
+                         std::optional<uint32_t> boundary, const std::vector<uint32_t> &pages) {
+  const auto length = static_cast<uint32_t>(tokens.size());
+  EngineRequest request = makeRequest(id, {tokens.begin(), tokens.end()}, limit);
+  if (ignoreEnd)
+    request.flags = RequestIgnoreEndOfSequence;
+  beginCold(executor, request, 0);
+  executor.setDraftContextPlan(id, planDraftContext(0, length, {}));
+  const ModelStepResult prefilled = prefillChunk(executor, id, 0, tokens, pages);
+  require(prefilled.failure.empty() && prefilled.outputTokens.empty(),
+          "a first cycle's prompt ended right after prefill");
+  const BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}}, .decodeStage = DecodeStage::Regular};
+  ModelBatchItem item = withRevision({id, length, 0, pages});
+  if (boundary) {
+    metal::AllocationFailure refusal;
+    item.stateCaptures.push_back({*boundary, executor.reserveState(id, *boundary, refusal)});
+    require(item.stateCaptures.back().reservation != nullptr, "the buffers of a decode capture were refused");
+  }
+  std::vector<ModelStepResult> results = executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
+  require(results.size() == 1 && results[0].failure.empty(), "a first cycle failed");
+  return {static_cast<uint32_t>(states.metadata(0).lengths.targetTokens - length),
+          std::move(results[0].outputTokens), results[0].finished, std::move(results[0].capturedStates)};
+}
+
+// A prompt of 88 to 126 tokens whose first cycle, a draft's block of rows,
+// retains a path that crosses the next page with at least two rows before it:
+// the prompt's length and its page. The caller forces the cycles' rows.
+std::pair<uint32_t, uint32_t> promptCrossingAPage(model::Runtime &executor, const model::QwenStateStorage &states,
+                                                  std::span<const uint32_t> chat, uint64_t firstId,
+                                                  const std::vector<uint32_t> &pages) {
+  for (const uint32_t page : {96U, 128U})
+    for (uint32_t length = page - 2; length + 8 >= page; --length) {
+      const FirstCycle cycle =
+          runFirstCycle(executor, states, firstId + length, repeatedChat(chat, length), 64, true, std::nullopt, pages);
+      executor.end(firstId + length);
+      if (length + cycle.retained > page)
+        return {length, page};
+    }
+  return {0, 0};
+}
+
+// A decode capture at a page strictly inside the path its cycle retained
+// holds the bytes a capture at that page holds where the cycle retained
+// exactly the rows before it (its codes, or with --cached-states exact the
+// running format): the fold takes the path's first rows, whatever the path
+// holds past them. That cycle is the same prompt's under an output limit
+// that leaves it no more rows; requireDecodeCaptureMatchesTheLane holds such
+// a capture to the lane's own state at its page.
+void requireCaptureInsideItsPathMatchesExactRows(model::Runtime &executor, model::QwenStateStorage &states,
+                                                 std::span<const uint32_t> chat) {
+  if (!executor.capturesInDecode()) {
+    std::cout << "decode_capture_inside_path=SKIP (the target writes auxiliary state with its retained rows)\n";
+    return;
+  }
+  const std::vector<uint32_t> pages = pageRange(100, 5);
+  model::RuntimeInstrumentation::forceStepRows(executor, model::ExecutionLimits::draftQueryRows);
+  const auto [length, page] = promptCrossingAPage(executor, states, chat, 2400, pages);
+  require(length != 0, "no prompt of 88 to 126 tokens had a first cycle that crossed a page");
+  const std::vector<uint32_t> tokens = repeatedChat(chat, length);
+  const FirstCycle crossing = runFirstCycle(executor, states, 2500, tokens, 64, true, page, pages);
+  executor.end(2500);
+  require(length + crossing.retained > page && crossing.captured.size() == 1,
+          "the cycle that crossed its page did so no longer, or sealed no capture");
+  // The output limit counts the first token prefill selected.
+  FirstCycle exact;
+  for (const uint32_t limit : {page - length + 1, page - length}) {
+    exact = runFirstCycle(executor, states, 2501, tokens, limit, true, page, pages);
+    executor.end(2501);
+    if (length + exact.retained == page)
+      break;
+  }
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  require(length + exact.retained == page && exact.captured.size() == 1,
+          "no output limit left the cycle exactly the rows before its page");
+  require(std::ranges::equal(std::span(crossing.output).first(exact.retained),
+                             std::span(exact.output).first(exact.retained)),
+          "the limited cycle kept another path than the one that crossed its page");
+  std::vector<uint32_t> probe = tokens;
+  probe.insert(probe.end(), crossing.output.begin(), crossing.output.begin() + (page - length));
+  probe.push_back(chat[page % chat.size()]);
+  const StateBytes inside = restoredBytes(executor, states, 2502, 2, probe, page, crossing.captured.front());
+  const StateBytes atEnd = restoredBytes(executor, states, 2503, 2, probe, page, exact.captured.front());
+  const auto differing = [](const std::vector<uint8_t> &left, const std::vector<uint8_t> &right) {
+    require(left.size() == right.size(), "two captures' restores differ in size");
+    uint64_t count = 0;
+    for (size_t index = 0; index < left.size(); ++index)
+      count += left[index] != right[index];
+    return count;
+  };
+  const uint64_t cell = differing(inside.cell, atEnd.cell), window = differing(inside.window, atEnd.window);
+  std::cout << "decode_capture_inside_path prompt=" << length << " page=" << page << " rows=" << page - length
+            << " retained=" << crossing.retained << " cell_bytes_differing=" << cell
+            << " window_bytes_differing=" << window << '\n';
+  require(cell == 0 && window == 0,
+          "a capture inside its cycle's path differs from one whose cycle retained exactly the rows before its page");
+  std::cout << "decode_capture_inside_path=PASS\n";
+}
+
+// The recurrent state a restore leaves a lane, its GDN cell's recurrent
+// layers, as floats.
+std::vector<float> recurrentValues(const model::GdnStateLayout &layout, const std::vector<uint8_t> &cell) {
+  const bool bfloat = layout.format == ops::GdnStateFormat::BFloat16;
+  const uint64_t count = uint64_t{layout.layers} * layout.recurrentGroups * layout.recurrentRows *
+                         layout.recurrentColumns;
+  std::vector<float> values;
+  values.reserve(count);
+  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
+    const uint8_t *at = cell.data() + layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes();
+    const uint64_t each = uint64_t{layout.recurrentGroups} * layout.recurrentRows * layout.recurrentColumns;
+    for (uint64_t index = 0; index < each; ++index) {
+      if (bfloat) {
+        uint16_t narrow = 0;
+        std::memcpy(&narrow, at + index * 2, 2);
+        values.push_back(test::bf16ToFloat(narrow));
+      } else {
+        float wide = 0.0F;
+        std::memcpy(&wide, at + index * 4, 4);
+        values.push_back(wide);
+      }
+    }
+  }
+  return values;
+}
+
+double cosineOf(std::span<const float> left, std::span<const float> right) {
+  SimilarityAccumulator accumulator;
+  for (size_t index = 0; index < left.size(); ++index)
+    accumulator.add(left[index], right[index]);
+  return accumulator.result().cosine;
+}
+
+// A stop token inside a cycle's accepted block ends its path there: the
+// state the cycle captures at a page is sealed where the path reached the
+// page before the stop, and holds what the same cycle without the stop
+// captured, byte for byte; a stop before the page leaves the page
+// uncaptured. A cached state that took a token past a stop would serve a
+// later prompt a state its tokens do not hold (SGLang #47392). Beside it,
+// the sealed state is the state of its page's tokens, not of one token fewer:
+// nearer a prefill to the page than a prefill to the token before it
+// (vLLM #67045). The stops are each a token the cycle selects, at the
+// stop's place in its path, set as the target's only stop token in a runtime
+// of its own.
+void requireStopInsideABlockEndsItsCapture(model::RuntimeContext context, model::LoadedModel &model,
+                                           std::span<const uint32_t> chat) {
+  model::QwenStateStorage &states = context.stateStorage;
+  const std::vector<uint32_t> pages = pageRange(100, 5), prefillPages = pageRange(105, 5);
+  uint32_t length = 0, page = 0;
+  FirstCycle plain;
+  std::vector<uint32_t> tokens;
+  StateBytes plainBytes;
+  std::vector<uint32_t> probe;
+  {
+    model::Runtime executor(context);
+    if (!executor.capturesInDecode()) {
+      std::cout << "stop_inside_block=SKIP (the target writes auxiliary state with its retained rows)\n";
+      return;
+    }
+    model::RuntimeInstrumentation::forceStepRows(executor, model::ExecutionLimits::draftQueryRows);
+    std::tie(length, page) = promptCrossingAPage(executor, states, chat, 2600, pages);
+    require(length != 0, "no prompt of 88 to 126 tokens had a first cycle that crossed a page");
+    tokens = repeatedChat(chat, length);
+    plain = runFirstCycle(executor, states, 2700, tokens, 64, true, page, pages);
+    executor.end(2700);
+    require(plain.captured.size() == 1 && length + plain.retained > page, "the plain cycle sealed no capture");
+    probe = tokens;
+    probe.insert(probe.end(), plain.output.begin(), plain.output.begin() + (page - length));
+    probe.push_back(chat[page % chat.size()]);
+    plainBytes = restoredBytes(executor, states, 2701, 2, probe, page, plain.captured.front());
+  }
+  // The first index of the path at or past `from` and before `to` whose
+  // token the path did not select before it.
+  const auto firstFresh = [&](uint32_t from, uint32_t to) -> std::optional<uint32_t> {
+    for (uint32_t index = std::max(from, 1U); index < to; ++index)
+      if (std::find(plain.output.begin(), plain.output.begin() + index, plain.output[index]) ==
+          plain.output.begin() + index)
+        return index;
+    return std::nullopt;
+  };
+  const std::optional<uint32_t> past = firstFresh(page - length, plain.retained);
+  const std::optional<uint32_t> before = firstFresh(1, page - length);
+  const auto originalTarget = model.descriptor.target;
+  const auto setStops = [&](std::optional<uint32_t> stop) {
+    std::visit([&](auto &weights) {
+      using Layout = std::decay_t<decltype(weights.layout)>;
+      weights.layout = std::get<Layout>(originalTarget);
+      if (stop)
+        weights.layout.stopTokens = {*stop};
+      model.descriptor.target = weights.layout;
+    }, model.target);
+  };
+  // The cycle with the stop at `index` of its path: what it retained, ended
+  // and sealed.
+  const auto stopAt = [&](uint32_t index, uint64_t id) {
+    setStops(plain.output[index]);
+    model::Runtime executor(context);
+    model::RuntimeInstrumentation::forceStepRows(executor, model::ExecutionLimits::draftQueryRows);
+    FirstCycle stopped = runFirstCycle(executor, states, id, tokens, 64, false, page, pages);
+    executor.end(id);
+    std::optional<StateBytes> bytes;
+    if (!stopped.captured.empty())
+      bytes = restoredBytes(executor, states, id + 1, 2, probe, page, stopped.captured.front());
+    setStops(std::nullopt);
+    return std::pair{std::move(stopped), std::move(bytes)};
+  };
+  std::string checked;
+  if (past) {
+    const auto [stopped, bytes] = stopAt(*past, 2710);
+    require(stopped.finished && stopped.retained == *past && bytes.has_value(),
+            "a stop past the page did not end the path there, or left the page uncaptured");
+    require(bytes->cell == plainBytes.cell && bytes->window == plainBytes.window,
+            "a stop past the page changed the state captured at it");
+    checked += " past=" + std::to_string(*past);
+  }
+  if (before) {
+    const auto [stopped, bytes] = stopAt(*before, 2720);
+    require(stopped.finished && stopped.retained == *before && !bytes.has_value(),
+            "a stop before the page did not end the path there, or a capture past the stop was sealed");
+    checked += " before=" + std::to_string(*before);
+  }
+  require(past || before, "the crossing cycle's path held no token to set as a stop");
+  // The sealed state against prefills to the page and to the token before it.
+  const model::GdnStateLayout layout = states.layout().target;
+  if (layout.layers) {
+    model::Runtime executor(context);
+    std::vector<uint32_t> through = tokens;
+    through.insert(through.end(), plain.output.begin(), plain.output.begin() + (page - length));
+    const auto prefilledTo = [&](uint64_t id, uint32_t end) {
+      EngineRequest request = makeRequest(id, std::vector<uint32_t>(through.begin(), through.begin() + end), 64);
+      request.flags = RequestIgnoreEndOfSequence;
+      beginCold(executor, request, 1);
+      executor.setDraftContextPlan(id, planDraftContext(0, end, {}));
+      requireOpen(prefillChunk(executor, id, 0, std::span(through).first(end), prefillPages), "stop inside block");
+      const std::vector<uint8_t> cell = bytesOf(states.current(1).stateBase);
+      executor.end(id);
+      return recurrentValues(layout, cell);
+    };
+    const std::vector<float> captured = recurrentValues(layout, plainBytes.cell);
+    const double atPage = cosineOf(captured, prefilledTo(2730, page));
+    const double tokenBefore = cosineOf(captured, prefilledTo(2731, page - 1));
+    std::cout << "stop_inside_block prefill_page_cos=" << atPage << " prefill_token_before_cos=" << tokenBefore
+              << '\n';
+    require(atPage > tokenBefore,
+            "the state captured at a page is nearer the state of one token fewer than of its page's tokens");
+  }
+  std::cout << "stop_inside_block=PASS prompt=" << length << " page=" << page << checked << '\n';
+}
+
+// A prompt of 961 tokens prefilled cold, and again from the state its
+// prefill captured at 960, restored from RAM and read back from the disk
+// tier: the last row's logits. A state read back from the disk restores what
+// the RAM copy restores, logit for logit. With --cached-states exact a hit
+// is the cold prefill's arithmetic, which splits there too, logit for logit;
+// through the codes (the default) its next token is the cold one's and its
+// distribution within `kBound` of the cold one's (KL divergence of the hit's
+// softmax from the cold one's). The bound is the p99 KL of the release
+// logits check's noise floor on Qwen3.8-27B GGUF (1.2e-3); measured on an M5
+// Max, the codes' hit left 3.2e-5 on Qwen3.8-27B MLX and 1.8e-6 on
+// Qwen3.6-35B-A3B GGUF, and a restore that left the lane's GDN state
+// unrestored 0.14 and 0.15.
+void requireCacheHitMatchesCold(model::Runtime &executor, std::span<const uint32_t> chat, uint32_t vocabulary,
+                                bool exact) {
+  // One token past the state, so that the next token's distribution rests on the state rather than on rows
+  // prefilled after it.
+  constexpr uint32_t kLength = 961, kBoundary = 960;
+  constexpr double kBound = 1.2e-3;
+  const std::vector<uint32_t> prompt = repeatedChat(chat, kLength);
+  const std::span<const uint32_t> tokens(prompt);
+  const std::vector<uint32_t> coldPages = pageRange(0, kLength / kv::kPageTokens + 1);
+  const auto hitPages = [&](uint32_t first) {
+    std::vector<uint32_t> result(coldPages.begin(), coldPages.begin() + kBoundary / kv::kPageTokens);
+    for (uint32_t page = 0; page < 2; ++page)
+      result.push_back(first + page);
+    return result;
+  };
+  const auto lastLogits = [&] {
+    const std::span<const float> logits = model::RuntimeInstrumentation::lastLogits(executor, 0);
+    require(logits.size() >= vocabulary, "the last row's logits are narrower than the vocabulary");
+    return std::vector<float>(logits.begin(), logits.begin() + vocabulary);
+  };
+  beginCold(executor, makeRequest(2800, prompt, 1), 0);
+  const std::array<uint32_t, 1> boundary{kBoundary};
+  executor.setDraftContextPlan(2800, planDraftContext(0, kLength, boundary));
+  ModelStepResult first = prefillChunk(executor, 2800, 0, tokens.first(kBoundary), coldPages, {}, boundary);
+  require(first.failure.empty() && first.capturedStates.size() == 1, "the cold prefill captured no state");
+  const std::shared_ptr<const CompositeState> state = first.capturedStates.front();
+  prefillChunk(executor, 2800, kBoundary, tokens.subspan(kBoundary), coldPages);
+  const std::vector<float> cold = lastLogits();
+  executor.end(2800);
+
+  beginCold(executor, makeRequest(2801, prompt, 1), 1);
+  restoreActivePrefix(executor, 2801, kLength, kBoundary, state);
+  prefillChunk(executor, 2801, kBoundary, tokens.subspan(kBoundary), hitPages(40));
+  const std::vector<float> fromRam = lastLogits();
+  executor.end(2801);
+
+  std::unique_ptr<StateOffload> write = state->offload({});
+  require(write != nullptr, "the disk tier admitted no state");
+  while (!write->ready())
+    std::this_thread::yield();
+  require(write->finish(), "a state's write to the disk tier failed");
+  const std::shared_ptr<const CompositeState> disk = write->state();
+  write.reset();
+  beginCold(executor, makeRequest(2802, prompt, 1), 2);
+  std::unique_ptr<StateRestore> read = executor.beginRestore(2802, kBoundary, disk, true, {});
+  require(read != nullptr, "a restore from the disk tier returned no read");
+  while (!read->ready())
+    std::this_thread::yield();
+  require(read->finish(), "a restore from the disk tier failed");
+  read.reset();
+  executor.setDraftContextPlan(2802, planDraftContext(kBoundary, kLength, {}));
+  prefillChunk(executor, 2802, kBoundary, tokens.subspan(kBoundary), hitPages(44));
+  const std::vector<float> fromDisk = lastLogits();
+  executor.end(2802);
+
+  const auto top = [](const std::vector<float> &logits) {
+    return static_cast<uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+  };
+  const auto logSoftmax = [](const std::vector<float> &logits) {
+    const double most = *std::max_element(logits.begin(), logits.end());
+    double sum = 0.0;
+    for (const float logit : logits)
+      sum += std::exp(logit - most);
+    std::vector<double> result(logits.size());
+    for (size_t index = 0; index < logits.size(); ++index)
+      result[index] = logits[index] - most - std::log(sum);
+    return result;
+  };
+  const std::vector<double> p = logSoftmax(cold), q = logSoftmax(fromRam);
+  double divergence = 0.0;
+  for (size_t index = 0; index < p.size(); ++index)
+    divergence += std::exp(p[index]) * (p[index] - q[index]);
+  std::cout << "cache_hit_cold cached_states=" << (exact ? "exact" : "codes") << " cold_top=" << top(cold)
+            << " hit_top=" << top(fromRam) << " kl=" << divergence
+            << " disk_equal=" << (fromDisk == fromRam) << " exact_equal=" << (fromRam == cold) << '\n';
+  require(top(fromRam) == top(cold) && divergence <= kBound,
+          "a cache hit's next token or distribution left the cold prefill's bound");
+  if (exact)
+    require(fromRam == cold, "an exact cached state's hit gave other logits than the cold prefill");
+  require(fromDisk == fromRam, "a state read back from the disk tier restored other logits than its RAM copy");
+  std::cout << "cache_hit_cold=PASS\n";
+}
+
 // Fills every byte of a lane's GDN recurrent state, the half of the cell its
 // next transition reads, with 0xFF: NaN in either format, which the
 // recurrence carries into every row the lane computes. Non-finite KV would
@@ -6097,7 +6460,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 
 int main(int argc, char **argv) {
   try {
-    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
+    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false, cacheOnly = false;
     SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -6128,13 +6491,15 @@ int main(int argc, char **argv) {
            "[--cached-states int8|exact] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
-           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
+           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only | "
+           "--cache-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
       else if (option == "--spill-only") spillOnly = true;
+      else if (option == "--cache-only") cacheOnly = true;
       else if ((option == "--spill-tokens" || option == "--spill-window" || option == "--spill-buffers") &&
                i + 1 < argc) {
         const char *value = argv[++i];
@@ -6381,9 +6746,12 @@ int main(int argc, char **argv) {
     for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
       require(static_cast<bool>(pages.allocateExtent(extent)),
               "oracle KV extent is unavailable");
-    model::QwenStateStorage states(backend,
-                                    admission,
-                                    model.stateLayout(stateFormat, !exactCachedStates), nullptr);
+    // A disk tier of two states' slots, which a state read back from the
+    // disk restores through (requireCacheHitMatchesCold).
+    const uint64_t stateSlotBytes = model::SlotFile::slotBytesFor(stateLayout.cachedBytes());
+    model::QwenStateStorage states(
+        backend, admission, model.stateLayout(stateFormat, !exactCachedStates),
+        std::make_shared<model::SlotFile>(stateSlotBytes, std::make_shared<model::DiskBudget>(2 * stateSlotBytes)));
     model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
     // The checks compare runs of one schedule bit for bit, which a draft's
     // block a lane (--verify-rows all) keeps comparable on a MoE target: the
@@ -6436,7 +6804,7 @@ int main(int argc, char **argv) {
     }
     // The engine refuses image requests to a model without vision before they
     // reach the runtime, which treats one as a broken invariant.
-    if (model.descriptor.hasVision()) {
+    if (model.descriptor.hasVision() && !cacheOnly) {
       requireAtomicImageAdmission(executor, backend, states, model, allocationFault);
       requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
       requireRepeatedImagePlacements(executor, backend, states, allocationFault);
@@ -6451,7 +6819,7 @@ int main(int argc, char **argv) {
       requireReplayPointKeepsItsImageRows(executor, backend);
       requireCapturedStateKeepsItsImageRows(executor, backend);
       requireImageRegistryKeepsOnlyHeldRows(executor);
-    } else {
+    } else if (!cacheOnly) {
       require(!imagesOnly, "--images-only needs a model that serves vision");
       std::cout << "image scenarios: skipped, the model serves text only\n";
     }
@@ -6467,6 +6835,17 @@ int main(int argc, char **argv) {
 
     requireWeightReadsAreTheStoresAlone(executor, model, targetTokens->productionSeed);
     const std::vector<uint32_t> &samplingSeedTokens = targetTokens->samplingSeed;
+    if (cacheOnly) {
+      requireCacheHitMatchesCold(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize,
+                                 exactCachedStates);
+      requireDecodeCaptureMatchesTheLane(executor, states, samplingSeedTokens);
+      requireCaptureInsideItsPathMatchesExactRows(executor, states, samplingSeedTokens);
+      runtime.reset();
+      requireStopInsideABlockEndsItsCapture(context, model, samplingSeedTokens);
+      std::cout << "PASS model-runtime-oracle scope=cache-only model=" << model.name()
+                << " (decode captures at and inside their paths, a stop inside a block, cache hits against cold)\n";
+      return 0;
+    }
     if (prefillGroupsOnly) {
       requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                           model.descriptor.hasVision());
@@ -6592,6 +6971,9 @@ int main(int argc, char **argv) {
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
     requireDecodeCaptureMatchesTheLane(executor, states, samplingSeedTokens);
+    requireCaptureInsideItsPathMatchesExactRows(executor, states, samplingSeedTokens);
+    requireCacheHitMatchesCold(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize,
+                               exactCachedStates);
     requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                         model.descriptor.hasVision());
     requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, model.descriptor.hasVision());
