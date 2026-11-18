@@ -395,21 +395,11 @@ class CallbackStreamer:
                 break
 
     def _step(self, token_id):
-        """The text `token_id` adds to the output. Where tokenizers'
-        DecodeStream cannot continue, which a decoder that rewrites earlier
-        text can make it, each token decodes the whole output instead, so
-        that a stop sequence still ends the request at the token that
-        completes it, and the usage counts no token past it."""
-        if self.decode_stream is not None:
-            try:
-                return self.decode_stream.step(self.backend, token_id) or ""
-            except Exception as error:
-                # tokenizers raises a plain Exception with this message when
-                # an incremental decode cannot continue.
-                if not str(error).startswith("Invalid prefix encountered"):
-                    raise
-                self.decode_stream = None
-        return self._rest()
+        """The text `token_id` adds to the output. tokenizers' DecodeStream
+        holds back the bytes of a character it has not ended; the end
+        decodes what it held (_rest). An error in the incremental decode
+        fails the request: every tokenizer served decodes byte by byte."""
+        return self.decode_stream.step(self.backend, token_id) or ""
 
     def _rest(self):
         """The text of the whole output past the text put so far."""

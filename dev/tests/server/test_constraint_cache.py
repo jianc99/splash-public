@@ -52,8 +52,7 @@ class ConstraintCacheTests(unittest.TestCase):
 
     def test_table_takes_the_installations_vocabulary_and_the_formats_stops(self):
         """The table is built before Ready, of the installation's vocabulary
-        and the chat format's stop texts; the factory refuses one of another
-        vocabulary than the Ready's."""
+        and the chat format's stop texts."""
         tokenizer, _ = grammar_tokenizers()
         fast = SimpleNamespace(
             encode=lambda text, add_special_tokens: [tokenizer.token_to_id(text)]
@@ -70,12 +69,6 @@ class ConstraintCacheTests(unittest.TestCase):
         )
         ready = dataclasses.replace(READY, vocabulary_size=300)
         self.assertIs(constraints.ConstraintFactory(table, ready).tokenizer, table)
-        with self.assertRaisesRegex(
-            constraints.TokenizerContractError, "grammars' table covers 300 tokens"
-        ):
-            constraints.ConstraintFactory(
-                table, dataclasses.replace(ready, vocabulary_size=301)
-            )
 
     def test_byte_budget_evicts_lru_and_counts_utf8(self):
         factory = self.factory()

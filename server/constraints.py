@@ -254,7 +254,7 @@ class ConstraintFactory:
         cover: the installation's `vocabulary` (assembly.vocabulary) and the
         chat format's stop tokens. The server builds it while the engine
         loads its weights (server.main), where it took 0.82 s after Ready on
-        a 32-core M5 Max; the factory checks it against the Ready."""
+        a 32-core M5 Max."""
         return guidance_tokenizer(
             tokenizer,
             n_vocab=vocabulary,
@@ -264,14 +264,10 @@ class ConstraintFactory:
 
     def __init__(self, table, ready):
         # The engine's Ready, whose vocabulary, stop tokens and mask rows its
-        # constraints are sized by, and the table built before it (table),
-        # which must cover that vocabulary; its stop tokens are those
-        # check_capabilities found the Ready's.
-        if table.vocab_size != ready.vocabulary_size:
-            raise TokenizerContractError(
-                f"the grammars' table covers {table.vocab_size} tokens, but the "
-                f"native model serves {ready.vocabulary_size}"
-            )
+        # constraints are sized by, and the table built before it (table) of
+        # the installation's vocabulary, which the engine checks against its
+        # own as it loads; its stop tokens are those check_capabilities found
+        # the Ready's.
         self.ready = ready
         self.tokenizer = table
         # Compiled matchers by grammar, within a budget of grammar bytes.
