@@ -66,6 +66,7 @@ struct FlintLayout final : QwenHybridLayout {
                           .attentionKvHeads = 4,
                           .attentionHeadDimension = 128,
                           .attentionGate = false,
+                          .attentionSinks = true,
                           .rotaryPairs = 64,
                           .rotaryTheta = 10'000.0F,
                           .slidingWindow = 513,

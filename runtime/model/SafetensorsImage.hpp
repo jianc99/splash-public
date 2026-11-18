@@ -49,8 +49,8 @@ enum class ModuleNames : uint8_t { Mlx, MlxLm, Transformers };
 // (transformers') or model.embed_tokens (mlx-lm's).
 [[nodiscard]] ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint);
 
-// Whether the images hold the norms as F32 rather than bf16 as stored, as
-// the family's walk holds them: a checkpoint's whose RMSNorm weights are
+// Whether the images hold the norms as F32 rather than bf16 as stored, by
+// the names and the family whose GGUFs are of `architecture`: a checkpoint's whose RMSNorm weights are
 // stored 1 below the weights the norm multiplies by as their F32 1 + w, but
 // the GDN's gated norm's widened (transformers' checkpoints of the Qwen3.5
 // hybrid), and Flint's widened, as its GGUF's are; an MLX hybrid's, which
@@ -58,11 +58,10 @@ enum class ModuleNames : uint8_t { Mlx, MlxLm, Transformers };
 [[nodiscard]] bool float32Norms(ModuleNames names, std::string_view architecture);
 
 // The layers' images, then the head's and the embedding's, of a target of
-// the family whose GGUFs are of `architecture` (its layout's
-// ggufArchitecture, which names the family's walk here as in the GGUF
-// planner: model/GgufImage.hpp), the sections each walk writes those its
-// GGUF walk writes, in their order. The checkpoint outlives them: their rows
-// read its tensors.
+// `geometry`, its norms as float32Norms holds them for `architecture` (its
+// layout's ggufArchitecture), the sections those its GGUF walk writes
+// (model/GgufImage.hpp), in their order. The checkpoint outlives them: their
+// rows read its tensors.
 [[nodiscard]] std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint,
                                                   const QwenTargetDimensions &geometry,
                                                   std::string_view architecture, gguf::PlanOptions options = {});
@@ -74,7 +73,6 @@ enum class ModuleNames : uint8_t { Mlx, MlxLm, Transformers };
 // one unquantized, and the configuration check one its config.json states
 // unquantized (model/ModelDescriptor.mm). The router, the shared-expert gate,
 // GDN alpha and beta, Flint's sinks and the token table are not among them.
-[[nodiscard]] std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry,
-                                                        std::string_view architecture, ModuleNames names);
+[[nodiscard]] std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names);
 
 } // namespace splash::model::safetensors

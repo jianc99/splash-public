@@ -414,70 +414,41 @@ template <class Walk> void ffn(Walk &b, const QwenTargetDimensions &g, const std
   }
 }
 
-// The Qwen3.5 hybrid's (qwen35, qwen35moe): a norm before each layer's mixer
-// and FFN and before the head. MLX stores its norms as the multipliers they
-// are (mlx-lm's conversion adds the 1), held bf16; transformers 1 below them,
-// held as the F32 1 + w.
-struct HybridWalk final {
-  static constexpr std::array<std::string_view, 2> architectures{"qwen35", "qwen35moe"};
-  static Conversion norms(ModuleNames names) {
-    return names == ModuleNames::Transformers ? Conversion::CenteredNorm : Conversion::None;
-  }
-  template <class Walk> static void layer(Walk &b, const QwenTargetDimensions &g, const std::string &p, uint32_t index) {
-    b.norm(p + "input_layernorm", g.hiddenSize);
-    mixer(b, g, p, g.isFullAttentionLayer(index));
-    b.norm(p + "post_attention_layernorm", g.hiddenSize);
-    ffn(b, g, p, index);
-  }
-  template <class Walk> static void head(Walk &b, const QwenTargetDimensions &g, ModuleNames names) {
-    b.norm(modelPrefix(names) + "norm", g.hiddenSize);
-  }
-};
-
-// Flint's (flint): every layer attends, with its learned sinks after its
-// mixer (self_attn.softmax_offset, one per query head, widened to the F32
-// the GGUF's attn_sinks hold), its leading layers' FFN dense. Its norms are
-// plain RMS norms, which MLX stores as the multipliers they are: those of
-// mlx-community/flint-mixed-3-4bit equal unsloth's GGUF's, its sinks the
-// GGUF's sinks (the 64 GB M5 Pro). They widen to the F32 its GGUF's images hold, as
-// Flint's kernel shapes are compiled for F32 norms alone
-// (dev/tests/engine/TestFamilies.hpp normsOfFamilies).
-struct FlintWalk final {
-  static constexpr std::array<std::string_view, 1> architectures{"flint"};
-  static Conversion norms(ModuleNames) { return Conversion::WidenToFloat32; }
-  template <class Walk> static void layer(Walk &b, const QwenTargetDimensions &g, const std::string &p, uint32_t index) {
-    b.norm(p + "input_layernorm", g.hiddenSize);
-    mixer(b, g, p, true);
-    b.floatVector(p + "self_attn.softmax_offset", g.attentionQueryHeads);
-    b.norm(p + "post_attention_layernorm", g.hiddenSize);
-    ffn(b, g, p, index);
-  }
-  template <class Walk> static void head(Walk &b, const QwenTargetDimensions &g, ModuleNames names) {
-    b.norm(modelPrefix(names) + "norm", g.hiddenSize);
-  }
-};
-
-// Calls `use` with the walk of the family whose GGUFs are of `architecture`;
-// another is refused, so a family without a walk fails by name.
-template <class Use> decltype(auto) withFamily(std::string_view architecture, Use &&use) {
-  if (std::ranges::find(FlintWalk::architectures, architecture) != FlintWalk::architectures.end())
-    return use(FlintWalk{});
-  if (std::ranges::find(HybridWalk::architectures, architecture) == HybridWalk::architectures.end())
-    throw WeightStoreError("no safetensors family plans architecture " + std::string(architecture));
-  return use(HybridWalk{});
+// A layer: a norm before its mixer and its FFN, its attention's learned sinks
+// after the mixer where its geometry holds them (attentionSinks: Flint's
+// self_attn.softmax_offset, one per query head, widened to the F32 the GGUF's
+// attn_sinks hold); and before the head, the final norm.
+template <class Walk> void layer(Walk &b, const QwenTargetDimensions &g, const std::string &p, uint32_t index) {
+  b.norm(p + "input_layernorm", g.hiddenSize);
+  mixer(b, g, p, g.isFullAttentionLayer(index));
+  if (g.attentionSinks) b.floatVector(p + "self_attn.softmax_offset", g.attentionQueryHeads);
+  b.norm(p + "post_attention_layernorm", g.hiddenSize);
+  ffn(b, g, p, index);
 }
 
-// Walks every image of Family, each through the walker `walker(name, layer,
-// type)` makes, which `done` takes once walked.
-template <class Family, class Make, class Done>
-void walkImages(Family, const QwenTargetDimensions &g, ModuleNames names, Make make, Done done) {
+// How the norms load. MLX stores them as the multipliers they are (mlx-lm's
+// conversion adds the 1), held bf16; transformers 1 below them, held as the
+// F32 1 + w. Flint's plain RMS norms (those of mlx-community/flint-mixed-3-4bit
+// equal unsloth's GGUF's, its sinks the GGUF's sinks, on the 64 GB M5 Pro)
+// widen to the F32 its GGUF's images hold, as Flint's kernel shapes are
+// compiled for F32 norms alone (dev/tests/engine/TestFamilies.hpp
+// normsOfFamilies).
+Conversion normConversion(ModuleNames names, std::string_view architecture) {
+  if (architecture == "flint") return Conversion::WidenToFloat32;
+  return names == ModuleNames::Transformers ? Conversion::CenteredNorm : Conversion::None;
+}
+
+// Walks every image, each through the walker `walker(name, layer, type)`
+// makes, which `done` takes once walked.
+template <class Make, class Done>
+void walkImages(const QwenTargetDimensions &g, ModuleNames names, Make make, Done done) {
   for (uint32_t index = 0; index < g.layers; ++index) {
     auto b = make("layer-" + std::to_string(index) + ".bin", index, g.isFullAttentionLayer(index) ? 1u : 0u);
-    Family::layer(b, g, modelPrefix(names) + "layers." + std::to_string(index) + ".", index);
+    layer(b, g, modelPrefix(names) + "layers." + std::to_string(index) + ".", index);
     done(b);
   }
   auto head = make("head.bin", g.layers, 2u);
-  Family::head(head, g, names);
+  head.norm(modelPrefix(names) + "norm", g.hiddenSize);
   head.projection(headName(names), g.vocabularySize, g.hiddenSize);
   done(head);
   auto embedding = make("embedding.bin", g.vocabularySize, g.hiddenSize);
@@ -496,22 +467,20 @@ ModuleNames moduleNames(const SafetensorsCheckpoint &checkpoint) {
 }
 
 bool float32Norms(ModuleNames names, std::string_view architecture) {
-  return withFamily(architecture, [&](auto family) { return decltype(family)::norms(names) != Conversion::None; });
+  return normConversion(names, architecture) != Conversion::None;
 }
 
 std::vector<gguf::Image> planImages(const SafetensorsCheckpoint &checkpoint, const QwenTargetDimensions &geometry,
                                    std::string_view architecture, gguf::PlanOptions options) {
   const ModuleNames names = moduleNames(checkpoint);
+  const Conversion norms = normConversion(names, architecture);
   std::vector<gguf::Image> images;
-  withFamily(architecture, [&](auto family) {
-    const Conversion norms = decltype(family)::norms(names);
-    walkImages(
-        family, geometry, names,
-        [&](std::string name, uint32_t layer, uint32_t type) {
-          return Builder(checkpoint, geometry, names, norms, std::move(name), layer, type, options);
-        },
-        [&](Builder &b) { images.push_back(b.finish()); });
-  });
+  walkImages(
+      geometry, names,
+      [&](std::string name, uint32_t layer, uint32_t type) {
+        return Builder(checkpoint, geometry, names, norms, std::move(name), layer, type, options);
+      },
+      [&](Builder &b) { images.push_back(b.finish()); });
   return images;
 }
 
@@ -522,14 +491,11 @@ uint32_t mlxFormat(std::string_view mode, uint32_t bits, uint32_t group) noexcep
   return GGUF_FMT_COUNT;
 }
 
-std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, std::string_view architecture,
-                                          ModuleNames names) {
+std::vector<std::string> quantizedModules(const QwenTargetDimensions &geometry, ModuleNames names) {
   QuantizedModules walk(names);
-  withFamily(architecture, [&](auto family) {
-    walkImages(
-        family, geometry, names, [&](std::string, uint32_t, uint32_t) { return QuantizedModules(names); },
-        [&](QuantizedModules &b) { walk.modules.insert(walk.modules.end(), b.modules.begin(), b.modules.end()); });
-  });
+  walkImages(
+      geometry, names, [&](std::string, uint32_t, uint32_t) { return QuantizedModules(names); },
+      [&](QuantizedModules &b) { walk.modules.insert(walk.modules.end(), b.modules.begin(), b.modules.end()); });
   return std::move(walk.modules);
 }
 
