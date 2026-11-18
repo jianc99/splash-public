@@ -231,7 +231,7 @@ def visible_outside_calls(text):
 
 
 class SeededRandomChunkStreamer(PassthroughStreamer):
-    def __init__(self, tokenizer, callback, *args):
+    def __init__(self, tokenizer, callback, *args, **options):
         super().__init__(tokenizer, callback)
         self.random = random.Random(20260821)
 

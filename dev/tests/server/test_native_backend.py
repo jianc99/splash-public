@@ -1503,7 +1503,7 @@ class CallbackStreamerTests(unittest.TestCase):
         self.assertEqual("".join(chunks), tokenizer.decode(tokenizer.token_ids))
 
     def test_an_invalid_decoder_prefix_stops_at_the_batch_that_holds_the_stop(self):
-        # Decoding the whole output after each batch, a stop ends the request
+        # Decoding the whole output at each token, a stop ends the request
         # with the batch that completes it, and the output keeps the tokens up
         # to the one that does, which its usage counts.
         tokenizer = ByteLevelTestTokenizer(
@@ -1601,3 +1601,146 @@ class CallbackStreamerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def refuse_incremental_decode(streamer):
+    """Make `streamer`'s DecodeStream refuse every step, as tokenizers does
+    where a decoder rewrites earlier text."""
+    streamer.decode_stream = SimpleNamespace(
+        step=mock.Mock(side_effect=ValueError("Invalid prefix encountered"))
+    )
+
+
+class AnswerStopTests(unittest.TestCase):
+    """A request's stop sequences end its answer alone: they are not searched
+    in its reasoning nor inside a tool call, the tags that bound those read
+    from their tokens."""
+
+    def read(self, raw_tokens, stops, *, thinking=False, calls=False, start=False):
+        """The streamer's reading of an output of `raw_tokens`, put one token,
+        three tokens or all at a time, with the incremental decode or without
+        it; each way must read the same. Returns the text, the stop, the kept
+        token count and the reasoning tokens."""
+        tokenizer = ByteLevelTestTokenizer([raw.encode() for raw in raw_tokens])
+        ids = dict(zip(raw_tokens, tokenizer.token_ids))
+        chat_format = dataclasses.replace(
+            FLINT if start else QWEN,
+            think_end_id=ids.get(THINK_END, 0),
+            think_start_id=ids.get(THINK_START, 0) if start else None,
+            call_open_id=ids.get(TOOL_CALL_OPEN, 0),
+            call_close_id=ids.get("</tool_call>", 0),
+        )
+        readings = set()
+        for size in (1, 3, len(raw_tokens)):
+            for incremental in (True, False):
+                chunks, stopped = [], []
+                streamer = backend_api.CallbackStreamer(
+                    tokenizer,
+                    chunks.append,
+                    stops,
+                    lambda: stopped.append(True),
+                    chat_format=chat_format,
+                    thinking=thinking,
+                    may_call_tools=calls,
+                    reads_calls=calls,
+                )
+                if not incremental:
+                    refuse_incremental_decode(streamer)
+                for offset in range(0, len(tokenizer.token_ids), size):
+                    streamer.put_tokens(tokenizer.token_ids[offset : offset + size])
+                streamer.end()
+                self.assertEqual(len(stopped), int(streamer.stop_sequence is not None))
+                readings.add(
+                    (
+                        "".join(chunks),
+                        streamer.stop_sequence,
+                        len(streamer.token_ids),
+                        streamer.count_reasoning_tokens(chat_format, thinking, calls),
+                    )
+                )
+        self.assertEqual(len(readings), 1, readings)
+        return readings.pop()
+
+    def test_a_stop_in_the_reasoning_does_not_end_the_answer(self):
+        tokens = ["12*12 is 1", "44, so.", THINK_END, "\n\n", "It is 1", "44", " more"]
+        self.assertEqual(
+            self.read(tokens, ("144",), thinking=True),
+            ("12*12 is 144, so.</think>\n\nIt is ", "144", 6, 2),
+        )
+
+    def test_the_newlines_after_the_reasoning_begin_no_stop(self):
+        tokens = ["Think.", THINK_END, "\n\n", "Answer", "\n\n", "more"]
+        self.assertEqual(
+            self.read(tokens, ("\n\n",), thinking=True),
+            ("Think.</think>\n\nAnswer", "\n\n", 5, 1),
+        )
+
+    def test_a_stop_cannot_span_the_reasoning_and_the_answer(self):
+        tokens = ["x a", THINK_END, "b y"]
+        self.assertEqual(
+            self.read(tokens, ("ab", "a</think>b"), thinking=True),
+            ("x a</think>b y", None, 3, 1),
+        )
+
+    def test_a_stop_inside_a_call_does_not_cut_it(self):
+        call = [
+            TOOL_CALL_OPEN,
+            "\n<function=Bash>\n<parameter=command>\necho a\n\necho b\n",
+            "</parameter>\n</function>\n",
+            "</tool_call>",
+        ]
+        # In the answer, and as the call that ends the reasoning.
+        self.assertEqual(
+            self.read(["Run it.", *call, "\nThen\n\nmore"], ("\n\n",), calls=True),
+            ("".join(["Run it.", *call, "\nThen"]), "\n\n", 6, 0),
+        )
+        self.assertEqual(
+            self.read(
+                ["Plan.", *call, "\nThen\n\nmore"], ("\n\n",), thinking=True, calls=True
+            ),
+            ("".join(["Plan.", *call, "\nThen"]), "\n\n", 6, 1),
+        )
+
+    def test_a_stop_cannot_span_a_call(self):
+        tokens = [
+            "x a",
+            TOOL_CALL_OPEN,
+            "\n<function=f>\n</function>\n",
+            "</tool_call>",
+            "b y",
+        ]
+        self.assertEqual(
+            self.read(tokens, ("ab",), calls=True), ("".join(tokens), None, 5, 0)
+        )
+
+    def test_a_call_tag_that_opens_no_call_is_answer_text(self):
+        # A call-open token whose text goes on otherwise is text, searched
+        # as the rest of the answer, a stop across it too.
+        tokens = ["The marker ", TOOL_CALL_OPEN, " is text. ", "STOP", " here"]
+        self.assertEqual(
+            self.read(tokens, ("STOP",), calls=True),
+            ("The marker <tool_call> is text. ", "STOP", 4, 0),
+        )
+        self.assertEqual(
+            self.read(tokens, ("marker <tool_call> is",), calls=True),
+            ("The ", "marker <tool_call> is", 3, 0),
+        )
+
+    def test_without_tools_a_call_tag_is_answer_text(self):
+        tokens = ["Run ", TOOL_CALL_OPEN, "\n<function=f>\nSTOP", " more"]
+        self.assertEqual(
+            self.read(tokens, ("STOP",)),
+            ("Run <tool_call>\n<function=f>\n", "STOP", 3, 0),
+        )
+
+    def test_reasoning_the_model_opens_itself_is_not_searched(self):
+        tokens = [THINK_START, "Say 144.", THINK_END, "It is 144."]
+        self.assertEqual(
+            self.read(tokens, ("144",), start=True),
+            ("<think>Say 144.</think>It is ", "144", 4, 1),
+        )
+        # An answer without reasoning is searched from its start.
+        self.assertEqual(
+            self.read(["It is 1", "44."], ("144",), start=True),
+            ("It is ", "144", 2, 0),
+        )

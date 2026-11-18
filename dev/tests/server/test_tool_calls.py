@@ -563,10 +563,12 @@ class ToolCallTests(HarnessTestCase):
                 )
 
     def test_stop_cuts_output_beside_tools_as_the_token_limit_does(self):
-        # A stop sequence ends the output wherever the model writes it. One
-        # inside a call cuts it as the token limit would: the call keeps the
-        # arguments it has, unfinished, and does not count as made. A
-        # structured answer it cuts goes unvalidated.
+        # A stop sequence is not searched inside a call the format's tokens
+        # bound, but the fake vocabulary spells its calls as text, which the
+        # stop search cannot tell from the answer: a stop there cuts the call
+        # as the token limit would. The call keeps the arguments it has,
+        # unfinished, and does not count as made. A structured answer it
+        # cuts goes unvalidated.
         factory = FakeConstraintFactory()
         harness = self.harness(
             FakeRuntime(
@@ -632,8 +634,8 @@ class ToolCallTests(HarnessTestCase):
 
     def test_a_stop_sequence_cuts_only_the_call_it_ends_in(self):
         # Text before a stop sequence is the text the client asked for, a
-        # trailing "<" included. One inside a call, at its name too, cuts it,
-        # and then no call of the output counts as made.
+        # trailing "<" included. One inside a call spelled as text, at its
+        # name too, cuts it, and then no call of the output counts as made.
         tokenizer = FakeTokenizer()
         tokenizer.fragments[90] = "a <"
         tokenizer.fragments[91] = " b more"

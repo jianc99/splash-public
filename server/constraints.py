@@ -6,7 +6,7 @@ from concurrent.futures import Future, wait
 from llguidance import LLMatcher, LLTokenizer
 from llguidance.numpy import allocate_token_bitmask, fill_next_token_bitmask
 
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import THINK_END, THINK_START, TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
 from .protocol import NO_PARENT
@@ -159,8 +159,8 @@ def validate_tokenizer(tokenizer, chat_format):
     """Before the engine starts, refuse a tokenizer that does not encode the
     tags chat_format reads the model's output by as that format has them:
     the close of thinking, the model's own opening of it where the model
-    opens it, and a call's opening must each be the format's token, and
-    each stop text one token (check_capabilities checks which stop tokens,
+    opens it, and a call's opening and close must each be the format's
+    token, and each stop text one token (check_capabilities checks which stop tokens,
     once the engine names them). Refuse too one whose added tokens the
     server could not keep out of the text a client sent
     (tokenization.added_tokens), which would serve a prompt that quotes a tag
@@ -173,6 +173,7 @@ def validate_tokenizer(tokenizer, chat_format):
     expected = {
         THINK_END: chat_format.think_end_id,
         TOOL_CALL_OPEN: chat_format.call_open_id,
+        TOOL_CALL_CLOSE: chat_format.call_close_id,
     }
     if chat_format.think_start_id is not None:
         expected[THINK_START] = chat_format.think_start_id
