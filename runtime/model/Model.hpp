@@ -654,9 +654,13 @@ struct ExecutionLimits final {
   static constexpr uint32_t prefillTokenBudget = SPLASH_PREFILL_TOKEN_BUDGET;
   // KV pages startup warmup runs on, from page 0: the runway the engine's KV
   // pool allocates when it is built, whose pages warmup holds while it runs
-  // (engine::KvPool::RunwayHold).
+  // (engine::KvPool::RunwayHold). Twice the prefill of the most rows' 64:
+  // each lane count's step measurement runs from page 5
+  // (Runtime::measureDecodeSteps), and eight lanes of a MoE target's 14
+  // points take 69. A start's minimum grows by the 64 more pages where its
+  // extents are smaller than 128 pages (a BF16 KV's 32).
   static constexpr uint32_t warmupKvPages =
-      (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
+      2 * ((prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens);
   static constexpr uint32_t draftQueryRows = SPLASH_DRAFT_QUERY_ROWS;
   static constexpr uint32_t draftProposalTokens = SPLASH_DRAFT_PROPOSAL_TOKENS;
   // The most rows of a lane's verify block, which every target kernel takes.

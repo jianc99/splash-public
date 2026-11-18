@@ -20,6 +20,7 @@
 // is a draft's block a lane; a table's line recalls its costs, and a line of
 // another table's points none.
 #include "TestChecks.hpp"
+#include "model/Model.hpp"
 #include "model/StepCosts.hpp"
 #include "model/VerifyBudget.hpp"
 
@@ -290,8 +291,8 @@ void invalidInputs() {
   VerifyBudget budget;
   const VerifyBudget::Lane lane;
   rejects([&] { budget.observe({}); }, "invalid verify budget cycle", "an empty cycle was observed");
-  const std::vector<VerifyBudget::Lane> five(5, lane);
-  rejects([&] { budget.observe(five); }, "invalid verify budget cycle", "five lanes were observed");
+  const std::vector<VerifyBudget::Lane> tooMany(VerifyBudget::kLanes + 1, lane);
+  rejects([&] { budget.observe(tooMany); }, "invalid verify budget cycle", "more lanes than a step holds were observed");
   for (const VerifyBudget::Label &label : {VerifyBudget::Label{kPositions, 0.0F, true}, {0, NAN, true}}) {
     VerifyBudget::Lane bad = lane;
     bad.labels = {label};
@@ -477,7 +478,7 @@ void choiceOverTheTable() {
       return cost(laneCount, p.last, p.cap);
     });
     const StepCosts::Choice got = costs.choose(spansOf(curves));
-    const uint32_t most = std::min(lanes * kBlock, mostRows), narrow = lanes * kNarrow;
+    const uint32_t most = std::min(lanes * kBlock, mostRows), narrow = std::min(lanes * kNarrow, most);
     std::vector<uint32_t> starts(std::begin(kClasses), std::end(kClasses));
     starts.push_back(narrow + 1);
     std::ranges::sort(starts);
@@ -862,11 +863,12 @@ void costLineFitsTheSamples() {
   for (uint32_t lanes = 1; lanes <= CostLine::kLanes; ++lanes) {
     CostLine costs(kStreamedClasses);
     // The seed's floor: 0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15 and 0.6 / 2.8 at
-    // one to four lanes.
+    // one to four lanes, and four lanes' 0.6 / 2.8 past them (their seed).
     const double seedSlope = (1.0 - CostLine::seed(lanes, lanes)) / (7.0 * lanes);
     const double seedFloor = seedSlope * lanes / CostLine::seed(lanes, lanes);
     require(!costs.line(lanes, false) && std::fabs(costs.floor(lanes, false) - seedFloor) <= 1e-12 &&
-                std::fabs(seedFloor - std::array{0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15, 0.6 / 2.8}[lanes - 1]) <= 1e-12,
+                std::fabs(seedFloor - std::array{0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15, 0.6 / 2.8}[std::min(lanes, 4U) - 1]) <=
+                    1e-12,
             std::to_string(lanes) + " lanes: before a sample the cost line had a fit, or its floor is not the seed's");
     std::mt19937_64 random(0xc057 + lanes);
     std::uniform_int_distribution<uint32_t> rowsOf(lanes, lanes * CostLine::kBlockRows);
@@ -1100,16 +1102,18 @@ void invalidSteps() {
   // Four lanes of four rows hold their anchors alone.
   rejects([&] { StepCosts costs(kClasses, StepCosts::kLanes, false); }, "hold nothing past its lanes' anchors",
           "a table of the anchors alone was made");
-  // The startup runway's 64 pages from page 5 hold four lanes of 26 points,
-  // not of 27; a class every row makes 61 at four lanes, while a MoE
-  // target's table of kClasses fits.
-  require(5 + 4 * StepCosts::lanePages(26) <= 64 && 5 + 4 * StepCosts::lanePages(27) > 64,
+  // The startup runway's 128 pages from page 5 hold eight lanes of 28
+  // points, not of 29; a class every row makes more, while a MoE target's
+  // table of kClasses fits.
+  constexpr uint32_t kRunway = splash::model::ExecutionLimits::warmupKvPages;
+  require(kRunway == 128 && 5 + StepCosts::kLanes * StepCosts::lanePages(28) <= kRunway &&
+              5 + StepCosts::kLanes * StepCosts::lanePages(29) > kRunway,
           "the runway holds other lanes than a measurement lays");
   std::vector<uint32_t> everyRow;
   for (uint32_t row = 1; row <= 64; ++row) everyRow.push_back(row);
-  rejects([&] { StepCosts(everyRow, 64, false).requireRunway(5, 64); }, "more pages than the startup runway",
+  rejects([&] { StepCosts(everyRow, 64, false).requireRunway(5, kRunway); }, "more pages than the startup runway",
           "a table whose measurement runs past the startup runway was taken");
-  StepCosts(kClasses, 64, true).requireRunway(5, 64);
+  StepCosts(kClasses, 64, true).requireRunway(5, kRunway);
   StepCosts costs(kClasses, 64, false);
   const size_t points = costs.points(2).size();
   for (const std::vector<std::vector<double>> &replays :
@@ -1118,7 +1122,7 @@ void invalidSteps() {
         {std::vector<double>(points, NAN)}})
     rejects([&] { costs.measure(2, replays); }, "invalid step replays", "impossible replays were measured");
   require(!costs.measured(2), "refused replays measured a lane count");
-  for (const uint32_t lanes : {0U, 5U}) {
+  for (const uint32_t lanes : {0U, StepCosts::kLanes + 1}) {
     rejects([&] { static_cast<void>(costs.points(lanes)); }, "invalid step lane count",
             "points of an impossible lane count were given");
     rejects([&] { costs.measure(lanes, std::vector<std::vector<double>>{std::vector<double>(points, 1.0)}); },
@@ -1145,7 +1149,7 @@ void invalidSteps() {
   const std::vector<std::vector<float>> two(2);
   rejects([&] { static_cast<void>(line.choose(spansOf(two), std::vector<uint32_t>{8}, false)); },
           "a step's lanes hold no rows of their own", "lanes that hold no rows of their own took a step");
-  for (const uint32_t lanes : {0U, 5U}) {
+  for (const uint32_t lanes : {0U, StepCosts::kLanes + 1}) {
     rejects([&] { static_cast<void>(line.floor(lanes, false)); }, "invalid cost line lane count",
             "an impossible lane count had a floor");
     rejects([&] { line.observe(lanes, false, 4, 4, 10.0); }, "invalid cost line lane count",

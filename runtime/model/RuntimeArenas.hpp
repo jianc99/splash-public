@@ -28,9 +28,10 @@ namespace splash::model {
 
 inline constexpr uint32_t kLaneCount = ExecutionLimits::maximumBatchWidth;
 // The most rows of a decode lane, its verify block's, and the most packed
-// rows of a decode step, kDecodeRows a lane: what the decode arena holds.
+// rows of a decode step, its lanes' together: what the decode arena holds.
 inline constexpr uint32_t kDecodeRows = ExecutionLimits::targetVerifyRows;
-inline constexpr uint32_t kDecodeStepRows = kLaneCount * kDecodeRows;
+inline constexpr uint32_t kDecodeStepRows = SPLASH_DECODE_STEP_ROWS;
+static_assert(kDecodeStepRows >= kDecodeRows, "a decode step holds a lane's verify block");
 // The rows of a decode lane's draft block (its query rows), the first of a
 // verify block's positions.
 inline constexpr uint32_t kDraftRows = ExecutionLimits::draftQueryRows;
@@ -740,18 +741,19 @@ public:
     if (!decodeRowTensor(tensor))
       throw std::invalid_argument("a lane's own decode tensor holds no step rows");
     const uint32_t index = static_cast<uint32_t>(tensor);
-    return stepRows(base_, offsets_[index], sizes_[index] * kLaneCount, rows);
+    // A lane's share holds a verify block's rows (decodeTensorBytes).
+    return stepRows(base_, offsets_[index], sizes_[index] / kDecodeRows, rows);
   }
   [[nodiscard]] metal::MetalBuffer rows(TargetTensor tensor, ops::LaneRows rows) const {
     const metal::MetalBuffer whole = target_.get(tensor);
-    return stepRows(whole, 0, whole ? whole.sizeBytes() : 0, rows);
+    return stepRows(whole, 0, whole ? whole.sizeBytes() / kDecodeStepRows : 0, rows);
   }
   // The rows of a target row tensor that a step of `lanes` lanes may hold,
-  // kDecodeRows a lane.
+  // kDecodeRows a lane, at most a step's.
   [[nodiscard]] metal::MetalBuffer lanesRows(TargetTensor tensor, uint32_t lanes) const {
     if (!lanes || lanes > kLaneCount)
       throw std::out_of_range("invalid decode batch width");
-    return rows(tensor, {0, lanes * kDecodeRows});
+    return rows(tensor, {0, std::min(lanes * kDecodeRows, kDecodeStepRows)});
   }
 
   [[nodiscard]] ops::LinearScratch linearScratch() const { return linearScratch_; }
@@ -785,14 +787,13 @@ public:
   [[nodiscard]] uint64_t bytes() const noexcept { return bytes_; }
 
 private:
-  // Rows `rows` of the kDecodeStepRows rows the `bytes` bytes at `offset` of
-  // `buffer` hold, none of no bytes.
-  [[nodiscard]] metal::MetalBuffer stepRows(const metal::MetalBuffer &buffer, uint64_t offset, uint64_t bytes,
+  // Rows `rows` of a step's kDecodeStepRows rows of `row` bytes each from
+  // `offset` of `buffer`, none of no bytes.
+  [[nodiscard]] metal::MetalBuffer stepRows(const metal::MetalBuffer &buffer, uint64_t offset, uint64_t row,
                                             ops::LaneRows rows) const {
     if (!rows.rows || uint64_t{rows.first} + rows.rows > kDecodeStepRows)
       throw std::out_of_range("invalid decode step rows");
-    if (!bytes) return {};
-    const uint64_t row = bytes / kDecodeStepRows;
+    if (!row) return {};
     return backend_.view(buffer, offset + rows.first * row, rows.rows * row);
   }
 

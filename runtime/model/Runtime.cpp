@@ -757,7 +757,7 @@ struct Runtime::Impl {
         stepCosts.emplace(stepClasses, mostStepRows, geometry.target.ffnKind == QwenFfnKind::SparseMoe);
         // Each lane count's measurement fits the startup runway from its
         // page 5 (Runtime::measureDecodeSteps): the most points today, a MoE
-        // target's 14 at four lanes, take 37 of its 64 pages.
+        // target's 14 at eight lanes, take 69 of its 128 pages.
         stepCosts->requireRunway(5, ExecutionLimits::warmupKvPages);
         for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
           const std::optional<std::string> line = value.recallStepCosts ? value.recallStepCosts(lanes) : std::nullopt;
@@ -1470,7 +1470,7 @@ struct Runtime::Impl {
   ops::LaneRows laneRows(uint32_t lane) const {
     const ops::LaneRows rows = *contents<ops::LaneRows>(decodeArena->get(lane, DecodeTensor::LaneLayout), "lane rows");
     if (!rows.rows || rows.rows > ExecutionLimits::targetVerifyRows ||
-        uint64_t{rows.first} + rows.rows > uint64_t{kLaneCount} * kDecodeRows)
+        uint64_t{rows.first} + rows.rows > kDecodeStepRows)
       throw std::runtime_error("draft selector produced invalid lane rows");
     return rows;
   }

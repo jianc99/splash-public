@@ -301,14 +301,16 @@ void testRejectedCommitCountsNothing() {
 }
 
 void testDecodeLanesRotate() {
+  constexpr uint32_t kWidth = model::ExecutionLimits::maximumBatchWidth;
   DenseSim sim;
-  for (uint64_t id = 1; id <= 6; ++id)
+  for (uint64_t id = 1; id <= kWidth + 2; ++id)
     sim.decoder(id);
   const BatchPlan first = sim.plan();
-  require(first.kind == WorkKind::Decode && first.width() == 4, "the first decode did not use the real B4 graph");
+  require(first.kind == WorkKind::Decode && first.width() == kWidth, "the first decode did not take the most lanes");
   sim.run(first);
   const BatchPlan second = sim.plan();
-  require(second.width() == 4 && second.items[0].requestId == 5 && second.items[1].requestId == 6,
+  require(second.width() == kWidth && second.items[0].requestId == kWidth + 1 &&
+              second.items[1].requestId == kWidth + 2,
           "decode did not prioritize lanes omitted by the previous batch");
 }
 
@@ -704,17 +706,20 @@ void testAdmissionStartsTheLanesOfTheNextCommand() {
           "admission did not start the candidate the next command leads with");
 }
 
-// Admission starts at most a full batch: of eight measured turns that share a
-// command, the first four.
+// Admission starts at most a full batch: of twice the most lanes of measured
+// turns that share a command, the first of them that a step holds.
 void testAdmissionStartsAtMostAFullBatch() {
   Sim sim(test::kM6FlashNextQ2, limits(8192, 48));
   measureTurns(sim);
   std::vector<PrefillAdmission> turns;
-  for (uint64_t id = 1; id <= 8; ++id) {
+  constexpr uint32_t kWidth = model::ExecutionLimits::maximumBatchWidth;
+  std::vector<uint64_t> first;
+  for (uint64_t id = 1; id <= 2 * kWidth; ++id) {
     sim.scheduler.submit(request(id, 8192 + 300));
     turns.push_back({id, 8192});
+    if (id <= kWidth) first.push_back(id);
   }
-  require(sim.scheduler.prefillAdmissionOrder(turns, sim.in()) == std::vector<uint64_t>({1, 2, 3, 4}),
+  require(sim.scheduler.prefillAdmissionOrder(turns, sim.in()) == first,
           "admission of short prompts lost their sharing or exceeded the real width");
 }
 
@@ -1648,8 +1653,8 @@ void testARestoringStartHoldsBackWhatItWouldLead() {
 }
 
 // A long lane under a stream of short arrivals of its priority waits behind
-// at most K = 3 commands that serve them, then leads one: its prompt ends
-// within (1 + K) times its own time plus a unit.
+// at most K (kOvertakes) commands that serve them, then leads one: its prompt
+// ends within (1 + K) times its own time plus a unit.
 void testAgingBoundsALongLaneUnderArrivals() {
   DenseSim sim;
   sim.lane(1, 0, 6 * kChunk);
@@ -1671,7 +1676,7 @@ void testAgingBoundsALongLaneUnderArrivals() {
     }
     longest = std::max(longest, sim.step());
   }
-  require(sim.scheduler.phase(1) != Phase::Prefill && sim.now <= 4.0 * cost + longest,
+  require(sim.scheduler.phase(1) != Phase::Prefill && sim.now <= (1.0 + kOvertakes) * cost + longest,
           "the long lane's prompt ended after " + std::to_string(sim.now) + " ms, past (1 + K) of its " +
               std::to_string(cost) + " ms");
 }

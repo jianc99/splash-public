@@ -1238,7 +1238,7 @@ void producerTableContract(metal::MetalBackend &backend) {
                    recurrent = uint64_t{shape.valueHeads} * shape.headDimension * shape.headDimension * 4;
     const GdnStateStrides strides{carried, recurrent, carried, GdnStateFormat::Float32};
     const metal::MetalBuffer state = allocate(backend, carried + recurrent);
-    const std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> states{state, state, state, state};
+    const std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> states{state, state, state, state, state, state, state, state};
     GdnDecodeBuffers buffers;
     buffers.packed = allocate(backend, kRows * shape.packedWidth * 2);
     buffers.convolutionWeights = allocate(backend, shape.convolutionDimension * 4 * 2);

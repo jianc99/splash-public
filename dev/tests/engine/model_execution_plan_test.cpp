@@ -139,7 +139,9 @@ void checkGateUpLayers() {
             "vocabulary head must reserve workspace only in decode");
     const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
     for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
-      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, lanes * model::kDecodeRows,
+      // A step's rows: a verify block a lane, at most the step's.
+      const uint32_t rows = std::min(lanes * model::kDecodeRows, model::kDecodeStepRows);
+      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
           ops::LinearEpilogue::GateUp}, up);
       const auto required = plan.scratchSize();
       require(scratch.input >= required.input && scratch.sums >= required.sums &&
@@ -149,12 +151,12 @@ void checkGateUpLayers() {
               "the gate/up workspace is too small");
       // The F16 and Q8_0 pair stages, at rows the storage of the target's
       // projections over a step's rows holds (ops::Linear::storageRows).
-      const auto pair = plans.linear().plan(mixed.upProjection, lanes * model::kDecodeRows,
+      const auto pair = plans.linear().plan(mixed.upProjection, rows,
                                             ops::LinearEpilogue::GateUp, &mixed.gateProjection);
       const auto paired = pair.scratchSize();
       uint32_t storage = 0;
       for (const auto &shape : geometry.target.decodeProjections)
-        storage = std::max(storage, plans.linear().storageRows(lanes * model::kDecodeRows, shape));
+        storage = std::max(storage, plans.linear().storageRows(rows, shape));
       require(pair.configuration().tile == ops::LinearTile::GgufStaged && pair.storageRows() <= storage,
               "a gate/up pair with an F16 gate did not stage within the decode storage");
       require(scratch.input >= paired.input && scratch.sums >= paired.sums && scratch.partials >= paired.partials &&
@@ -252,7 +254,8 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
           for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                                 ops::LinearEpilogue::GateUp}) {
-            const auto need = plans.linear().plan({matrix, lanes * laneRows, epilogue}).scratchSize();
+            const auto need =
+                plans.linear().plan({matrix, std::min(lanes * laneRows, model::kDecodeStepRows), epilogue}).scratchSize();
             require(scratch.input >= need.input && scratch.sums >= need.sums && scratch.partials >= need.partials &&
                         scratch.counters >= need.counters,
                     "decode arena scratch below a lane's plan");
@@ -260,8 +263,8 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
     }
 }
 
-// A decode step of any rows its lanes may give it, up to four lanes of a
-// verify block's 16, finds its MoE plan's workspace in the decode arena: past
+// A decode step of any rows its lanes may give it, up to its 64, finds its
+// MoE plan's workspace in the decode arena: past
 // 32 rows the 35B's and the 122B's plans take 32-row expert tiles, whose 274
 // tiles at 64 rows a bound of four lanes of 8 rows did not hold.
 void checkDecodeStepMoe(const model::LoadedModel &loaded) {
@@ -272,8 +275,8 @@ void checkDecodeStepMoe(const model::LoadedModel &loaded) {
     device.gpuCoreCount = 20;
     const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     const model::TargetRows step = model::decodeTargetRows(geometry, plans);
-    require(step.rows == model::kLaneCount * model::ExecutionLimits::targetVerifyRows,
-            "the decode arena does not hold four lanes of a verify block's rows");
+    require(step.rows == model::kDecodeStepRows,
+            "the decode arena does not hold a step's rows");
     for (uint32_t rows = 1; rows <= step.rows; ++rows) {
       const ops::MoeWorkspace need =
           plans.moe(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat, rows).workspace();

@@ -44,8 +44,8 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
 // on no device.
 std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
                                                        std::optional<std::pair<MoeShape, uint32_t>> moe) const {
-  if (mostRows > SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS)
-    throw std::invalid_argument("a decode step holds at most a verify block a lane");
+  if (mostRows > SPLASH_DECODE_STEP_ROWS)
+    throw std::invalid_argument("a decode step holds at most SPLASH_DECODE_STEP_ROWS rows");
   const FloatTileCalibration &floats = calibration().floatTile;
   std::vector<uint32_t> first;
   std::tuple<LinearTile, uint32_t, bool, uint32_t> last{};

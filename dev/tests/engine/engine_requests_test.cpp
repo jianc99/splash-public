@@ -883,10 +883,12 @@ void testReplyStatesFollowSpeculativeCycles() {
   require(events.starts.at(1) == 192, "the next turn did not resume at the reply's last page");
 }
 
-// Three longer lanes fill the others, so a Foreground arrival takes the
-// fourth's.
+// Longer lanes fill every lane but one, so a Foreground arrival takes the
+// last's. Their ids are 11 on.
+constexpr uint64_t kFillers = model::ExecutionLimits::maximumBatchWidth - 1;
+
 void fillOtherLanes(engine::Engine &engine) {
-  for (uint64_t id = 11; id <= 13; ++id) {
+  for (uint64_t id = 11; id < 11 + kFillers; ++id) {
     EngineRequest filler = request(id, std::vector<uint32_t>(300, static_cast<uint32_t>(id)));
     filler.maxNewTokens = 3000;
     engine.submit(std::move(filler));
@@ -902,7 +904,7 @@ bool capturedAt(const Executor &executor, uint64_t id, uint32_t tokens) {
 }
 
 // Request 1 replies to the 60 tokens of `prompt`, whose replay point is at
-// 32, with 80 tokens, one a cycle, beside three longer lanes: once the cycle
+// 32, with 80 tokens, one a cycle, beside a longer lane in every other lane: once the cycle
 // that captures 128 has stored exactly 128 tokens, request 5 arrives at
 // Foreground priority to take its lane.
 void preemptReplyAtItsPage(test::EngineHarness &h, double &now, const std::vector<uint32_t> &prompt) {
@@ -934,7 +936,7 @@ void testPreemptedReplyKeepsItsDeepestState() {
           "the lane did not resume from below the page its KV ended at");
   engine.submit(conversationTurn(2, nextTurn(prompt, 80), 1));
   tickUntil(h, now, [&] { return events.usage.contains(2); }, "the next turn did not complete");
-  for (uint64_t id = 11; id <= 13; ++id)
+  for (uint64_t id = 11; id < 11 + kFillers; ++id)
     engine.cancel(id);
   tickUntil(h, now, [&] { return idle(engine); }, "the fillers did not end");
   require(events.starts.back() == 128, "the next turn did not resume at the reply's deepest state");
@@ -961,7 +963,9 @@ void testPreemptedReplyCheckpointIsDropped() {
   const StateCacheSnapshot cached = h.cache.snapshot().stateCache;
   require(cached.offloads == 0 && cached.checkpointEntries == 0,
           "reclaim wrote a preempted reply's checkpoint rather than dropping it");
-  for (const uint64_t id : {1, 5, 11, 12, 13})
+  engine.cancel(1);
+  engine.cancel(5);
+  for (uint64_t id = 11; id < 11 + kFillers; ++id)
     engine.cancel(id);
   tickUntil(h, now, [&] { return idle(engine); }, "the requests did not end");
 }

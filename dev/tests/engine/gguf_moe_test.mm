@@ -1649,7 +1649,7 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
   // step.
   std::vector<SplashLaneRows> every;
   for (uint32_t first = 0; first < rows; first += 8) every.push_back({first, std::min(8u, rows - first)});
-  if (every.size() > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::logic_error("a step of more rows than four lanes of 8");
+  if (every.size() > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::logic_error("a step of more rows than the most lanes of 8");
   // Inputs within 0.25 of zero, which score an expert at most 1, and a row's
   // route k at 1 - k / (2 kTopK), which scores its expert above 2.
   std::mt19937 generator(0x5e1);

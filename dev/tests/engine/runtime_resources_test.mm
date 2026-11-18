@@ -1809,7 +1809,7 @@ void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
   const model::DecodeArena arena(backend, geometry, operators);
-  constexpr uint32_t kStepRows = model::kLaneCount * model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kStepRows = model::kDecodeStepRows;
   const auto at = [](const metal::MetalBuffer &buffer) { return static_cast<const std::byte *>(buffer.contents()); };
   // A lane's rows after lanes of 16 and 5.
   constexpr ops::LaneRows lane{21, 11};
