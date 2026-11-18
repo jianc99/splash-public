@@ -545,7 +545,7 @@ final class Server {
             recovering: status.transport?.recovering ?? false,
             unloaded: status.transport?.unloaded ?? false,
             loading: status.transport?.unloaded == true && status.weights?.restoring == true,
-            loadError: status.transport?.unloaded == true ? status.transport?.error?.text : nil,
+            loadError: status.transport?.unloaded == true ? status.transport?.error?.text.map(sentence) : nil,
             context: status.capabilities?.max_context_tokens,
             cacheOff: status.disk?.off_reason,
             // A request without the engine's id has none: no line or later status could be told
@@ -560,6 +560,15 @@ final class Server {
             },
             taken: status.active_requests == nil ? nil : taken
         )
+    }
+
+    /// The server's words as a sentence the window shows: its first letter upper-case, ending in a
+    /// stop; its words as they are.
+    nonisolated static func sentence(_ words: String) -> String {
+        let words = words.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = words.first else { return words }
+        let sentence = first.uppercased() + words.dropFirst()
+        return ".!?".contains(sentence.last!) ? sentence : sentence + "."
     }
 
     private struct Status: Decodable {

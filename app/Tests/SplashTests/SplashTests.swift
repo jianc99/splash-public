@@ -745,7 +745,8 @@ struct ServerTests {
         #expect(unloaded.unloaded && unloaded.asleep && !unloaded.loading && unloaded.loadError == nil)
         #expect(Server.report(Data(#"{"weights": {"released": true, "restoring": true}, "transport": {"unloaded": true}}"#.utf8))?.loading == true)
         #expect(Server.report(Data(#"{"weights": {"released": true, "restoring": true}}"#.utf8))?.loading == false)
-        #expect(Server.report(Data(#"{"weights": {"released": true}, "transport": {"unloaded": true, "error": "out of memory"}}"#.utf8))?.loadError == "out of memory")
+        #expect(Server.report(Data(#"{"weights": {"released": true}, "transport": {"unloaded": true, "error": "out of memory"}}"#.utf8))?.loadError == "Out of memory.")
+        #expect(Server.sentence("it stopped. ") == "It stopped." && Server.sentence("Why?") == "Why?" && Server.sentence("") == "")
         let odd = Server.report(Data(#"{"weights": {"released": true}, "transport": {"unloaded": true, "error": {"code": 3}}}"#.utf8))
         #expect(odd?.unloaded == true && odd?.loadError == nil)
         // An SSD cache asked for that the disk left off says why; the golden's is on.
@@ -787,7 +788,7 @@ struct ServerTests {
         try FileManager.default.removeItem(at: fake.root.appending(path: "loading"))
         FileManager.default.createFile(atPath: fake.root.appending(path: "failed").path, contents: nil)
         try await waitFor(state.server.serving == .loadFailed, "the failed load")
-        #expect(state.serverStatus.phrase == "Couldn’t load" && state.serverStatus.note == "the engine ran out of memory loading the model")
+        #expect(state.serverStatus.phrase == "Couldn’t load" && state.serverStatus.note == "The engine ran out of memory loading the model.")
         #expect(state.server.phase == .ready && state.server.answers)
         FileManager.default.createFile(atPath: fake.root.appending(path: "loaded").path, contents: nil)
         try await waitFor(state.server.serving == .running, "Running")
