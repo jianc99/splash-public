@@ -6,6 +6,7 @@ read as they do.
 """
 
 import json
+import time
 import unittest
 
 from dev.tests.server_fixtures import FakeRuntime, Harness, anthropic_body
@@ -19,7 +20,7 @@ from dev.tests.tool_output import (
 from server import json_codec
 from server import output as model_output
 from server import server as api
-from server.chat_format import GLM_ARGS
+from server.chat_format import GLM_ARGS, QWEN_XML
 from server.output import MAX_ARGUMENTS_DEPTH, MAX_NAME_LENGTH
 
 # The deepest a parameter value reads as JSON: one level less than its call's
@@ -613,6 +614,121 @@ class ToolCallReadingTests(unittest.TestCase):
                     self.read(call("f", *arguments), {"f": schema})[1],
                     [("f", expected)],
                 )
+
+    def test_every_call_one_piece_of_output_holds_is_read(self):
+        # A speculative step can bring several whole calls at once.
+        text = "\n".join(
+            call("roll_cut", ("item", f"s{index}"), ("shift", str(index)))
+            for index in range(4)
+        )
+        self.assertEqual(
+            self.read(text)[1],
+            [("roll_cut", {"item": f"s{index}", "shift": index}) for index in range(4)],
+        )
+
+    def test_text_before_between_and_after_calls_is_kept(self):
+        first, second = call("note", ("text", "a")), call("note", ("text", "b"))
+        for text, content in (
+            ("Let me check. " + first, "Let me check. "),
+            ("before" + first + "between" + second + "after", "beforebetweenafter"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text)[0], content)
+
+    def test_a_call_tag_in_prose_keeps_the_text_after_it(self):
+        text = "The literal marker is <tool_call> and it starts a tool call. END"
+        self.assertEqual(self.read(text), (text, []))
+
+    def test_a_call_in_another_layout_stays_text(self):
+        # A JSON body inside the call tags, or a function without them, is
+        # not this format's call: its text reaches the client whole.
+        for text in (
+            '<tool_call>\n{"name": "note", "arguments": {"text": "a"}}\n</tool_call>',
+            "<function=note>\n<parameter=text>\na\n</parameter>\n</function>",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.read(text), (text, []))
+
+    def test_closing_tags_repeated_after_a_call_leave_its_arguments(self):
+        self.assertEqual(
+            self.read(call("note", ("text", "p9")) + "</function></tool_call>"),
+            ("</function></tool_call>", [("note", {"text": "p9"})]),
+        )
+
+    def test_a_repeated_parameter_keeps_its_first_value(self):
+        self.assertEqual(
+            self.read(call("note", ("text", "first"), ("text", "second")))[1],
+            [("note", {"text": "first"})],
+        )
+
+    def test_values_that_spell_no_json_of_their_type_stay_text(self):
+        # Every call's arguments stay valid JSON, and a value that is not
+        # one drops no other call.
+        schema = {
+            "type": "object",
+            "properties": {
+                "values": {"type": "array", "items": {"type": "number"}},
+                "ids": {"type": "array"},
+                "label": {"type": "string"},
+                "flag": {"type": "boolean"},
+                "place": {"anyOf": [{"type": "string"}, {"type": "object"}]},
+            },
+        }
+        for argument, expected in (
+            (("values", "[1.5, NaN, 3.0]"), "[1.5, NaN, 3.0]"),
+            (("ids", "{1, 2, 3}"), "{1, 2, 3}"),
+            (("label", "null"), "null"),
+            (("flag", "yes"), "yes"),
+            (("flag", "True"), True),
+            (("place", '{"city": "Paris"}'), {"city": "Paris"}),
+            (("place", "Paris"), "Paris"),
+        ):
+            with self.subTest(argument=argument):
+                self.assertEqual(
+                    self.read(call("f", argument), {"f": schema})[1],
+                    [("f", {argument[0]: expected})],
+                )
+        self.assertEqual(
+            len(
+                self.read(
+                    call("f", ("ids", "{1, 2, 3}")) + call("f", ("label", "next")),
+                    {"f": schema},
+                )[1]
+            ),
+            2,
+        )
+
+    def test_a_value_the_token_limit_cuts_is_no_valid_json(self):
+        # A cut call keeps the arguments it has, unfinished: no client can
+        # run a cut command as if it were whole.
+        _, calls, _ = project(
+            "<tool_call>\n<function=note>\n<parameter=text>\nrm -rf /",
+            tool_policy(SCHEMAS),
+            incomplete=True,
+        )
+        self.assertEqual(calls[0]["function"]["arguments"], '{"text":"rm -rf /')
+        with self.assertRaises(ValueError):
+            json.loads(calls[0]["function"]["arguments"])
+
+    def test_a_long_string_argument_streams_before_its_close(self):
+        projector = model_output.StreamingToolCallProjector(
+            tool_policy(SCHEMAS), "test", syntax=QWEN_XML
+        )
+        events = projector.put(
+            "<tool_call>\n<function=note>\n<parameter=text>\n" + "x" * 20_000
+        )
+        self.assertGreater(len(streamed_arguments(events)), 19_000)
+
+    def test_unclosed_tags_read_in_linear_time(self):
+        for text in (
+            "<tool_call> " * 7_750,
+            "<tool_call>\n<function=note>\n<parameter=text>\n"
+            + "\n</parameter" * 9_000,
+        ):
+            with self.subTest(text=text[:40]):
+                started = time.perf_counter()
+                project(text, tool_policy(SCHEMAS), size=1)
+                self.assertLess(time.perf_counter() - started, 2.0)
 
 
 if __name__ == "__main__":
