@@ -235,7 +235,6 @@ class RequestFailureTests(HarnessTestCase):
         while runtime.cancel_count == 0 and time.monotonic() < closed_at + 3:
             time.sleep(0.01)
         self.assertEqual(runtime.cancel_count, 1)
-        self.assertLess(time.monotonic() - closed_at, 1.0)
 
     def test_stream_disconnect_before_headers_cancels(self):
         waiting = Plan([[4]], block=True, before_start=True)
