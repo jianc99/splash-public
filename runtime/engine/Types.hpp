@@ -67,10 +67,10 @@ struct EngineRequest final {
   uint64_t id = 0;
   RequestPriority priority = RequestPriority::Normal;
   std::vector<uint32_t> prompt;
-  // Trailing prompt tokens a later request may not share (a chat template's
-  // generation prompt, which the next turn may render differently), so
-  // reusable state is kept before them. Zero when unknown; it must leave at
-  // least one prompt token.
+  // Trailing prompt tokens a later request may not share (the last message's
+  // end of turn and the generation prompt, which the next turn renders
+  // otherwise), so reusable state is kept before them. Zero when unknown; it
+  // must leave at least one prompt token.
   uint32_t generationPromptTokens = 0;
   // Where the prompt's head ends, its first message (a system prompt and tools), which other conversations may
   // share: a state is kept there on first use (Engine::configureDraftStatePlan). Zero when there is none.

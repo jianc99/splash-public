@@ -50,6 +50,38 @@ void tickUntil(test::EngineHarness &h, double &now, const std::function<bool()> 
   now = h.now() + 1;
 }
 
+// A request for one token on a prompt whose last page ends inside its last message's end of turn, then the same
+// message typed on: the second resumes from the first's state in memory, at the last page before the end of turn.
+// The server counts that end of turn with the generation prompt (frontend._past_last_text), 2 tokens on Qwen's
+// templates, as the tokens no continuation shares; counted from the generation prompt alone (7), the state sat
+// past what the second request shares, and it prefilled from the start.
+void testATypedOnMessageResumesFromAOneTokenRead() {
+  constexpr uint32_t kEndOfTurn = 2, kGeneration = 7, kPage = KvCache::pageTokens;
+  test::EngineHarness h({.pages = 64});
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  // The page boundary below the generation prompt falls right after the message's text and its end of turn.
+  std::vector<uint32_t> read(10 * kPage + kGeneration);
+  std::iota(read.begin(), read.end(), 1);
+  EngineRequest first = request(1, read);
+  first.generationPromptTokens = kEndOfTurn + kGeneration;
+  first.maxNewTokens = 1;
+  engine.submit(std::move(first));
+  tickUntil(h, now, [&] { return idle(engine); }, "the read did not complete");
+  std::vector<uint32_t> typed(read.begin(), read.end() - kEndOfTurn - kGeneration);
+  typed.resize(typed.size() + 60, 900);
+  typed.resize(typed.size() + kEndOfTurn + kGeneration, 901);
+  EngineRequest second = request(2, typed);
+  second.generationPromptTokens = kEndOfTurn + kGeneration;
+  engine.submit(std::move(second));
+  tickUntil(h, now, [&] { return idle(engine); }, "the typed-on message did not complete");
+  const uint32_t resumed = (static_cast<uint32_t>(read.size()) - kEndOfTurn - kGeneration) / kPage * kPage;
+  require(events.starts.back() == resumed, "the typed-on message resumed from " +
+                                               std::to_string(events.starts.back()) + ", not " +
+                                               std::to_string(resumed));
+}
+
 void testConcurrentColdPrefixesComputeOnce() {
   test::EngineHarness h({.pages = 64});
   Executor &model = h.model;
@@ -2696,6 +2728,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testRunningReplyCheckpointIsDropped", testRunningReplyCheckpointIsDropped},
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
       {"testAReclaimWritesNoSupersededPoint", testAReclaimWritesNoSupersededPoint},
+      {"testATypedOnMessageResumesFromAOneTokenRead", testATypedOnMessageResumesFromAOneTokenRead},
       {"testARegenerateAfterAReclaimResumesAtItsPromptEnd", testARegenerateAfterAReclaimResumesAtItsPromptEnd},
       {"testATurnsKeptPointsAreCopiedTheDelayAfterItEnds", testATurnsKeptPointsAreCopiedTheDelayAfterItEnds},
       {"testFourConversationsKeepEachOthersPoints", testFourConversationsKeepEachOthersPoints},

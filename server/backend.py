@@ -190,8 +190,8 @@ class Job:
     retained_input: list | None = None
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
-    # Trailing prompt tokens of the chat template's generation prompt; zero
-    # when unknown.
+    # Trailing prompt tokens after the last message's text (its end of turn
+    # and the generation prompt, frontend._past_last_text); zero when unknown.
     generation_prompt_tokens: int = 0
     # Where the prompt's head (a system prompt and tools) ends; zero without
     # one (frontend._head_tokens).
