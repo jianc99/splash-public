@@ -786,7 +786,10 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # (docs/validate.md). Without --ple-memory the oracle loads
 # Qwen3.8-Flash-Next's PLE table whole (the weights then need 37555 MiB, M6
 # 11-03) where splash serve streams it; 237M is the row cache splash serve
-# gives it on the M6.
+# gives it on the M6. The fourth run holds the cache's checks to cached states in
+# the running format (--cached-states exact), where a cache hit is the cold
+# prefill's arithmetic, and runs a stop inside a decode cycle's block, which
+# takes runtimes of its own.
 ORACLE_ARGS ?=
 VISION_FIXTURE_FAMILY := import json, pathlib, sys; \
 	model = json.loads((pathlib.Path(sys.argv[1]) / "model.json").read_text()); \
@@ -804,6 +807,8 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --state-format bf16 \
 		--spill-buffers 2 $(ORACLE_ARGS)
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --spill-tokens 32768 --spill-window 64 $(ORACLE_ARGS)
+	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 --cached-states exact --cache-only \
+		$(ORACLE_ARGS)
 
 .PHONY: benchmark-backend \
 	benchmark-decode-profile benchmark-attention-sweep \
