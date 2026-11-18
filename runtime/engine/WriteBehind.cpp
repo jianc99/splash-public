@@ -7,17 +7,6 @@ WriteBehind::WriteBehind(Cache &cache) : cache_(cache), copying_(cache.persisten
 void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
   if (!cache_.kvTierWritable() || tokens < kMinimumTokens || queued_.contains(block))
     return;
-  // While copies wait for demand, the queue keeps only the points their
-  // conversations still resume from.
-  copying_ = copying();
-  if (!copying_)
-    std::erase_if(waiting_, [&](const Point &point) {
-      if (cache_.newestPoint(point.block))
-        return false;
-      queued_.erase(point.block);
-      ++counters_.unneeded;
-      return true;
-    });
   queued_.insert(block);
   waiting_.push_back({block, now + kDelayMilliseconds});
 }

@@ -472,11 +472,11 @@ private:
       const bool checkpoint = peeks_ && chance(30);
       cache_.publishCompositeState(block, std::make_shared<ShelvedState>(shelf_, false), checkpoint);
       // Half the checkpoints are replies' states, which a reply's decode
-      // captures, half of those kept, as its request's end keeps one.
+      // captures, half of those kept as a point, as its request's end keeps one.
       if (checkpoint && chance(50)) {
         cache_.markReply(cache_.checkpointState(block));
         if (chance(50))
-          cache_.keepReply(cache_.checkpointState(block));
+          cache_.keepReplyAsPoint(cache_.checkpointState(block));
       }
     }
   }

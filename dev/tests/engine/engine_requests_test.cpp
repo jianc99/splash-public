@@ -425,8 +425,15 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
   h.runUntilIdle();
   engine.submit(request(2, branch(6400, 900'000)));
   h.runUntilIdle();
-  require(test::evictStep(resources).gave() &&
-              resources.snapshot().stateCache.checkpointEntries == 0,
+  // The checkpoint leaves alone: an eviction would take the producer's resume point first, which the other
+  // conversation's replay point below it supersedes.
+  {
+    const CacheLookup checkpoint = resources.lookup(std::span(prompt).first(4097), {});
+    require(checkpoint.state && checkpoint.state->boundary() == 4096, "the other conversation left no checkpoint");
+    const uint64_t block = checkpoint.state->kvBlock();
+    resources.invalidateState(block);
+  }
+  require(resources.snapshot().stateCache.checkpointEntries == 0,
           "the other conversation's checkpoint was not evicted");
   engine.submit(request(3, prompt));
   double now = 1;
@@ -986,6 +993,82 @@ void testEndedReplyKeepsItsLastCheckpoint() {
   }
 }
 
+// Four conversations served turn by turn at a budget that holds the states of about two: a reply's capture takes
+// only buffers that are free, so no other conversation's kept point is pushed out to the SSD for a reply, and each
+// turn resumes at its prompt's replay point at least, reading the reply before it again where that reply got no
+// state.
+void testFourConversationsKeepEachOthersPoints() {
+  test::EngineHarness h({.pages = 1024, .pageBytes = 2, .tier = test::TierOptions{.capacity = 256, .transferLimit = 8},
+                         .memory = test::FakeMemory::Config{}, .limits = {.limitBytes = 600}});
+  h.model.offloadTier = std::make_shared<OffloadControl>();
+  h.model.offloadTier->ready = true;
+  h.model.restoreControl->ready = true;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  std::array<std::vector<uint32_t>, 4> prompts;
+  std::array<uint32_t, 4> replayPoints{};
+  for (uint32_t conversation = 0; conversation < 4; ++conversation) {
+    prompts[conversation].resize(97);
+    std::iota(prompts[conversation].begin(), prompts[conversation].end(), 1000 * (conversation + 1));
+  }
+  std::string missed;
+  uint64_t id = 0;
+  for (uint32_t turn = 1; turn <= 4; ++turn)
+    for (uint32_t conversation = 0; conversation < 4; ++conversation) {
+      std::vector<uint32_t> &prompt = prompts[conversation];
+      engine.submit(conversationTurn(++id, prompt, 70));
+      tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+      if (turn > 1 && events.starts.back() < replayPoints[conversation])
+        missed += " conversation " + std::to_string(conversation) + " turn " + std::to_string(turn) + " at " +
+                  std::to_string(events.starts.back()) + " not " + std::to_string(replayPoints[conversation]) + ";";
+      replayPoints[conversation] = static_cast<uint32_t>(prompt.size() - 7) / KvCache::pageTokens * KvCache::pageTokens;
+      prompt = nextTurn(prompt, 70);
+    }
+  require(!h.cache.snapshot().stateCache.promotions, "a conversation's kept point went to the SSD for another's reply");
+  require(missed.empty(), "a turn resumed before its prompt's replay point:" + missed);
+}
+
+// A conversation that renders its replies back, three turns with an SSD tier: a reclaim of every state not in use
+// writes only the conversation's newest point, its last reply's state, and the point before it, the last prompt's
+// replay point that a regenerate resumes from (StateCache::kKeptBehind); the fourth turn resumes at the newest from
+// the disk. Its earlier points go unwritten: before, a reclaim wrote the three prompts' replay points and dropped
+// the replies' states, so the fourth turn resumed at its prompt's last replay point and read the third reply
+// again.
+void testAReclaimWritesNoSupersededPoint() {
+  test::EngineHarness h({.pages = 64, .tier = test::TierOptions{.capacity = 64, .transferLimit = 8}});
+  h.model.offloadTier = std::make_shared<OffloadControl>();
+  h.model.offloadTier->ready = true;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  std::vector<uint32_t> prompt(97);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  for (uint64_t turn = 1; turn <= 3; ++turn) {
+    engine.submit(conversationTurn(turn, prompt, 70));
+    tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+    prompt = nextTurn(prompt, 70);
+  }
+  const StateCacheSnapshot before = h.cache.snapshot().stateCache;
+  // One state write at a time: each lands before the next reclaim.
+  for (uint32_t step = 0; step < 8; ++step) {
+    reclaimUpToInUse(h.cache);
+    static_cast<void>(h.cache.pollTransfers());
+  }
+  const StateCacheSnapshot after = h.cache.snapshot().stateCache;
+  require(after.offloads - before.offloads == 1 + StateCache::kKeptBehind,
+          "a reclaim wrote " + std::to_string(after.offloads - before.offloads) +
+              " states, not the newest and the points it keeps behind it");
+  h.model.restoreControl->ready = true;
+  engine.submit(conversationTurn(4, prompt, 1));
+  tickUntil(h, now, [&] { return idle(engine); }, "the fourth turn did not complete");
+  const uint32_t replyEnd = static_cast<uint32_t>(prompt.size() - 41) / KvCache::pageTokens * KvCache::pageTokens;
+  require(events.starts.back() == replyEnd,
+          "the fourth turn resumed from " + std::to_string(events.starts.back()) + ", not " + std::to_string(replyEnd));
+}
+
 // A finished request's KV holds part of the budget, so a later request's KV
 // meets the wall as it grows, where each wall test's budget puts it; captured
 // states are OffloadStates from then on, which reclaim may write to the SSD
@@ -1062,8 +1145,10 @@ void testCompletedReplyStateIsDroppedAtTheWall() {
 // 4,320 after a reclaim, restored from the SSD tier; so does turn 3, for
 // turn 4 at 6,464. A turn 2 that renders turn 1's reply otherwise leaves
 // its own opportunistic: after a reclaim turn 3 resumes from its replay
-// point at 2,208. Turns of 70 tokens keep none: after turn 2 resumed at 160,
-// a reclaim sends turn 3 to its replay point at 192.
+// point at 2,208. Turns of 70 tokens keep theirs too, whatever the reply's
+// length: after turn 2 resumed at 160, turn 3 resumes at its reply's end at
+// 256 after a reclaim, which wrote that state and dropped the replay points
+// it supersedes.
 void testRepliesAreKeptOnceAConversationRendersThemBack() {
   const auto starts = [](uint32_t output, std::vector<bool> reclaimAfter, bool otherwise = false) {
     test::EngineHarness h({.pages = 512});
@@ -1101,8 +1186,8 @@ void testRepliesAreKeptOnceAConversationRendersThemBack() {
           "a reclaim dropped the reply's state of a turn that resumed through a kept one");
   require(starts(2100, {false, true}, true) == Starts{0, 64, 2208},
           "a reclaim wrote the reply's state of a turn that rendered the reply before it otherwise");
-  require(starts(70, {false, true}) == Starts{0, 160, 192},
-          "a reclaim wrote the state of a reply too short to be worth a write");
+  require(starts(70, {false, true}) == Starts{0, 160, 256},
+          "a reclaim dropped the reply's state of a short reply that its conversation renders back");
 }
 
 // A capture at a page that holds a checkpoint already reuses it as it is: a
@@ -2488,6 +2573,8 @@ std::span<const test::TestCase> requestsTests() {
       {"testPreemptedReplyCheckpointIsDropped", testPreemptedReplyCheckpointIsDropped},
       {"testRunningReplyCheckpointIsDropped", testRunningReplyCheckpointIsDropped},
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
+      {"testAReclaimWritesNoSupersededPoint", testAReclaimWritesNoSupersededPoint},
+      {"testFourConversationsKeepEachOthersPoints", testFourConversationsKeepEachOthersPoints},
       {"testReplyCheckpointsAreNotWrittenAtTheWall", testReplyCheckpointsAreNotWrittenAtTheWall},
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},
       {"testRepliesAreKeptOnceAConversationRendersThemBack", testRepliesAreKeptOnceAConversationRendersThemBack},

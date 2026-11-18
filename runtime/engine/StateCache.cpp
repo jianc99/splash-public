@@ -110,7 +110,7 @@ bool StateCache::reuseStoredState(uint64_t kvBlock, bool checkpoint) {
     throw std::logic_error("composite state outlived its target KV block");
   }
   Entry &entry = found->second;
-  // A checkpoint's reuse leaves its reply as it was; makeOrdinary clears an ordinary one's.
+  // A checkpoint's reuse leaves its reply mark as it was; makeOrdinary clears an ordinary one's.
   if (!checkpoint)
     makeOrdinary(kvBlock, entry);
   if (!entry.pins)
@@ -231,18 +231,9 @@ void StateCache::markReply(StateCheckpoint checkpoint) noexcept {
   const auto found = entries_.find(checkpoint.kvBlock);
   if (found == entries_.end() || !found->second.checkpoint || found->second.publication != checkpoint.publication)
     return;
-  found->second.reply = Reply::Opportunistic;
+  found->second.opportunistic = true;
   kv_.noteReply(checkpoint.kvBlock);
   // A reclaim no longer writes it: it leaves its order of writes.
-  reindex(checkpoint.kvBlock, found->second);
-}
-
-void StateCache::keepReply(StateCheckpoint checkpoint) noexcept {
-  const auto found = entries_.find(checkpoint.kvBlock);
-  if (found == entries_.end() || found->second.publication != checkpoint.publication ||
-      found->second.reply != Reply::Opportunistic)
-    return;
-  found->second.reply = Reply::Kept;
   reindex(checkpoint.kvBlock, found->second);
 }
 
@@ -254,16 +245,19 @@ bool StateCache::checkpointPinned(StateCheckpoint checkpoint) const noexcept {
 
 void StateCache::makeOrdinary(uint64_t kvBlock, Entry &entry) {
   kv_.noteState(kvBlock);
-  if (!entry.checkpoint)
+  if (!entry.checkpoint) {
+    markSuperseded(kvBlock);
     return;
+  }
   --checkpointEntries_;
   checkpointBytes_ -= entry.ram ? entry.ram->bytes() : 0;
   entry.checkpoint = false;
-  entry.reply = Reply::None;
+  entry.opportunistic = false;
   // A crash before the next clean stop must not leave it a checkpoint the
   // next process retires.
   if (entry.disk && !entry.invalid)
     labelDisk(kvBlock, entry);
+  markSuperseded(kvBlock);
 }
 
 bool StateCache::contains(uint64_t kvBlock) const noexcept {
@@ -286,6 +280,89 @@ uint64_t StateCache::resumePoint() const noexcept {
 bool StateCache::ordinary(uint64_t kvBlock) const noexcept {
   const auto found = entries_.find(kvBlock);
   return found != entries_.end() && !found->second.invalid && !found->second.checkpoint;
+}
+
+bool StateCache::superseded(uint64_t kvBlock, uint32_t behind) const {
+  if (!kv_.stateBelow(kvBlock))
+    return false;
+  uint64_t branch = 0;
+  for (const uint64_t child : kv_.children(kvBlock))
+    if (holdsOrdinaryState(child)) {
+      if (branch)
+        return false;
+      branch = child;
+    }
+  if (!branch)
+    return false;
+  // Ordinary states nested below it on that branch, up to more than `behind`.
+  uint32_t deepest = 0;
+  std::vector<std::pair<uint64_t, uint32_t>> pending{{branch, 0}};
+  while (!pending.empty() && deepest <= behind) {
+    const auto [id, above] = pending.back();
+    pending.pop_back();
+    const uint32_t nested = above + (ordinary(id) ? 1 : 0);
+    deepest = std::max(deepest, nested);
+    if (kv_.stateBelow(id))
+      for (const uint64_t child : kv_.children(id))
+        pending.emplace_back(child, nested);
+  }
+  return deepest > behind;
+}
+
+bool StateCache::holdsOrdinaryState(uint64_t kvBlock) const {
+  std::vector<uint64_t> pending{kvBlock};
+  while (!pending.empty()) {
+    const uint64_t id = pending.back();
+    pending.pop_back();
+    if (ordinary(id))
+      return true;
+    // Only where a state lies below is there anything to find.
+    if (kv_.stateBelow(id)) {
+      const std::vector<uint64_t> children = kv_.children(id);
+      pending.insert(pending.end(), children.begin(), children.end());
+    }
+  }
+  return false;
+}
+
+void StateCache::markSuperseded(uint64_t kvBlock) {
+  const auto mark = [&](uint64_t id) {
+    const auto found = entries_.find(id);
+    if (found == entries_.end())
+      return;
+    const bool superseded = ordinary(id) && !found->second.branchPoint && this->superseded(id, kKeptBehind);
+    if (found->second.superseded == superseded)
+      return;
+    found->second.superseded = superseded;
+    reindex(id, found->second);
+  };
+  if (!kv_.contains(kvBlock))
+    return;
+  mark(kvBlock);
+  const std::vector<uint64_t> chain = kv_.chain(kvBlock).blocks;
+  uint32_t marked = 0;
+  for (auto above = chain.rbegin() + 1; above < chain.rend() && marked <= kKeptBehind; ++above)
+    if (ordinary(*above)) {
+      mark(*above);
+      ++marked;
+    }
+}
+
+void StateCache::markBranchPoint(uint64_t kvBlock) {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || found->second.checkpoint)
+    return;
+  found->second.branchPoint = true;
+  markSuperseded(kvBlock);
+}
+
+void StateCache::keepReplyAsPoint(StateCheckpoint checkpoint) {
+  const auto found = entries_.find(checkpoint.kvBlock);
+  if (found == entries_.end() || found->second.publication != checkpoint.publication ||
+      !found->second.opportunistic)
+    return;
+  makeOrdinary(checkpoint.kvBlock, found->second);
+  reindex(checkpoint.kvBlock, found->second);
 }
 
 uint64_t StateCache::bytes(uint64_t kvBlock) const noexcept {
@@ -551,6 +628,8 @@ void StateCache::adoptDisk(uint64_t kvBlock, std::shared_ptr<const CompositeStat
   kv_.countDiskState(kvBlock, true);
   entry.lastUsed = lastUsed;
   reindex(kvBlock, entry);
+  if (!checkpoint)
+    markSuperseded(kvBlock);
 }
 
 bool StateCache::promotable(uint64_t kvBlock, const CompositeState *source) const noexcept {
@@ -638,6 +717,8 @@ StateEviction StateCache::erase(uint64_t kvBlock, bool retirement) noexcept {
     ++checkpointRetirements_;
   else
     ++evictions_;
+  // An ordinary state that leaves can leave the one above it the newest of its conversation again.
+  markSuperseded(kvBlock);
   return {true};
 }
 
@@ -772,9 +853,11 @@ void StateCache::reindex(uint64_t kvBlock, Entry &target) noexcept {
   RecencyOrder::unlink(target.writeNode);
   const bool used = inUse(kvBlock);
   if (candidate(kvBlock, target)) {
-    (used ? inUse_ : target.checkpoint ? checkpoints_ : ordinary_).link(target.ramNode, target.lastUsed, kvBlock);
+    // A superseded state goes with the checkpoints, first.
+    const bool first = target.checkpoint || target.superseded;
+    (used ? inUse_ : first ? checkpoints_ : ordinary_).link(target.ramNode, target.lastUsed, kvBlock);
     if (writer(target))
-      (used ? inUseWrites_ : target.checkpoint ? checkpointWrites_ : ordinaryWrites_)
+      (used ? inUseWrites_ : first ? checkpointWrites_ : ordinaryWrites_)
           .link(target.writeNode, target.lastUsed, kvBlock);
   }
   if (target.disk && !writing(kvBlock) && !target.pins && !target.invalid)

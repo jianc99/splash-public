@@ -239,7 +239,10 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 30,664: -28, the governor's term for growth the host does not show yet
 # (MemoryGovernor.cpp, MemoryGovernor.hpp), which counted nothing.
 # 30,676: +12 for the automatic budget's unwired tenth (MemoryPlan.hpp).
-ENGINE_LINE_BUDGET = 30_676
+# 30,739: +63 for what a conversation keeps and what a reclaim drops unwritten
+# (StateCache.cpp 83, StateCache.hpp 22; Cache.cpp -27, Cache.hpp -1,
+# WriteBehind.cpp -11, WriteBehind.hpp -1, Engine.cpp -2).
+ENGINE_LINE_BUDGET = 30_739
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

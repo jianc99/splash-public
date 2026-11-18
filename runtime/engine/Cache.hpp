@@ -806,9 +806,12 @@ public:
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
-  // A reply's state, opportunistic or kept (StateCache::markReply).
+  // A reply's state, opportunistic (StateCache::markReply).
   void markReply(StateCheckpoint checkpoint) noexcept { states_.markReply(checkpoint); }
-  void keepReply(StateCheckpoint checkpoint) noexcept { states_.keepReply(checkpoint); }
+  // A reply's state that its conversation's next turn resumes from (StateCache::keepReplyAsPoint).
+  void keepReplyAsPoint(StateCheckpoint checkpoint) { states_.keepReplyAsPoint(checkpoint); }
+  // A junction's state (StateCache::markBranchPoint).
+  void markBranchPoint(uint64_t block) { states_.markBranchPoint(block); }
   // This exact disposable publication is pinned: retireCheckpointState
   // refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {
@@ -1474,8 +1477,6 @@ private:
   uint32_t fitDiskLimit();
   // A persistent tier's label for the block's disk copy.
   void labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot);
-  // Ordinary states below the block sit on exactly one of its branches.
-  [[nodiscard]] bool superseded(uint64_t block) const;
   // What a copy of the block takes of the quota: its slot's bytes, or
   // without a copy what a slot of its page's form takes; nothing for a block
   // with neither, which holds nothing to write.
@@ -1503,8 +1504,6 @@ private:
   // full quota gives those up as well. Without a disk budget the tier's
   // slots bound it.
   [[nodiscard]] bool pointFits(const PersistCursor &point) const;
-  // An ordinary state at the block or anywhere below it.
-  [[nodiscard]] bool holdsOrdinaryState(uint64_t block) const;
   void startRestore(uint64_t block);
   // By form, whether evicting the walk's KV may empty an extent
   // (Walk::reaches): of the pages its class may reuse (reusablePages), the
