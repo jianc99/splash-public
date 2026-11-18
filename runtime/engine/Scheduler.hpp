@@ -129,7 +129,7 @@ struct SchedulerSnapshot final {
 // One single-owner scheduling policy.
 //
 // Prefill takes the ready lanes of the most urgent priority. Within it a
-// request that kMaximumOvertakes prefill commands in a row served later
+// request that a runtime's lanes less one prefill commands in a row served later
 // arrivals of its priority and not it, with a lane or waiting for one, is
 // overdue and leads, the oldest first, until a command serves it; otherwise
 // the lane of the fewest remaining rows leads, ties in submission order. A
@@ -263,7 +263,7 @@ private:
     uint64_t order = 0;
     uint64_t lastDecodeDispatch = 0;
     // The prefill commands of its priority in a row that served later
-    // arrivals and not it, up to kMaximumOvertakes, at which it is overdue;
+    // arrivals and not it, up to the runtime's lanes less one, at which it is overdue;
     // none once a command serves it or its prompt completes.
     uint32_t overtaken = 0;
     // The prompt position its committed rows reach in prefillRows, never

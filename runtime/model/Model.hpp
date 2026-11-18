@@ -740,6 +740,12 @@ struct ModelMemoryPlan final {
   uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
+  // The lanes the arenas hold (QwenTargetGeometry::lanes).
+  uint32_t lanes = ExecutionLimits::maximumBatchWidth;
+  // The arenas of ExecutionLimits::plannedLanes lanes, which a start's
+  // minimum holds: one that holds no more runs four lanes. None: the arenas
+  // above.
+  uint64_t minimumArenaBytes = 0;
 };
 
 // Fixed reserves the memory plan carries beside the planned arenas: Metal

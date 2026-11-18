@@ -61,6 +61,8 @@ struct StreamedMemoryInputs final {
   uint64_t activeLimitBytes = 0;
   // The pages of a prefill group's rows (model::kPrefillGroupChunks chunks).
   uint32_t groupPages = 0;
+  // The runtime's lanes, whose floors the hot block cache holds at most.
+  uint32_t lanes = model::ExecutionLimits::plannedLanes;
 };
 
 // The stores the plan streams the parts through, zero for a part that loads

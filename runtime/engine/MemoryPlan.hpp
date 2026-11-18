@@ -429,4 +429,8 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                          const ModelMemoryProfile &model,
                          uint64_t maximumMemoryBytes);
 
+// Whether `eight`, a plan with eight lanes' arenas beside what made `four`, four lanes' plan, offers its context and
+// spills as it does; a start keeps four lanes where not.
+[[nodiscard]] bool eightLanesHold(const EngineMemoryPlan &four, const EngineMemoryPlanResult &eight) noexcept;
+
 } // namespace splash::engine

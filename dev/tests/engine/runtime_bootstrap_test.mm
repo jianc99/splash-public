@@ -603,8 +603,8 @@ void testReadyEventForTheServedModel() {
   engine.maxContext = 73721;
   engine.maxImagePatches = 16384;
   const protocol::ReadyEvent vision =
-      readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext));
-  require(vision == protocol::ReadyEvent{model::ExecutionLimits::maximumBatchWidth, 73721, true, 150144, {150001, 150003, 150005, 150018}, 17},
+      readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext), 8);
+  require(vision == protocol::ReadyEvent{8, 73721, true, 150144, {150001, 150003, 150005, 150018}, 17},
           "Ready did not announce what a start serving Flint with images serves");
   model::ModelDescriptor dense;
   dense.target = model::Qwen3_8Layout{};
@@ -612,8 +612,8 @@ void testReadyEventForTheServedModel() {
   engine.maxContext = 262144;
   engine.maxImagePatches = 0;
   const protocol::ReadyEvent text =
-      readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext));
-  require(text == protocol::ReadyEvent{model::ExecutionLimits::maximumBatchWidth, 262144, false, 248320, {248044, 248046}, 17},
+      readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext), 4);
+  require(text == protocol::ReadyEvent{4, 262144, false, 248320, {248044, 248046}, 17},
           "Ready did not announce what a start serving a model without images serves");
 }
 

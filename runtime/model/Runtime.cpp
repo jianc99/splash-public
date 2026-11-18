@@ -236,9 +236,9 @@ StateAdmission laneAdmission(uint32_t lane, const metal::AllocationResult &resul
 // Any unassigned lane works: its buffers come from the storage's pool, and
 // the governor is asked only for what the pool lacks.
 template <class Activate>
-StateAdmission admitIdleLane(const QwenStateStorage &states,
+StateAdmission admitIdleLane(const QwenStateStorage &states, uint32_t lanes,
                              Activate activate) {
-  for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
+  for (uint32_t lane = 0; lane < lanes; ++lane) {
     if (!states.metadata(lane).assigned())
       return activate(lane);
   }
@@ -712,7 +712,7 @@ struct Runtime::Impl {
       : backend(value.backend),
         model(value.model),
         geometry(RuntimeGeometry::from(value.model, value.kvPages.layout().format, value.stateStorage.layout().target,
-                                       StreamedParts::loaded(value.model, value.blockCache != nullptr))),
+                                       StreamedParts::loaded(value.model, value.blockCache != nullptr), value.lanes)),
         operators(value.operators),
         kvPages(value.kvPages),
         states(value.stateStorage),
@@ -735,7 +735,7 @@ struct Runtime::Impl {
     prefillArena = std::make_unique<PrefillArena>(backend, geometry, operators);
     decodeArena = std::make_unique<DecodeArena>(backend, geometry, operators);
     penaltyTable =
-        decodeArena->batchSlice(DecodeTensor::PenaltyState, kLaneCount);
+        decodeArena->all(DecodeTensor::PenaltyState);
     // A decode step's classes, up to the rows a step runs in one pass: a
     // streamed expert store's round (a 48-row step on a 32-row store takes a
     // second round, +30% a step), else a verify block a lane. Under
@@ -755,7 +755,7 @@ struct Runtime::Impl {
         costLine.emplace(stepClasses);
       } else {
         stepCosts.emplace(stepClasses, mostStepRows, geometry.target.ffnKind == QwenFfnKind::SparseMoe);
-        for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
+        for (uint32_t lanes = 1; lanes <= geometry.target.lanes; ++lanes) {
           const std::optional<std::string> line = value.recallStepCosts ? value.recallStepCosts(lanes) : std::nullopt;
           if (!line)
             continue;
@@ -1455,7 +1455,7 @@ struct Runtime::Impl {
 
   // A completed cycle's lane's retained tokens, from its first row.
   const uint32_t *retainedTokens(const DecodeLaneResult &lane) const {
-    return contents<uint32_t>(decodeArena->batchSlice(DecodeTensor::OutputTokens, kLaneCount),
+    return contents<uint32_t>(decodeArena->all(DecodeTensor::OutputTokens),
                               "target output tokens") +
            lane.rows.first;
   }
@@ -1563,7 +1563,7 @@ struct Runtime::Impl {
       path &= path - 1;
     const uint32_t vocabulary = geometry.target.vocabularySize;
     const std::span<const float> row(
-        contents<float>(decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "unselectable logits") +
+        contents<float>(decodeArena->all(DecodeTensor::Logits), "unselectable logits") +
             (uint64_t{first} + std::countr_zero(path)) * vocabulary,
         vocabulary);
     uint32_t nan = 0, positive = 0, negative = 0;
@@ -1604,7 +1604,7 @@ struct Runtime::Impl {
       return;
     graph.host([this, lanes, verify] {
       const uint64_t vocabulary = geometry.target.vocabularySize;
-      const float *logits = contents<float>(decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "logits");
+      const float *logits = contents<float>(decodeArena->all(DecodeTensor::Logits), "logits");
       capturedTargetLogits.resize(lanes);
       for (uint32_t lane = 0; lane < lanes; ++lane) {
         const ops::LaneRows rows = verify ? laneRows(lane) : ops::LaneRows{lane, 1};
@@ -1625,9 +1625,9 @@ struct Runtime::Impl {
   void encodeInitialSelections(CommandGraph &graph,
                                std::span<const InitialSelection> lanes,
                                uint32_t width) {
-    targetModel->addHeadBatch(graph, decodeArena->lanesRows(TargetTensor::Hidden0, kLaneCount),
-                             decodeArena->batchSlice(DecodeTensor::FinalHidden, kLaneCount),
-                             decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), width,
+    targetModel->addHeadBatch(graph, decodeArena->lanesRows(TargetTensor::Hidden0, decodeArena->lanes()),
+                             decodeArena->all(DecodeTensor::FinalHidden),
+                             decodeArena->all(DecodeTensor::Logits), width,
                              decodeArena->linearScratch());
     if (std::ranges::none_of(lanes, &InitialSelection::select))
       return;
@@ -2685,11 +2685,11 @@ struct Runtime::Impl {
     buffers.laneRows = decodeArena->batchSlice(DecodeTensor::LaneLayout, lanes);
     QwenTargetDecodeBuffers decode;
     decode.step = step;
-    decode.gdnTape = decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount);
+    decode.gdnTape = decodeArena->all(DecodeTensor::GdnTape);
     decode.tree = decodeArena->batchSlice(DecodeTensor::TreeRows, lanes);
-    decode.capturedTargetHidden = decodeArena->batchSlice(DecodeTensor::CapturedTargetHidden, kLaneCount);
-    decode.finalHidden = decodeArena->batchSlice(DecodeTensor::FinalHidden, kLaneCount);
-    decode.logits = decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount);
+    decode.capturedTargetHidden = decodeArena->all(DecodeTensor::CapturedTargetHidden);
+    decode.finalHidden = decodeArena->all(DecodeTensor::FinalHidden);
+    decode.logits = decodeArena->all(DecodeTensor::Logits);
     std::array<QwenTargetPrefillSequence, kLaneCount> sequences{};
     for (uint32_t lane = 0; lane < kLaneCount; ++lane) {
       Request &entry = laneEntry(entries, lane);
@@ -2861,12 +2861,12 @@ struct Runtime::Impl {
                      const MetalBuffer &window, uint32_t rows, uint32_t position, const ops::StepRows &step) const {
     targetModel->addStateFold(graph,
                               {decodeArena->get(lane, DecodeTensor::RetainedRows), states.next(stateLane).stateBase,
-                               decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
+                               decodeArena->all(DecodeTensor::GdnTape),
                                decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1), fold},
                               rows);
     // The window takes the first rows of the lane's retained path, which
     // its capture holds when the lane retained them.
-    ops::DraftAttention::addWindowCommit(graph, decodeArena->batchSlice(DecodeTensor::ContextHidden, kLaneCount),
+    ops::DraftAttention::addWindowCommit(graph, decodeArena->all(DecodeTensor::ContextHidden),
                                          window, decodeArena->get(lane, DecodeTensor::RetainedRows),
                                          decodeArena->get(lane, DecodeTensor::LaneLayout), step.rows, rows, position,
                                          geometry.draft.hiddenSize);
@@ -3179,11 +3179,11 @@ struct Runtime::Impl {
           // first, each with its parent row.
           const ops::LaneRows block = impl_.laneRows(lane);
           const uint32_t *rows =
-              contents<uint32_t>(impl_.decodeArena->batchSlice(DecodeTensor::InputTokens, kLaneCount),
+              contents<uint32_t>(impl_.decodeArena->all(DecodeTensor::InputTokens),
                                  "constrained verify rows") +
               block.first;
           const ops::TreeRow *tree =
-              contents<ops::TreeRow>(impl_.decodeArena->batchSlice(DecodeTensor::TreeRows, kLaneCount),
+              contents<ops::TreeRow>(impl_.decodeArena->all(DecodeTensor::TreeRows),
                                      "constrained verify tree") +
               block.first;
           entry.maskWords.clear();
@@ -3381,7 +3381,7 @@ void Runtime::beginColdRequest(const ModelRequest &request,
 StateAdmission Runtime::begin(const ModelRequest &request) {
   Impl::VisionRollback rollback{*impl_, impl_->vision};
   StateAdmission admission = admitIdleLane(
-      impl_->states, [&](uint32_t lane) { return beginAt(request, lane); });
+      impl_->states, impl_->geometry.target.lanes, [&](uint32_t lane) { return beginAt(request, lane); });
   rollback.committed = admission.granted();
   return admission;
 }
@@ -3418,7 +3418,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
   }
   Impl::VisionRollback rollback{*impl_, impl_->vision};
   std::vector<Impl::ImageState> images;
-  StateAdmission admission = admitIdleLane(impl_->states, [&](uint32_t lane) {
+  StateAdmission admission = admitIdleLane(impl_->states, impl_->geometry.target.lanes, [&](uint32_t lane) {
     return impl_->activate(request, lane, images);
   });
   if (admission.granted()) {
@@ -3436,7 +3436,7 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
 }
 
 StateAdmission Runtime::beginAt(const ModelRequest &request, uint32_t stateLane) {
-  if (!request.id || stateLane >= kLaneCount || request.prompt.empty()) {
+  if (!request.id || stateLane >= impl_->geometry.target.lanes || request.prompt.empty()) {
     throw std::invalid_argument("invalid executor request activation");
   }
   if (impl_->requests.contains(request.id)) {
@@ -4291,7 +4291,7 @@ double Runtime::measureDecodeSteps(uint32_t width) {
   const std::vector<ops::StepRows> steps = impl_->stepCosts->steps(width);
   const auto answer = static_cast<uint32_t>(steps.size()) * ExecutionLimits::targetVerifyRows;
   const uint32_t lanePages = StepCosts::lanePages(steps.size());
-  const auto stateLane = [](uint32_t lane) { return ExecutionLimits::maximumBatchWidth - 1 - lane; };
+  const auto stateLane = [&](uint32_t lane) { return impl_->geometry.target.lanes - 1 - lane; };
   const std::optional<Impl::ForcedStep> forced = impl_->forcedStep;
   std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
   for (uint32_t lane = 0; lane < width; ++lane) {
@@ -4348,15 +4348,16 @@ double Runtime::measureDecodeSteps(uint32_t width) {
 }
 
 WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
-  if (!width || width > ExecutionLimits::maximumBatchWidth) {
+  if (!width || width > impl_->geometry.target.lanes) {
     throw std::invalid_argument("invalid decode warmup width");
   }
   constexpr uint64_t firstId = std::numeric_limits<uint64_t>::max() - 110;
   // Plan order is deliberately unrelated to state-lane order: DecodeArena
   // lanes follow the BatchPlan, while recurrent and KV state stay addressed
   // by each request's state lane, so plan lane k runs on state lane
-  // maximumBatchWidth - 1 - k and batching never assumes lanes 0..width-1.
-  const auto stateLane = [](uint32_t lane) { return ExecutionLimits::maximumBatchWidth - 1 - lane; };
+  // lanes - 1 - k (QwenTargetGeometry::lanes) and batching never assumes lanes
+  // 0..width-1.
+  const auto stateLane = [&](uint32_t lane) { return impl_->geometry.target.lanes - 1 - lane; };
   double wallSeconds = 0.0;
   std::vector<WarmupLaneResult> lanes;
   std::array<std::vector<uint32_t>, ExecutionLimits::maximumBatchWidth> pages;
@@ -4604,10 +4605,12 @@ namespace {
 // The lane state of a model of `descriptor` in `stateFormat` and the arenas
 // of `geometry`.
 ModelMemoryPlan memoryPlanOf(const ModelDescriptor &descriptor, ops::GdnStateFormat stateFormat,
-                             const RuntimeGeometry &geometry, const ops::ExecutionPlans &operators) {
+                             const RuntimeGeometry &geometry, const RuntimeGeometry &four,
+                             const ops::ExecutionPlans &operators) {
   CompositeStateLayout states = descriptor.stateLayout;
   states.target.format = stateFormat;
-  return {states.laneBytes(), plannedPrefillBytes(geometry, operators), plannedDecodeBytes(geometry, operators)};
+  return {states.laneBytes(), plannedPrefillBytes(geometry, operators), plannedDecodeBytes(geometry, operators),
+          geometry.target.lanes, plannedPrefillBytes(four, operators) + plannedDecodeBytes(four, operators)};
 }
 
 } // namespace
@@ -4615,18 +4618,22 @@ ModelMemoryPlan memoryPlanOf(const ModelDescriptor &descriptor, ops::GdnStateFor
 ModelMemoryPlan plannedRuntimeMemory(const LoadedModel &model,
                                      const ops::ExecutionPlans &operators,
                                      kv::Format kvFormat,
-                                     ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts, uint32_t lanes) {
   requireCompatibleModel(model);
-  return memoryPlanOf(model.descriptor, stateFormat, RuntimeGeometry::from(model, kvFormat, stateFormat, parts),
+  return memoryPlanOf(model.descriptor, stateFormat, RuntimeGeometry::from(model, kvFormat, stateFormat, parts, lanes),
+                      RuntimeGeometry::from(model, kvFormat, stateFormat, parts, ExecutionLimits::plannedLanes),
                       operators);
 }
 
 ModelMemoryPlan plannedRuntimeMemory(const ModelDescriptor &descriptor, const QwenTargetGeometry &target,
                                      const ops::ExecutionPlans &operators, kv::Format kvFormat,
-                                     ops::GdnStateFormat stateFormat, StreamedParts parts) {
+                                     ops::GdnStateFormat stateFormat, StreamedParts parts, uint32_t lanes) {
   return memoryPlanOf(
       descriptor, stateFormat,
-      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts), operators);
+      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts, lanes),
+      RuntimeGeometry::from(descriptor, descriptor.draft, target, kvFormat, stateFormat, parts,
+                            ExecutionLimits::plannedLanes),
+      operators);
 }
 
 std::unique_ptr<RuntimeModel> createRuntime(RuntimeContext context) {
@@ -4642,7 +4649,7 @@ std::span<const float> RuntimeInstrumentation::lastLogits(const Runtime &runtime
   const Runtime::Impl &impl = *runtime.impl_;
   const ops::LaneRows rows = impl.laneRows(lane);
   const uint64_t vocabulary = impl.geometry.target.vocabularySize;
-  return {contents<float>(impl.decodeArena->batchSlice(DecodeTensor::Logits, kLaneCount), "logits") +
+  return {contents<float>(impl.decodeArena->all(DecodeTensor::Logits), "logits") +
               rows.first * vocabulary,
           rows.rows * vocabulary};
 }
@@ -4730,7 +4737,7 @@ std::vector<uint8_t> RuntimeInstrumentation::pendingGdnRows(const Runtime &runti
   }};
   // The latest step's slot is the one the lane's next step folds from.
   const uint8_t *slot =
-      contents<const uint8_t>(impl.decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount), "GDN tape") +
+      contents<const uint8_t>(impl.decodeArena->all(DecodeTensor::GdnTape), "GDN tape") +
       impl.decodeArena->gdnTapeSlot(entry.stateLane, metadata.activeParity);
   std::vector<uint8_t> rows;
   for (uint32_t layer = 0; layer < impl.geometry.target.stateLayout.layers; ++layer) {

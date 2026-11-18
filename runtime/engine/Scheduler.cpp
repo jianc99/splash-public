@@ -14,10 +14,6 @@ constexpr uint32_t kMinimumPrefillRows = 64;
 // where more (the Neural Engine FFN split's least chunk): smaller cuts lose
 // prefill throughput (17% fewer rows a second on an M6 below 512 rows).
 constexpr uint32_t kFloorRows = 512;
-// A request yields to later arrivals of its priority at most this many
-// prefill commands in a row: the other lanes of a full batch, each finishing
-// one short prompt.
-constexpr uint32_t kMaximumOvertakes = model::ExecutionLimits::maximumBatchWidth - 1;
 // A Background request held back this long, unserved since its first tick, its
 // last command or its last suspension, is ordered as Normal, so that attended
 // work cannot starve it. On the 35B (a 64 GB M5 Pro) a chat's title alone takes
@@ -446,7 +442,7 @@ Scheduler::Lane Scheduler::lane(const Request &request, uint32_t processed, cons
           .priority = priorityOf(request),
           .processed = processed,
           .shape = shapeOf(request.spec.id, in),
-          .overdue = request.overtaken >= kMaximumOvertakes};
+          .overdue = request.overtaken + 1 >= config_.limits.lanes};
 }
 
 std::vector<model::PrefillLane> Scheduler::prefillLanes(std::span<const BatchItem> items,
@@ -575,7 +571,7 @@ std::optional<Scheduler::Planned> Scheduler::planPrefill(std::vector<Lane> ready
   };
   std::vector<Lane> members{leader};
   for (auto view = ready.begin() + 1; view != ready.end(); ++view) {
-    if (view->priority != tier || lanes.size() == model::ExecutionLimits::maximumBatchWidth)
+    if (view->priority != tier || lanes.size() == config_.limits.lanes)
       break;
     // A lane that runs in passes joins only a command that does.
     if (groups(*view) && !group)
@@ -631,7 +627,7 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
         request->decodeStage != decodeStage)
       continue;
     plan.items.push_back({request->spec.id, 0, 0});
-    if (plan.width() == model::ExecutionLimits::maximumBatchWidth)
+    if (plan.width() == config_.limits.lanes)
       break;
   }
   return plan;
@@ -639,7 +635,7 @@ std::optional<BatchPlan> Scheduler::nextDecode(std::span<const uint64_t> exclude
 
 void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
   if (active_ || plan.empty() ||
-      plan.width() > model::ExecutionLimits::maximumBatchWidth) {
+      plan.width() > config_.limits.lanes) {
     throw std::logic_error("invalid scheduler commit");
   }
   const bool prefill = plan.kind == WorkKind::Prefill;
@@ -682,7 +678,7 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
     // A command, its passes one, serves its lanes, joiners too: each starts
     // its count again. It overtakes the other requests of its priority
     // submitted before a lane it serves, with a lane or waiting for one: one
-    // overtaken kMaximumOvertakes times in a row is overdue until a command
+    // overtaken its lanes less one times in a row (a full batch's other lanes) is overdue until a command
     // serves it. Lanes the command is planned without are blocked, not
     // passed over.
     uint64_t youngestServed = 0;
@@ -695,7 +691,7 @@ void Scheduler::commit(const BatchPlan &plan, const PlanInputs &in) {
         continue;
       if (holds(plan.items, id))
         request.overtaken = 0;
-      else if (request.order < youngestServed && request.overtaken < kMaximumOvertakes)
+      else if (request.order < youngestServed && request.overtaken + 1 < config_.limits.lanes)
         ++request.overtaken;
     }
   } else if (!prefill) {

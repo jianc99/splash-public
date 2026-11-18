@@ -102,6 +102,10 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       std::ranges::copy(captureLayers, captureLayerValues.begin());
   }
 
+  // The lanes the runtime runs, the most requests at once, which its arenas
+  // and a target's own scratch hold: eight, or the four a start keeps where
+  // eight lanes' arenas would cost context (engine::eightLanesHold).
+  uint32_t lanes = ExecutionLimits::maximumBatchWidth;
   // The format of the sparse MoE blocks' routers, which their plans follow
   // (ops::moeRouterFormat).
   uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;

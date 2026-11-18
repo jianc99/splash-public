@@ -363,6 +363,34 @@ void checkDecodeArenaPages(const model::LoadedModel &loaded) {
   }
 }
 
+// Four lanes' arenas are main's before a step took eight lanes, to the
+// byte, on Apple9 and on Apple10 and later, int8 and BF16 K/V alike: a start
+// that keeps four lanes (engine::eightLanesHold) plans what main did. Eight
+// lanes' hold more: each lane's tensors, its GDN tape and its logits most.
+void checkFourLanesAreMains(const char *name, const model::LoadedModel &loaded, uint64_t decode9, uint64_t decode10,
+                            uint64_t prefill9, uint64_t prefill10) {
+  const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
+  for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+    const auto four = model::RuntimeGeometry::from(loaded, format, ops::GdnStateFormat::Float32, parts,
+                                                   model::ExecutionLimits::plannedLanes);
+    const auto eight = model::RuntimeGeometry::from(loaded, format, ops::GdnStateFormat::Float32, parts, 8);
+    for (uint32_t family : {9U, 10U, 11U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = 20;
+      const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+      require(model::plannedDecodeBytes(four, plans) == (family == 9 ? decode9 : decode10) &&
+                  model::plannedPrefillBytes(four, plans) == (family == 9 ? prefill9 : prefill10),
+              std::string(name) + "'s four lanes' arenas are not main's on Apple" + std::to_string(family));
+      require(model::plannedDecodeBytes(eight, plans) > model::plannedDecodeBytes(four, plans),
+              std::string(name) + "'s eight lanes' arenas hold no more than four's");
+    }
+  }
+  rejects([&] { static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                               parts, model::ExecutionLimits::maximumBatchWidth + 1)); },
+          "invalid model runtime lanes", "a runtime of more lanes than a step holds was planned");
+}
+
 // A model served with YaRN reaches the runtime's geometry with its scaling
 // and the window it serves, which everything sized by the context follows; a
 // descriptor whose window is not the one its scaling serves is refused.
@@ -604,6 +632,16 @@ int main() {
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    // The arenas main planned before a step took eight lanes (d1c6acebe).
+    checkFourLanesAreMains("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), 450'576'384,
+                                                  434'864'128, 746'455'040, 730'349'568);
+    checkFourLanesAreMains("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(),
+                                                     279'281'664, 273'874'944, 539'017'216, 533'446'656);
+    checkFourLanesAreMains(
+        "Qwen3.5-122B-A10B", loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()),
+        462'028'800, 455'098'368, 887'439'360, 880'263'168);
+    checkFourLanesAreMains("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>(),
+                                                   409'796'608, 403'963'904, 1'124'614'144, 1'118'781'440);
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>());

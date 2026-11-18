@@ -79,7 +79,7 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
 // tableBytes), as they allocate them: the hot block cache's at a target of
 // `hotTargetBytes` and one for each of `buffers` buffers of staged history.
 uint64_t readerTableBytes(const StreamedMemoryInputs &in, uint64_t hotTargetBytes, uint32_t buffers) {
-  return model::KvBlockCache::tableBytes(in.kvLayout, *in.sparseKv, hotTargetBytes) +
+  return model::KvBlockCache::tableBytes(in.kvLayout, *in.sparseKv, hotTargetBytes, in.lanes) +
          buffers * model::KvHistoryStream::tableBytes(in.kvLayout);
 }
 
@@ -159,7 +159,7 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   spill.laneSlots = shape.laneSlots();
   spill.hotFloorBytes = spill.hotTargetBytes = spillFloors.hotFloorBytes;
   spill.hotLimitBytes = extentsBytes(
-      layout, shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+      layout, shape.requiredSlots(in.lanes) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
       layout.kvBytesPerModelPage());
   spill.indexRunwayBytes = spillFloors.indexRunwayBytes;
   spill.stagingBytes = spillFloors.stagingBytes(spill.floorTokens, spill.stagingBuffers);

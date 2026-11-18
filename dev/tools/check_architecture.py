@@ -249,7 +249,11 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 30,809: +17 for a state at the end of a prompt's head (Engine.cpp 5,
 # Protocol.hpp 4, Protocol.cpp 4, Types.hpp 3, NativeRuntime.cpp 1).
 # 30,808: -1 for write-behind's clock clamps (WriteBehind.cpp -1).
-ENGINE_LINE_BUDGET = 30_808
+# 30,844: +36 for eight lanes only where their arenas cost no context
+# (RuntimeResources.mm 25, MemoryPlan.cpp 9, MemoryPlan.hpp 3,
+# StreamedMemoryPlan.hpp 2, StreamedMemoryPlan.cpp 1, Bootstrap.mm 1;
+# Scheduler.cpp -4, Bootstrap.hpp -1).
+ENGINE_LINE_BUDGET = 30_844
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

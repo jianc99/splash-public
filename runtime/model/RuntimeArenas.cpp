@@ -14,7 +14,7 @@ std::array<uint64_t, targetTensorCount> targetTensorBytes(const QwenTargetGeomet
   const uint64_t rows = shape.rows;
   // Each of a chunk's sequences stages its rows in whole KV blocks
   // (ops::PagedAttention), the last of each block's rows unused.
-  const uint64_t stagedRows = rows + uint64_t{kLaneCount} * (kTileRows - 1);
+  const uint64_t stagedRows = rows + uint64_t{shape.lanes} * (kTileRows - 1);
   put(TargetTensor::Hidden0, bytesFor<uint16_t>(rows * target.hiddenSize));
   put(TargetTensor::Hidden1, bytesFor<uint16_t>(rows * target.hiddenSize));
   put(TargetTensor::Normalized, bytesFor<uint16_t>(rows * target.hiddenSize));
@@ -57,6 +57,7 @@ TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::Executi
   const QwenTargetGeometry &target = geometry.target;
   TargetRows shape{.rows = kPrefillRows,
                    .chunks = geometry.prefillChunks,
+                   .lanes = geometry.target.lanes,
                    // Any one sequence's splits: a chunk's sequences share the
                    // workspace in turn where they do not fit together.
                    .attention = operators.sequenceAttentionWorkspace(target.attentionQueryHeads, target.kvLayout),
@@ -74,7 +75,8 @@ TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::Executio
   const ops::AttentionWorkspace lane = operators.laneAttentionWorkspace(target.attentionQueryHeads, target.kvLayout);
   TargetRows shape{.rows = kDecodeStepRows,
                    .chunks = 1,
-                   .attention = {lane.partialsBytes * kLaneCount, lane.statisticsBytes * kLaneCount},
+                   .lanes = geometry.target.lanes,
+                   .attention = {lane.partialsBytes * geometry.target.lanes, lane.statisticsBytes * geometry.target.lanes},
                    .moe = {}};
   if (target.ffnKind == QwenFfnKind::SparseMoe)
     shape.moe = operators.moeWorkspace(target.moeShape(), target.moeRouterFormat, kDecodeStepRows);
@@ -100,7 +102,7 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   put(PrefillTensor::TargetPositions,
       bytesFor<uint32_t>(uint64_t{kPrefillRows} * 3));
   put(PrefillTensor::DraftPositions, bytesFor<uint32_t>(kPrefillRows));
-  put(PrefillTensor::LaneLayout, bytesFor<SplashLaneRows>(kLaneCount));
+  put(PrefillTensor::LaneLayout, bytesFor<SplashLaneRows>(geometry.target.lanes));
   put(PrefillTensor::TargetInverseFrequencies,
       bytesFor<float>(geometry.target.rotaryPairs));
   put(PrefillTensor::DraftInverseFrequencies,
@@ -281,10 +283,10 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
 uint64_t decodeArenaBaseBytes(const RuntimeGeometry &geometry,
                              const ops::ExecutionPlans &operators) {
   uint64_t bytes = TargetArena::bytes(geometry.target, decodeTargetRows(geometry, operators));
-  for (uint64_t value : decodeTensorBytes(geometry, operators)) {
-    bytes = checkedAdd(
-        bytes, alignUp(checkedMultiply(value, kLaneCount, "decode tensor")),
-        "decode arena");
+  const auto sizes = decodeTensorBytes(geometry, operators);
+  for (uint32_t tensor = 0; tensor < sizes.size(); ++tensor) {
+    const uint32_t shares = decodeTensorLanes(static_cast<DecodeTensor>(tensor), geometry.target.lanes);
+    bytes = checkedAdd(bytes, alignUp(checkedMultiply(sizes[tensor], shares, "decode tensor")), "decode arena");
   }
   return bytes;
 }
@@ -305,7 +307,7 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
        {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
        {d.selectorRank, d.hiddenSize}})
-    result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDraftRows));
+    result.include(operators.draftLinear().scratchSize(shape, geometry.target.lanes * kDraftRows));
   return result;
 }
 
