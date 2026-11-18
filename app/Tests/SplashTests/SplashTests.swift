@@ -34,10 +34,20 @@ struct CatalogTests {
     @Test func namesModels() {
         #expect(catalog.name(of: "a/Big-MLX") == "Big")
         #expect(catalog.name(of: "someone/Other-GGUF:Q8_0") == "Other")
-        #expect(catalog.name(of: "someone/Other-4bit") == "Other-4bit")
+        #expect(catalog.name(of: "someone/Other-4bit") == "Other")
         #expect(Catalog.variant(of: "someone/Other-GGUF:Q8_0") == "Q8_0")
-        #expect(Catalog.variant(of: "mlx-community/Other-4bit") == "MLX")
-        #expect(Catalog.variant(of: "someone/Other-4bit") == "Other-4bit")
+        #expect(Catalog.variant(of: "mlx-community/Other-4bit") == "4bit")
+        #expect(Catalog.variant(of: "mlx-community/Other") == "MLX")
+        #expect(Catalog.variant(of: "someone/Other") == "Other")
+        // The words after a model's name that say how its weights are stored go to its variant.
+        let long = "mlx-community/DeepSeek-R2-Distill-Qwen3.6-35B-A3B-Instruct-128K-MLX-4bit-DWQ"
+        #expect(catalog.name(of: long) == "DeepSeek-R2-Distill-Qwen3.6-35B-A3B-Instruct")
+        #expect(Catalog.variant(of: long) == "128K-MLX-4bit-DWQ")
+        #expect(catalog.name(of: "unsloth/gemma-3-27b-it-qat-GGUF:Q4_K_M") == "gemma-3-27b-it")
+        #expect(catalog.name(of: "someone/Llama-3.1-8B-Instruct-bf16") == "Llama-3.1-8B-Instruct")
+        #expect(catalog.name(of: "someone/Qwen3-8B-Q4_K_M") == "Qwen3-8B")
+        #expect(catalog.name(of: "someone/4bit") == "4bit")
+        #expect(catalog.name(of: "someone/Qwen3-30B-A3B") == "Qwen3-30B-A3B")
         // Model files on this Mac, by their folder.
         #expect(catalog.name(of: "/a/mlx-models/Qwen3-8B.gguf") == "Qwen3-8B")
         #expect(Catalog.variant(of: "/a/mlx-models/Qwen3-8B.gguf") == "mlx-models")
