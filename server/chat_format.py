@@ -122,8 +122,9 @@ class ChatFormat:
     # (Flint's); None where the generation prompt opens it, as Qwen's do by
     # the request's reasoning effort.
     think_start_id: int | None
-    # The token of TOOL_CALL_OPEN.
+    # The tokens of TOOL_CALL_OPEN and TOOL_CALL_CLOSE.
     call_open_id: int
+    call_close_id: int
     call_syntax: ToolCallSyntax
     # The template's special token after which prompt tokenization reuses a
     # cached prompt's tokens (tokenization.PromptTokenizer).
@@ -158,6 +159,7 @@ QWEN = ChatFormat(
     think_end_id=248069,
     think_start_id=None,
     call_open_id=248058,
+    call_close_id=248059,
     call_syntax=QWEN_XML,
     message_boundary="<|im_end|>",
     image_pad="<|image_pad|>",
@@ -171,6 +173,7 @@ FLINT = ChatFormat(
     think_end_id=150007,
     think_start_id=150006,
     call_open_id=150010,
+    call_close_id=150011,
     call_syntax=GLM_ARGS,
     message_boundary="<|assistant|>",
     image_pad=None,

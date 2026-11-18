@@ -113,6 +113,7 @@ def flint_format(tokenizer):
         think_end_id=ids("</think>"),
         think_start_id=ids("<think>"),
         call_open_id=ids("<tool_call>"),
+        call_close_id=ids("</tool_call>"),
     )
 
 
@@ -542,6 +543,7 @@ class FlintTokenizerContractTests(unittest.TestCase):
             ("think_start_id", "<think>"),
             ("think_end_id", "</think>"),
             ("call_open_id", "<tool_call>"),
+            ("call_close_id", "</tool_call>"),
         ):
             with self.subTest(field=field):
                 with self.assertRaisesRegex(
@@ -610,7 +612,10 @@ class FlintTokenizerContractTests(unittest.TestCase):
                 150007,
             ),
         )
-        self.assertEqual((FLINT.call_open_id, FLINT.call_syntax), (150010, GLM_ARGS))
+        self.assertEqual(
+            (FLINT.call_open_id, FLINT.call_close_id, FLINT.call_syntax),
+            (150010, 150011, GLM_ARGS),
+        )
         self.assertFalse(FLINT.calls_end_reasoning)
         self.assertTrue(QWEN.calls_end_reasoning)
 

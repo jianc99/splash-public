@@ -297,7 +297,7 @@ class ImagePadTokenizer(FakeTokenizer):
 
 
 class PassthroughStreamer:
-    def __init__(self, tokenizer, callback, *args):
+    def __init__(self, tokenizer, callback, *args, **options):
         self.tokenizer = tokenizer
         self.callback = callback
         self.stop_sequence = None

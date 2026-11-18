@@ -18,6 +18,7 @@ class TokenizerContractTests(unittest.TestCase):
             "<|im_end|>": 248046,
             "</think>": 248069,
             "<tool_call>": 248058,
+            "</tool_call>": 248059,
         }
         return mock.Mock(
             get_vocab=mock.Mock(return_value=vocabulary),
@@ -34,7 +35,7 @@ class TokenizerContractTests(unittest.TestCase):
         generation_constraints.check_capabilities(self.tokenizer(), QWEN, READY)
 
     def test_mismatched_thinking_or_call_tokens_are_rejected(self):
-        for token in ("</think>", "<tool_call>"):
+        for token in ("</think>", "<tool_call>", "</tool_call>"):
             with self.subTest(token=token):
                 tokenizer = self.tokenizer()
                 tokenizer.get_vocab()[token] += 1
