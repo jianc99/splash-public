@@ -485,11 +485,15 @@ extension ChatScreenTests {
             return g - r > 0.3 && b > 0.4
         }
         guard let first = teal.first, let last = teal.last else { return nil }
-        // The hairline, a gray between the card's ground and ink, past the end of its row of controls.
-        func hairline(_ y: Int) -> Bool {
+        // The hairline, a gray between the card's ground and ink, past the end of its row of controls:
+        // its ink in this row and the next, as a card moving between whole pixels draws it half in
+        // each (a 1x display: 0.953 in two rows where it is 0.92 in one, on the Mac mini M6).
+        func ink(_ y: Int) -> Double {
+            guard rows.contains(y) else { return 0 }
             let (r, g, b) = color(Int((cardEnd.width - 10) * scale), y)
-            return max(r, g, b) - min(r, g, b) < 0.04 && (r + g + b) / 3 > 0.5 && (r + g + b) / 3 < 0.94
+            return max(r, g, b) - min(r, g, b) < 0.04 && (r + g + b) / 3 > 0.5 ? 1 - (r + g + b) / 3 : 0
         }
+        func hairline(_ y: Int) -> Bool { ink(y) + ink(y + 1) > 0.06 }
         guard let top = rows.prefix(first).last(where: hairline), let bottom = rows.suffix(from: last).first(where: hairline)
         else { return nil }
         return (CGFloat(bottom - top) / scale, cardEnd.minY + CGFloat(first + last) / 2 / scale)
