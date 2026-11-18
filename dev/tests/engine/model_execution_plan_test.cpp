@@ -291,6 +291,20 @@ void checkDecodeStepMoe(const model::LoadedModel &loaded) {
 // and chunks of 64 rows or fewer keep the staged experts' exact activations.
 void checkMoeInt8Passes(const model::LoadedModel &loaded) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  // Experts in the int8 tile's formats take the passes as the start keeps
+  // them resident and not as it streams them, whether the geometry comes
+  // from the files or from the model as it loaded: both go through
+  // RuntimeGeometry::from with the start's streamed parts.
+  for (const bool streamed : {false, true}) {
+    model::QwenTargetGeometry target = geometry.target;
+    target.moeInt8Experts = true;
+    const auto planned = model::RuntimeGeometry::from(loaded.descriptor, loaded.draft.layout, target,
+                                                      kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                      {.experts = streamed});
+    require(planned.target.moeShape().int8Experts == !streamed,
+            streamed ? "a start that streams its experts plans their int8 passes"
+                     : "a start that keeps its experts resident plans no int8 passes");
+  }
   for (uint32_t family : {9U, 10U, 11U})
     for (const ops::Int8Activations setting : {ops::Int8Activations::On, ops::Int8Activations::Off})
       for (const bool experts : {false, true}) {

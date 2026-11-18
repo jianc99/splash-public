@@ -105,8 +105,8 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
   // The format of the sparse MoE blocks' routers, which their plans follow
   // (ops::moeRouterFormat).
   uint32_t moeRouterFormat = ops::QuantizedSegment::kFloat32;
-  // Whether the blocks' experts take the int8 prefill passes
-  // (ops::moeInt8Experts).
+  // Whether the blocks' experts take the int8 prefill passes: their formats
+  // (ops::moeInt8Experts), and resident (RuntimeGeometry::from).
   bool moeInt8Experts = false;
   // The blocks' shape as their plans take it.
   [[nodiscard]] ops::MoeShape moeShape() const noexcept {

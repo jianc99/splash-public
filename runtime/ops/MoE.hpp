@@ -62,8 +62,9 @@ struct MoeShape final {
   uint32_t sharedSlices = 1;
   bool sharedGate = true;
   // Whether every block's experts are resident and in formats the int8
-  // prefill tile takes (moeInt8Experts): its prefill plans then run the int8
-  // passes and size their scratch (MoeConfig::int8Passes).
+  // prefill tile takes (moeInt8Experts and RuntimeGeometry::from): its prefill
+  // plans then run the int8 passes and size their scratch
+  // (MoeConfig::int8Passes).
   bool int8Experts = false;
 
   // Whether the int8 passes hold the shape: they keep the gate's rows in the
