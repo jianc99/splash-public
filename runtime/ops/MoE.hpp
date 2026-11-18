@@ -66,6 +66,13 @@ struct MoeShape final {
   // passes and size their scratch (MoeConfig::int8Passes).
   bool int8Experts = false;
 
+  // Whether the int8 passes hold the shape: they keep the gate's rows in the
+  // expert output, rows of the hidden size (MoE::addInt8Experts). Every MoE
+  // target served has narrower experts (hidden / intermediate: 2048 / 512 for
+  // Qwen3.6-35B-A3B and Flint, 3072 / 1024 for Qwen3.5-122B-A10B, 2560 / 640
+  // for Qwen3.8-Flash-Next); a wider shape keeps the staged passes.
+  [[nodiscard]] constexpr bool int8Fits() const noexcept { return expertIntermediateSize <= hiddenSize; }
+
   [[nodiscard]] constexpr bool valid() const noexcept {
     // Experts of an intermediate width that fills 64-column tiles, and a
     // routing compiled for the router, shared slices, gate and experts.

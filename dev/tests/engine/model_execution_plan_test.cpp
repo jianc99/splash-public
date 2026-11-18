@@ -311,7 +311,7 @@ void checkMoeInt8Passes(const model::LoadedModel &loaded) {
         }
       }
   // The int8 passes hold the gate's rows in the expert output, rows of the
-  // hidden size: a block whose experts are wider is refused, not overrun.
+  // hidden size: a block whose experts are wider keeps the staged passes.
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
@@ -319,15 +319,9 @@ void checkMoeInt8Passes(const model::LoadedModel &loaded) {
   ops::MoeShape wide = geometry.target.moeBlockShape();
   wide.int8Experts = true;
   wide.expertIntermediateSize = wide.hiddenSize + 64;
-  bool refused = false;
-  try {
-    static_cast<void>(plans.moe(wide, geometry.target.moeRouterFormat, 2048));
-  } catch (const std::invalid_argument &) {
-    refused = true;
-  }
-  require(refused, "a MoE plan ran int8 passes over experts wider than the hidden size");
-  wide.int8Experts = false;
-  static_cast<void>(plans.moe(wide, geometry.target.moeRouterFormat, 2048));
+  const ops::MoePlan plan = plans.moe(wide, geometry.target.moeRouterFormat, 2048);
+  require(!plan.configuration().int8Passes && !plan.workspace().groupedCodesBytes,
+          "a MoE plan runs int8 passes over experts wider than the hidden size");
 }
 
 // The decode arena's plan counts each buffer it allocates in whole host

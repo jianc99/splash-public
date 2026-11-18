@@ -68,8 +68,9 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, bool
   if (!shape.valid())
     throw std::invalid_argument("invalid MoE workspace shape");
   // The int8 passes write the gate's rows into the expert output, sized for
-  // the routes' rows of the hidden size (addInt8Experts).
-  if (int8Passes && shape.expertIntermediateSize > shape.hiddenSize)
+  // the routes' rows of the hidden size (addInt8Experts): the plans select
+  // them only where the shape holds them (MoeShape::int8Fits).
+  if (int8Passes && !shape.int8Fits())
     throw std::invalid_argument("MoE int8 passes need an expert intermediate no wider than the hidden size");
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
   const uint32_t tiles = moeMaximumTiles(rows, shape, tileRows);

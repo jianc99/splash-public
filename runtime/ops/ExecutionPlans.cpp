@@ -82,8 +82,9 @@ MoePlan ExecutionPlans::moe(MoeShape shape, uint32_t routerFormat, uint32_t rows
   // ProjectionCalibration::prefillInt8; chunks of more rows than the decode
   // tiles hold) and the block's experts take it. At 64 rows the int8 passes
   // took the 35B MLX's chunk 5% longer on a 32-core M5 Max (2 ABBA runs,
-  // 31.6 against 33.3 ms), at 128 rows the same time and from 320 rows less.
-  config.int8Passes = shape.int8Experts && linear_.int8Activations() == Int8Activations::On &&
+  // 31.6 against 33.3 ms), at 128 rows the same time and from 320 rows less;
+  // where the passes hold the shape (MoeShape::int8Fits).
+  config.int8Passes = shape.int8Experts && shape.int8Fits() && linear_.int8Activations() == Int8Activations::On &&
                       calibration().projection.prefillInt8 && rows > kMaximumDecodeTileRows;
   return MoE::plan(shape, rows, config);
 }
