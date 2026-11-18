@@ -231,9 +231,24 @@ void StateCache::markReply(StateCheckpoint checkpoint) noexcept {
   const auto found = entries_.find(checkpoint.kvBlock);
   if (found == entries_.end() || !found->second.checkpoint || found->second.publication != checkpoint.publication)
     return;
-  found->second.opportunistic = true;
+  markHeld(checkpoint);
   kv_.noteReply(checkpoint.kvBlock);
+}
+
+void StateCache::markHeld(StateCheckpoint checkpoint) noexcept {
+  const auto found = entries_.find(checkpoint.kvBlock);
+  if (found == entries_.end() || !found->second.checkpoint || found->second.publication != checkpoint.publication)
+    return;
+  found->second.opportunistic = true;
   // A reclaim no longer writes it: it leaves its order of writes.
+  reindex(checkpoint.kvBlock, found->second);
+}
+
+void StateCache::keepHeld(StateCheckpoint checkpoint) noexcept {
+  const auto found = entries_.find(checkpoint.kvBlock);
+  if (found == entries_.end() || found->second.publication != checkpoint.publication || !found->second.opportunistic)
+    return;
+  found->second.opportunistic = false;
   reindex(checkpoint.kvBlock, found->second);
 }
 

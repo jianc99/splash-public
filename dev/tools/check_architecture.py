@@ -248,7 +248,10 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 10, Cache.hpp 5, StateCache.hpp 4, Cache.cpp 1).
 # 30,809: +17 for a state at the end of a prompt's head (Engine.cpp 5,
 # Protocol.hpp 4, Protocol.cpp 4, Types.hpp 3, NativeRuntime.cpp 1).
-ENGINE_LINE_BUDGET = 30_809
+# 30,900: +91 for rolling checkpoints written only where their lane stops
+# (Engine.cpp 55, Cache.hpp 10, StateCache.cpp 15, Engine.hpp 6,
+# StateCache.hpp 5).
+ENGINE_LINE_BUDGET = 30_900
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

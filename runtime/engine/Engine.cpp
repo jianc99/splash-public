@@ -1421,7 +1421,7 @@ void Engine::publishReachedStateBoundaries(
     }
     materialized = true;
     endedAtBoundary = objective.tokens == promptProcessed;
-    publishStateBoundary(active, objective, std::move(state), recycled, fromLane, now);
+    publishStateBoundary(active, objective, std::move(state), recycled, fromLane, endedAtBoundary, now);
   }
   if (captured != captures.size())
     throw std::logic_error("prefill captured a state boundary it did not reach");
@@ -1440,8 +1440,14 @@ void Engine::publishReachedStateBoundaries(
 
 bool Engine::publishStateBoundary(Request &active, Request::StateBoundary objective,
                                   std::shared_ptr<const CompositeState> state, bool recycled,
-                                  bool fromLane, double now) {
+                                  bool fromLane, bool atProgress, double now) {
   const bool checkpoint = objective.disposable;
+  // A checkpoint its command ended at the lane holds: a later one replaces
+  // it with no write, and it reaches the SSD only when the lane leaves it
+  // without one or stops at it (storeHeldCheckpoint). Written at once, a
+  // 50,842-token prompt of Qwen3.6-35B-A3B at --max-memory 10.3G on a 16 GB M4
+  // wrote 6 of 19.6 MiB, and their successors retired 5 unread.
+  const bool holds = checkpoint && atProgress;
   // The conversation's next turn resumes from the prompt's replay point. A
   // rebuilt replay point counts as a replay-state publication, not a
   // junction.
@@ -1453,16 +1459,22 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
                            : replay   ? counters_.replayStatePublications
                                       : counters_.junctionMaterializations;
   const uint64_t block = cache_.blockAt(active.request.id, objective.tokens);
+  // Refused, the recovery point the lane left for it is written again.
+  const auto refuse = [&] {
+    ++failures;
+    if (scheduler_.phase(active.request.id) == Phase::Prefill)
+      cache_.keepHeld(active.latestCheckpoint);
+    return false;
+  };
   // A windowed layout's state restores only through a Full tail, which
   // the command that computed it, or held it in its window, leaves so.
-  if (!cache_.stateTailFull(block)) {
-    ++failures;
-    return false;
-  }
+  if (!cache_.stateTailFull(block))
+    return refuse();
   // The state is in use before any of the ways below keeps it, so each of
   // them makes room as work in use.
   if (replay)
     active.replayPoint = cache_.useState(block);
+  bool fresh = false;
   if (cache_.reuseCompositeState(block, checkpoint)) {
     // The captured state goes back to the model's pool.
     ++counters_.deduplicatedStatePublications;
@@ -1475,10 +1487,8 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     // the publication, as does the one a reused state leaves. No checkpoint
     // is published while a restore lease pins the one before it. The
     // prompt's replay point keeps the lane's checkpoint (below).
-    if (checkpoint && checkpointPinned(active)) {
-      ++failures;
-      return false;
-    }
+    if (checkpoint && checkpointPinned(active))
+      return refuse();
     const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
     if (!replay && resident)
       static_cast<void>(retireCheckpoint(active));
@@ -1487,13 +1497,19 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     // checkpoint only beside buffers of its own; refused them, it takes
     // the checkpoint's unless a peer still holds it. Then what the ledger
     // frees for the state's claim (stateClaim).
+    // The prompt's last checkpoint is no rolling one once no later one
+    // comes: a later prompt sharing the text up to it but not the tail (the
+    // same document, another question) resumes there instead of from the
+    // start. So the replay point that takes its buffers writes it first,
+    // and retires it only when no write can start.
     if (fromLane) {
       bool first = true;
       recycled = allocate(
                      [&] {
                        state = model_.snapshot(active.request.id);
                        if (!state && std::exchange(first, false) && replay && resident &&
-                           !checkpointShared(active) && retireCheckpoint(active))
+                           !checkpointShared(active) &&
+                           (cache_.writeState(active.latestCheckpoint.kvBlock) || retireCheckpoint(active)))
                          state = model_.snapshot(active.request.id);
                        return StateBuffers{.ok = state != nullptr};
                      },
@@ -1511,9 +1527,14 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
       ++publications;
       if (recycled)
         ++counters_.recycledStatePublications;
+      fresh = true;
     } else if (cache_.reuseStoredState(block, checkpoint)) {
       // No cache slot takes a RAM copy of a state already on disk.
       ++counters_.deduplicatedStatePublications;
+    } else if (holds) {
+      // The lane holds it; the recovery point before it stays till then.
+      active.heldCheckpoint = objective.tokens;
+      return true;
     } else if (model_.canSnapshotToDisk(cache_.stateInUse(block)) &&
                cache_.publishStateToDisk(
                    block,
@@ -1525,8 +1546,7 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
       ++counters_.diskStatePublications;
       ++publications;
     } else {
-      ++failures;
-      return false;
+      return refuse();
     }
   }
   // The previous recovery point, if the lane still holds one, retires now,
@@ -1540,12 +1560,29 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     static_cast<void>(retireCheckpoint(active));
   active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                        : StateCheckpoint{};
+  if (holds && fresh) {
+    cache_.markHeld(active.latestCheckpoint);
+    active.heldCheckpoint = objective.tokens;
+  }
   // A junction is where this request leaves another's chain: a branch point, which no state below it supersedes.
   if (!checkpoint && !replay)
     cache_.markBranchPoint(block);
   if (!checkpoint)
     writeBehind_.published(block, objective.tokens, now);
   return true;
+}
+
+void Engine::storeHeldCheckpoint(Request &active) {
+  const uint32_t tokens = std::exchange(active.heldCheckpoint, 0);
+  const uint64_t block = tokens ? cache_.blockAt(active.request.id, tokens) : 0;
+  // Its RAM copy stays, one a reclaim now writes; without one the lane's
+  // state, still at the boundary, goes to disk (the time only dates an
+  // ordinary state's write-behind).
+  if (tokens && cache_.stateResident(block))
+    cache_.keepHeld(cache_.checkpointState(block));
+  else if (tokens)
+    static_cast<void>(publishStateBoundary(active, {.tokens = tokens, .disposable = true}, nullptr, false,
+                                           false, false, 0.0));
 }
 
 Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchItem> &items,
@@ -1561,6 +1598,21 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
   for (const BatchItem &item : plan.items)
     shapes.emplace_back(request(item.requestId).kvMode, cache_.holdsIndexPages(item.requestId));
   const bool commandBetweenPasses = !plan.pass && passCommand_.active();
+  // A lane leaving the checkpoint it holds stores it first, unless the
+  // command reaches a later boundary whose state replaces it; it holds it no
+  // longer once the command runs (below). One that reaches the prompt's
+  // replay point always stores it: the replay point may take the buffers of
+  // a checkpoint captured on the way, which is then never published (on
+  // Flash-Next at --max-memory 13G a 237K-token prompt kept no checkpoint).
+  for (const BatchItem &item : plan.items) {
+    Request &active = request(item.requestId);
+    const uint32_t end = item.promptOffset + item.tokenCount;
+    const auto later = std::span(active.stateBoundaries).subspan(active.stateBoundaryCursor);
+    if (prefill && !plan.pass && active.heldCheckpoint &&
+        (end >= promptReplayBoundary(active) ||
+         std::ranges::none_of(later, [&](const Request::StateBoundary &boundary) { return boundary.tokens <= end; })))
+      storeHeldCheckpoint(active);
+  }
   const auto reshaped = [&] {
     for (size_t index = 0; index < plan.items.size(); ++index) {
       const uint64_t id = plan.items[index].requestId;
@@ -1769,6 +1821,7 @@ Engine::Prepared Engine::prepare(const BatchPlan &plan, std::vector<ModelBatchIt
               .subspan(scheduled.promptOffset, scheduled.tokenCount);
     item.stateCaptures = std::move(states[index]);
     items.push_back(std::move(item));
+    active.heldCheckpoint = 0;
   }
   return Prepared::Runnable;
 }
@@ -2003,7 +2056,7 @@ void Engine::apply(const Pending &command, std::span<const ModelStepResult> resu
         const bool fresh =
             !cache_.checkpointState(cache_.blockAt(active.request.id, reached.front().tokens));
         if (publishStateBoundary(active, {.tokens = reached.front().tokens, .disposable = true},
-                                 result.capturedStates.front(), false, false, now) &&
+                                 result.capturedStates.front(), false, false, false, now) &&
             fresh)
           cache_.markReply(active.latestCheckpoint);
       }
@@ -2231,6 +2284,8 @@ void Engine::vacateLane(Request &active, bool keepContinuation) {
       writeBehind_.ended(reply, static_cast<uint32_t>(active.exactTokens.size()) / KvCache::pageTokens *
                                     KvCache::pageTokens);
   }
+  // A lane stopping at its checkpoint stores it for its retry or resume.
+  storeHeldCheckpoint(active);
   if (passCommand_.holds(id))
     settleEnded(passCommand_.yield());
   discardPendingStateBoundaries(active);
