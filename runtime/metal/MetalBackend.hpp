@@ -507,6 +507,9 @@ public:
   // dispatches would compile. Validates them as submission does and throws
   // as it would, but encodes and commits nothing.
   void preparePipelines(std::span<const ComputeDispatch> dispatches);
+  // Whether the library holds function `name`, which a pipeline of that name
+  // needs, looked up without compiling anything.
+  [[nodiscard]] bool hasFunction(std::string_view name) const;
   // The engine is Ready. A pipeline is created the first time a dispatch
   // names it, a command's new ones together, and the submitting thread waits
   // while Metal compiles them if the shader cache is cold: 19 s for the 27B's
