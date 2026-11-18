@@ -4114,9 +4114,34 @@ void requireGrammarChainsAreVerified(model::Runtime &executor, const model::Mode
 // again alone, one row a cycle, each selection forced to the same token,
 // capturing at the boundary too. A cycle of a row a lane more, and the first
 // selection of a request restored from each capture, give each lane's logits
-// within `bound` (cosine) of the chain's.
+// within its paths' rounding (cosine) of the chain's. The control, run first:
+// the same, each lane's path the tree's first children from its root, so that
+// no path branches (a branch-free twin of the same rows in the same widths);
+// the bound is a distance from 1 kMargin times the twin's largest. Both
+// sides' largest are the extremes of 18 rows (9 where the target captures
+// nothing in decode) of a heavy-tailed rounding, whose medians agreed within
+// 2.2 times on six models, so the largest differ by chance: the check's was
+// 0.22 to 2.78 times its twin's in seven runs (11-17, the 2.78 Qwen3.8-27B
+// UD-Q4_K_M on the 16-core M5 Pro), and kMargin is a margin on that ratio,
+// which the check prints. A twin further than kControl from its chain fails as
+// a control off, so that a broken build does not set its own bound. The path
+// commit copies a path's K/V rows with their int8 scales as stored, so a
+// branch adds no rounding of its own: the staged decode tiles of
+// a step's rows and the column tile of a chain's one row sum in different
+// orders, which int8 K/V at one scale a row and head carries to every code
+// near a half step (Qwen3.8-27B UD-Q4_K_M's branched logits kept a cosine of
+// 0.998385 to its chain's on the 16-core M5 Pro, under 1.7.0 too). Unlike the
+// near-tie check this one compares whole rows: a step whose path commit is
+// skipped moves no branched row's best token on Qwen3.8-27B MLX 4-bit, so a
+// bound on the selected tokens' gaps would pass it. Its limit: a skipped
+// commit moves one step's next logits only a little. On Flint UD-Q4_K_XL it
+// put them at cosine 0.98175, 1.4 times the bound's distance past it, beside a
+// legitimate 0.985 on Qwen3.8-Flash-Next MLX 4-bit, so no single bound
+// separates models. On Qwen3.8-27B MLX 4-bit it put them at 0.997542,
+// inside that run's bound of 0.995485: this check does not see it there.
 void requireBranchedPathsMatchChains(model::Runtime &executor, const model::ModelDescriptor &descriptor,
-                                     std::span<const uint32_t> seed, double bound) {
+                                     std::span<const uint32_t> seed) {
+  constexpr double kControl = 0.95, kMargin = 5.0;
   constexpr uint32_t kBoundary = kv::kPageTokens, kPrompt = kBoundary - 2, kBudget = 32;
   const uint32_t maskWords = targetTokens->maskWords();
   const bool captures = executor.capturesInDecode();
@@ -4238,8 +4263,10 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
     require(logits.size() == 1, "branched paths: a restored request's selection copied no logits");
     return std::move(logits.front());
   };
+  double twinLeast = 1.0, least = 1.0;
+  for (const bool twin : {true, false})
   for (const uint32_t width : {2U, 3U, 4U}) {
-    const std::string label = "branched paths B" + std::to_string(width);
+    const std::string label = (twin ? "branch-free twin B" : "branched paths B") + std::to_string(width);
     std::vector<Lane> branched;
     for (uint32_t index = 0; index < width; ++index)
       branched.push_back(start(1000 + index, index, index, pageRange(100 + 4 * index, 2)));
@@ -4255,6 +4282,11 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
       // descendants down its first children, short of a stop token.
       const auto stop = [&](uint32_t row) { return row && stops.contains(request.simulationTokens[row]); };
       std::vector<uint32_t> path;
+      if (twin)
+        for (uint32_t row = 0;; row = children[row].front()) {
+          path.push_back(row);
+          if (children[row].empty() || stop(children[row].front())) break;
+        }
       for (uint32_t branch = 0; branch < rows && path.empty(); ++branch) {
         std::vector<uint32_t> up;
         for (uint32_t row = branch;; row = parents[row]) {
@@ -4275,18 +4307,29 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
       }
       require(!path.empty(),
               label + ": a lane's tree of " + std::to_string(rows) + " rows does not branch short of a stop token");
-      // Each path row selects the next one's token; the last selects freely.
+      // Each path row selects the next one's token; the last selects freely
+      // but none of its children's, so that the path ends where it was
+      // forced (on Qwen3.6-35B-A3B a row whose first child is a stop token
+      // selected its later child's).
       std::vector<uint32_t> words = admitting(rows + 1);
       for (size_t at = 0; at + 1 < path.size(); ++at) force(words, 1 + path[at], request.simulationTokens[path[at + 1]]);
+      for (const uint32_t child : children[path.back()]) {
+        const uint32_t token = request.simulationTokens[child];
+        words[(1 + path.back()) * maskWords + token / 32] &= ~(1U << (token % 32));
+      }
       for (const uint32_t row : path) forcedPaths[lane.index] |= 1U << row;
       return words;
     });
     model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
     for (uint32_t lane = 0; lane < width; ++lane) {
       const uint32_t retained = model::RuntimeInstrumentation::lastRetainedRows(executor, lane);
-      require(retained == forcedPaths[lane] && retained != test::chainPath(std::popcount(retained)) &&
-                  (branched[lane].capture || !captures) && branched[lane].position >= kBoundary,
-              label + ": a lane did not retain its branched path across the boundary, or did not capture there");
+      require(retained == forcedPaths[lane] && (twin || retained != test::chainPath(std::popcount(retained))),
+              label + ": lane " + std::to_string(lane) + " retained rows " + std::to_string(retained) +
+                  ", not its forced path's " + std::to_string(forcedPaths[lane]));
+      require(branched[lane].position >= kBoundary && (branched[lane].capture || !captures),
+              label + ": lane " + std::to_string(lane) + " ended at " + std::to_string(branched[lane].position) +
+                  (branched[lane].capture ? "" : " without a capture") + ", short of the boundary at " +
+                  std::to_string(kBoundary) + " or of its capture there");
     }
     const std::vector<std::vector<float>> branchedNext = nextLogits(branched);
     for (const Lane &lane : branched) executor.end(lane.id);
@@ -4315,13 +4358,19 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
       executor.end(chain.id);
       const double restored =
           captures ? cosine(restoredLogits(original, 1020), restoredLogits(chain, 1021)) : 1.0;
-      require(next > bound && restored > bound,
-              label + ": lane " + std::to_string(original.index) + "'s next logits are at cosine " +
-                  std::to_string(next) + " and its restored capture's at " + std::to_string(restored) +
-                  " of the chain's");
+      (twin ? twinLeast : least) = std::min({twin ? twinLeast : least, next, restored});
     }
   }
-  std::cout << "branched_paths_match_chains=PASS widths=2,3,4" << (captures ? "" : " (no decode captures)") << '\n';
+  require(twinLeast > kControl, "branched paths: the control is off, a branch-free twin's logits at cosine " +
+                                    std::to_string(twinLeast) + " of its chain's");
+  const double bound = 1.0 - kMargin * (1.0 - twinLeast);
+  const double ratio = (1.0 - least) / std::max(1.0 - twinLeast, 1e-9);
+  require(least > bound, "branched paths: a lane's logits are at cosine " + std::to_string(least) +
+                             " of its chain's, " + std::to_string(ratio) + " times its twin's distance (least cosine " +
+                             std::to_string(twinLeast) + "; bound " + std::to_string(bound) + ")");
+  std::cout << "branched_paths_match_chains=PASS widths=2,3,4" << (captures ? "" : " (no decode captures)")
+            << " least_cosine=" << least << " twin_least=" << twinLeast << " ratio=" << ratio << " bound=" << bound
+            << '\n';
 }
 
 // A step whose lanes take different rows at the lane cap of 16 computes each
@@ -6634,7 +6683,7 @@ int main(int argc, char **argv) {
               << partitionedPending.acceptedDraftTokens << '\n';
     executor.end(50);
     executor.end(51);
-    requireBranchedPathsMatchChains(executor, model.descriptor, samplingSeedTokens, bound);
+    requireBranchedPathsMatchChains(executor, model.descriptor, samplingSeedTokens);
     // A lane alone in a MoE target's step routes its rows to expert tiles of
     // its own rows, which sum in another order: Qwen3.8-Flash-Next's lanes
     // alone keep a cosine of 0.988 to their rows in the step of 42 rows.
