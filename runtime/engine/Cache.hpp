@@ -817,16 +817,6 @@ public:
   bool keepReplyAsPoint(StateCheckpoint checkpoint) { return states_.keepReplyAsPoint(checkpoint); }
   // A junction's state (StateCache::markBranchPoint).
   void markBranchPoint(uint64_t block) { states_.markBranchPoint(block); }
-  // A prefill checkpoint its running lane holds, and the lane storing it (StateCache::markHeld).
-  void markHeld(StateCheckpoint checkpoint) noexcept { states_.markHeld(checkpoint); }
-  void keepHeld(StateCheckpoint checkpoint) noexcept { states_.keepHeld(checkpoint); }
-  // Frees the RAM copy of the state at the block by writing it, as a
-  // reclaim does (StateCache::reclaim); false, and nothing done, while the
-  // tier takes no write of it or the staging buffer is busy.
-  [[nodiscard]] bool writeState(uint64_t kvBlock) {
-    return states_.reclaimable(kvBlock) && states_.reclaimWrites(kvBlock) && !states_.writing() &&
-           states_.reclaim(kvBlock).evicted;
-  }
   // This exact disposable publication is pinned: retireCheckpointState
   // refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {

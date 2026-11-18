@@ -308,122 +308,6 @@ void testDiskCheckpointStaysUntilItsSuccessorIsPublished() {
           "the retry did not resume from the checkpoint on disk");
 }
 
-// A lane denied RAM for its states, as at the memory wall, prefills in commands of 8,192 rows, each
-// ending at the checkpoint its capture was refused at, as Qwen3.6-35B-A3B's did at --max-memory 10.3G
-// on a 16 GB M4 Mac mini, where it wrote 6 checkpoints of 19.6 MiB and retired 5 of them unread. It writes
-// only the checkpoint it leaves without a successor, its prompt's last, beside the replay state. A
-// lane cancelled at its checkpoint writes it, and the resend resumes there.
-void testALaneAtTheWallWritesOnlyTheCheckpointsItLeaves() {
-  for (const bool cancel : {false, true}) {
-    test::TestKvStorage storage(1024, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache cache(pool, nullptr, nullptr);
-    Executor executor;
-    // Streamed weights group a lane's chunks into commands of groupRows rows (Scheduler::groups).
-    executor.groupRows = 2 * kPrefillCheckpointTokens;
-    executor.streamedExperts = true;
-    executor.deniedReservations = 1000;
-    executor.stateTier = std::make_shared<OffloadControl>();
-    executor.stateTier->ready = true;
-    executor.restoreControl->promotionDenied = true;
-    Events events;
-    engine::Engine engine(test::engineConfig(), cache, executor, events);
-    guardReleases(storage, engine);
-    // Checkpoints at 4,096 to 20,480, the replay point at 24,576. The commands end at 8,192, 12,288
-    // and 20,480, checkpoints whose captures were refused, and at the replay point.
-    const std::vector<uint32_t> prompt(6 * kPrefillCheckpointTokens + 1, 73);
-    engine.submit(request(1, prompt));
-    double now = 1;
-    if (cancel) {
-      tickUntil(engine, now,
-                [&] {
-                  return executor.requests.contains(1) &&
-                         executor.requests.at(1).position == 2 * kPrefillCheckpointTokens &&
-                         !engine.commandInFlight();
-                },
-                "the lane did not stop at its first checkpoint");
-      engine.cancel(1);
-    }
-    runUntilIdle(engine);
-    const auto counters = engine.snapshot();
-    const auto &states = counters.resources.stateCache;
-    // The prompt's last checkpoint and its replay state; cancelled, the checkpoint it stopped at.
-    const uint32_t written = cancel ? 1 : 2;
-    require(executor.diskSnapshots == written && counters.checkpointPublications == 1 &&
-                counters.checkpointPublicationFailures == 0 && states.checkpointEntries == 1 &&
-                states.checkpointRetirements == 0 && events.failedCount == 0,
-            "the lane at the wall wrote " + std::to_string(executor.diskSnapshots) + " states, " +
-                std::to_string(counters.checkpointPublications) + " of them checkpoints, and retired " +
-                std::to_string(states.checkpointRetirements) + " from disk; want " + std::to_string(written) +
-                ", 1 and 0");
-    executor.restoreControl->ready = true;
-    engine.submit(request(2, prompt));
-    runUntilIdle(engine);
-    const uint32_t resumed = cancel ? 2 * kPrefillCheckpointTokens : static_cast<uint32_t>(prompt.size() - 1);
-    require(events.starts.back() == resumed && events.failedCount == 0,
-            "the resend resumed from " + std::to_string(events.starts.back()) + ", not " + std::to_string(resumed));
-  }
-}
-
-// The prompt's last checkpoint survives the replay point at the wall, which a later prompt that shares
-// the text up to it but not the tail resumes from. The replay point, refused buffers, takes those of the
-// lane's checkpoint in RAM, which it writes first; or those of the checkpoint its command captures on
-// the way, which is then never published, so the lane stores the checkpoint it holds before that
-// command. Without either, Flash-Next at --max-memory 13G on an M5 Pro (48 GB) kept no checkpoint of a
-// 237K-token prompt, and a second prompt sharing all but its tail prefilled from the start (291 s to
-// its first token, against 9 s).
-void testThePromptsLastCheckpointSurvivesTheReplayPoint() {
-  for (const bool captured : {false, true}) {
-    test::TestKvStorage storage(1024, 4096, 4);
-    KvPool pool(storage, 0);
-    engine::Cache cache(pool, nullptr, nullptr);
-    Executor executor;
-    executor.groupRows = 2 * kPrefillCheckpointTokens;
-    executor.streamedExperts = true;
-    executor.offloadTier = std::make_shared<OffloadControl>();
-    executor.offloadTier->ready = true;
-    executor.stateTier = std::make_shared<OffloadControl>();
-    executor.stateTier->ready = true;
-    executor.restoreControl->promotionDenied = true;
-    // In RAM: checkpoints at 4,096 to 24,576, the replay point at 28,672. Captured: commands of 8,192
-    // rows end at 8,192 and 16,384, checkpoints refused RAM that the lane holds; the last command
-    // captures the checkpoint at 20,480 on its way to the replay point at 24,544, which, refused its own
-    // buffers once, takes that checkpoint's.
-    const std::vector<uint32_t> prompt(captured ? 6 * kPrefillCheckpointTokens : 7 * kPrefillCheckpointTokens + 1,
-                                       79);
-    if (captured) {
-      executor.reservationRoom = [&, replays = 0]() mutable {
-        return executor.reservingTokens == 5 * kPrefillCheckpointTokens ||
-               (executor.reservingTokens > 5 * kPrefillCheckpointTokens && ++replays > 1);
-      };
-    } else {
-      // Room for one state in RAM: the next takes the buffers of the one there.
-      executor.reservationRoom = [&] { return cache.snapshot().stateCache.bytes == 0; };
-    }
-    Events events;
-    engine::Engine engine(test::engineConfig(), cache, executor, events);
-    guardReleases(storage, engine);
-    engine.submit(request(1, prompt));
-    runUntilIdle(engine);
-    const auto counters = engine.snapshot();
-    const auto &states = counters.resources.stateCache;
-    const std::string arm = captured ? "captured" : "in RAM";
-    require(counters.replayStatePublications == 1 && states.checkpointEntries >= 1 && events.failedCount == 0,
-            arm + ": the prompt kept " + std::to_string(states.checkpointEntries) + " checkpoints, " +
-                std::to_string(states.offloads) + " written, " + std::to_string(events.failedCount) + " failures");
-    // The same text past the last checkpoint kept, then another tail.
-    std::vector<uint32_t> other(prompt.begin(), prompt.begin() + (captured ? 18'432 : 26'624));
-    other.resize(prompt.size(), 80);
-    executor.restoreControl->ready = true;
-    engine.submit(request(2, other));
-    runUntilIdle(engine);
-    const uint32_t kept = (captured ? 4 : 6) * kPrefillCheckpointTokens;
-    require(events.starts.back() == kept && events.failedCount == 0,
-            arm + ": the prompt sharing the text up to the last checkpoint resumed from " +
-                std::to_string(events.starts.back()) + ", not " + std::to_string(kept));
-  }
-}
-
 // No checkpoint is planned within a prefill chunk of the replay boundary; one a chunk or more away
 // is published, in RAM or on disk, beside the replay state.
 void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
@@ -2461,8 +2345,6 @@ std::span<const test::TestCase> diskTests() {
       {"testCancelledPrefillRecoversFromItsDiskCheckpoint", testCancelledPrefillRecoversFromItsDiskCheckpoint},
       {"testFailedFinalStateKeepsTheDiskCheckpoint", testFailedFinalStateKeepsTheDiskCheckpoint},
       {"testDiskCheckpointStaysUntilItsSuccessorIsPublished", testDiskCheckpointStaysUntilItsSuccessorIsPublished},
-      {"testALaneAtTheWallWritesOnlyTheCheckpointsItLeaves", testALaneAtTheWallWritesOnlyTheCheckpointsItLeaves},
-      {"testThePromptsLastCheckpointSurvivesTheReplayPoint", testThePromptsLastCheckpointSurvivesTheReplayPoint},
       {"testNoCheckpointWithinAChunkOfTheReplayBoundary", testNoCheckpointWithinAChunkOfTheReplayBoundary},
       {"testSkippedCheckpointKeepsPreviousRecoveryPoint", testSkippedCheckpointKeepsPreviousRecoveryPoint},
       {"testACompletionBurstIsCopiedWithoutDelayingDecode", testACompletionBurstIsCopiedWithoutDelayingDecode},

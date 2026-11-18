@@ -184,10 +184,6 @@ public:
   // writes it, as a next prompt resumes there only if it renders the reply
   // back token for token. A reuse by another publication, or a use, ends it.
   void markReply(StateCheckpoint checkpoint) noexcept;
-  // The same for a prefill checkpoint its lane holds and can write itself; keepHeld, once the lane stores it, makes
-  // it a checkpoint a reclaim writes.
-  void markHeld(StateCheckpoint checkpoint) noexcept;
-  void keepHeld(StateCheckpoint checkpoint) noexcept;
   // The matching checkpoint is pinned: retireCheckpointState refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept;
   // An unfinished request's conversation resumes from the state at this
@@ -359,8 +355,7 @@ private:
     uint32_t pins = 0;
     uint64_t lastUsed = 0;
     bool checkpoint = false;
-    // A reply's state (markReply) until its request keeps it as a point (keepReplyAsPoint), or a prefill checkpoint
-    // its lane holds (markHeld) until the lane stores it (keepHeld).
+    // A reply's state (markReply) until its request keeps it as a point (keepReplyAsPoint).
     bool opportunistic = false;
     // An ordinary state another below it supersedes (supersededBelow()), set as the states below it change.
     bool superseded = false;

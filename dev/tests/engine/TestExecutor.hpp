@@ -627,7 +627,6 @@ public:
     if (!requests.at(id).resident || !tokens || tokens % engine::KvCache::pageTokens)
       throw std::logic_error("a state was reserved off a resident lane's page boundary");
     ++reservationAttempts;
-    reservingTokens = tokens;
     if (reservationObserver)
       reservationObserver();
     if (deniedReservations) {
@@ -881,8 +880,6 @@ public:
   std::function<void()> beginObserver;
   std::function<void()> reservationObserver;
   std::function<bool()> reservationRoom;
-  // The boundary of the reservation reservationRoom is asked about.
-  uint32_t reservingTokens = 0;
   metal::AllocationFailure reservationFailure = metal::AllocationFailure::EngineBudget;
   std::function<bool()> beginGrowthBlocked;
   std::vector<std::vector<uint32_t>> resumedPrompts;
