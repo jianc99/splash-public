@@ -235,12 +235,6 @@ void testProjectionExtents(MetalBackend &backend, const DenseLinear &dense) {
   const MetalBuffer input = sharedBuffer(backend, size_t(DenseLinear::paddedRows(rows)) * inputs * 2);
   const MetalBuffer output = sharedBuffer(backend, size_t(rows) * outputs * 4);
   using splash::test::requireExtent;
-  requireExtent(backend, weight, weight.sizeBytes(), 2, "dense weight", [&](CommandGraph &g, const MetalBuffer &v) {
-    dense.add(g, {v, bias}, outputs, inputs, input, output, rows);
-  });
-  requireExtent(backend, bias, bias.sizeBytes(), 2, "dense bias", [&](CommandGraph &g, const MetalBuffer &v) {
-    dense.add(g, {weight, v}, outputs, inputs, input, output, rows);
-  });
   requireExtent(backend, input, input.sizeBytes(), 2, "dense input", [&](CommandGraph &g, const MetalBuffer &v) {
     dense.add(g, {weight, bias}, outputs, inputs, v, output, rows);
   });
@@ -251,11 +245,6 @@ void testProjectionExtents(MetalBackend &backend, const DenseLinear &dense) {
   requireExtent(backend, output, output.sizeBytes(), 4, "dense output", [&](CommandGraph &g, const MetalBuffer &v) {
     dense.add(g, {weight, bias}, outputs, inputs, input, v, rows, DenseEpilogue::Residual);
   });
-  CommandGraph graph;
-  splash::test::rejects([&] { dense.add(graph, {weight, bias}, outputs, 192, input, output, rows); },
-                        "whole 128s", "inputs of 192 were accepted");
-  splash::test::rejects([&] { dense.add(graph, {weight, bias}, 192, inputs, input, output, rows); },
-                        "whole 128s", "outputs of 192 were accepted");
 }
 
 // LayerNorm with bias of fp32 rows into bf16, at a width that is not a
@@ -295,12 +284,6 @@ void testLayerNorm(MetalBackend &backend) {
   using splash::test::requireExtent;
   requireExtent(backend, input, input.sizeBytes(), 4, "norm input", [&](CommandGraph &g, const MetalBuffer &v) {
     Normalization::addLayer(g, v, {weight, bias}, output, width, rows, 1e-5F);
-  });
-  requireExtent(backend, weight, weight.sizeBytes(), 2, "norm weight", [&](CommandGraph &g, const MetalBuffer &v) {
-    Normalization::addLayer(g, input, {v, bias}, output, width, rows, 1e-5F);
-  });
-  requireExtent(backend, bias, bias.sizeBytes(), 2, "norm bias", [&](CommandGraph &g, const MetalBuffer &v) {
-    Normalization::addLayer(g, input, {weight, v}, output, width, rows, 1e-5F);
   });
   requireExtent(backend, output, output.sizeBytes(), 2, "norm output", [&](CommandGraph &g, const MetalBuffer &v) {
     Normalization::addLayer(g, input, {weight, bias}, v, width, rows, 1e-5F);

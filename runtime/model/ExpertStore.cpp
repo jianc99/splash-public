@@ -1384,9 +1384,6 @@ void ExpertStore::Impl::forgetExperts(bool everySize) {
 void ExpertStore::forget() {
   std::lock_guard lock(impl_->mutex);
   Impl &impl = *impl_;
-  if (impl.released) return;
-  if (impl.backend.commandInFlight())
-    throw std::logic_error("an expert store forgets its experts while a command is in flight");
   impl.forgetExperts(false);
   impl.publish();
 }

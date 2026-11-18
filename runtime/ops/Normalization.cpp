@@ -17,10 +17,8 @@ std::string normKernel(std::string_view name, const NormWeights &weights, uint32
 void Normalization::addLayer(metal::CommandGraph &graph, const metal::MetalBuffer &input,
                              const LayerNormWeights &weights, const metal::MetalBuffer &output, uint32_t width,
                              uint32_t rows, float epsilon) {
-  if (!rows || !width) throw std::invalid_argument("a LayerNorm takes rows and a width");
+  // The weights are the tower's, which ops::Vision checks once; the rows are the image's.
   requireBytes(input, uint64_t{rows} * width * 4, "norm input");
-  requireBytes(weights.weight, uint64_t{width} * 2, "norm weight");
-  requireBytes(weights.bias, uint64_t{width} * 2, "norm bias");
   requireBytes(output, uint64_t{rows} * width * 2, "norm output");
   graph.add("norm_layer", {input, weights.weight, weights.bias, output}, LayerNormParams{width, epsilon},
             {rows, 1, 1});

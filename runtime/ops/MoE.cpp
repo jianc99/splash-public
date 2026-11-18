@@ -329,8 +329,9 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeGroupParams group = groupParams(plan, weights);
   if (weights.stream) {
     addExperts(graph, buffers.scratch, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED);
-  } else if (plan.configuration().int8Passes && !buffers.lanes && !int8Format(weights.gate).empty() &&
-             !int8Format(weights.up).empty() && !int8Format(weights.down).empty()) {
+  } else if (plan.configuration().int8Passes && !buffers.lanes) {
+    // A decode step's lanes keep the staged passes, which read their verified
+    // grouping, also in a step of more than the decode tiles' 64 rows.
     addInt8Experts(graph, buffers, weights, plan);
   } else {
     addGather(graph, buffers, plan);

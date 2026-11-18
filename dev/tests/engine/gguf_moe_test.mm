@@ -1220,7 +1220,7 @@ int int8Experts(MetalBackend &backend) {
       uint32_t compared = 0;
       for (const uint32_t rows : {kMaximumRows, 33u, 16u, 1u}) {
         MoeConfig config{MoeExpertTile::M32};
-        config.int8Passes = on && runs;
+        config.int8Passes = on && runs && takes;
         const MoePlan plan = MoE::plan(kShape, rows, config);
         const std::string label = std::string(fmtName(f)) + (on ? " int8" : " staged") + " prefill rows=" +
                                   std::to_string(rows);
