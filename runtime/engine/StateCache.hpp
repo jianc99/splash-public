@@ -63,6 +63,8 @@ public:
   ~StateUse() noexcept;
 
   void reset() noexcept;
+  // The block it marks; 0 once reset.
+  [[nodiscard]] uint64_t kvBlock() const noexcept { return kvBlock_; }
 
 private:
   friend class StateCache;
@@ -213,7 +215,8 @@ public:
   static constexpr uint32_t kKeptBehind = 1;
   // Its request ended rendering an earlier reply back: the reply's state, a checkpoint, becomes its
   // conversation's newest point, an ordinary state, which its next turn resumes from.
-  void keepReplyAsPoint(StateCheckpoint checkpoint);
+  // False when the checkpoint is no longer that reply's.
+  bool keepReplyAsPoint(StateCheckpoint checkpoint);
   // A junction's state, published where a request leaves another's chain: a branch point, never superseded, though
   // its second continuation holds no state below it until that request publishes one.
   void markBranchPoint(uint64_t kvBlock);

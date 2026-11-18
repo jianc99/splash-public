@@ -809,7 +809,7 @@ public:
   // A reply's state, opportunistic (StateCache::markReply).
   void markReply(StateCheckpoint checkpoint) noexcept { states_.markReply(checkpoint); }
   // A reply's state that its conversation's next turn resumes from (StateCache::keepReplyAsPoint).
-  void keepReplyAsPoint(StateCheckpoint checkpoint) { states_.keepReplyAsPoint(checkpoint); }
+  bool keepReplyAsPoint(StateCheckpoint checkpoint) { return states_.keepReplyAsPoint(checkpoint); }
   // A junction's state (StateCache::markBranchPoint).
   void markBranchPoint(uint64_t block) { states_.markBranchPoint(block); }
   // This exact disposable publication is pinned: retireCheckpointState

@@ -1392,8 +1392,8 @@ void testRefusedDemotionTakesTheLeafBesideCopiesAhead() {
     }
 }
 
-// A temporary tier copies a point once its request ended, the points after it first, and a reclaim
-// then frees it at once; a persistent tier copies points in use.
+// Either tier copies a point only once its request has ended, kDelayMilliseconds after that end
+// (WriteBehind::ended), the points after it first; a reclaim then frees it at once.
 void testTemporaryPointsWaitForTheirRequests() {
   constexpr double kDelay = WriteBehind::kDelayMilliseconds;
   for (const bool persistent : {false, true}) {
@@ -1409,11 +1409,6 @@ void testTemporaryPointsWaitForTheirRequests() {
     const uint64_t unused = process.cachePrompt(2, promptOf(2000, 1))[0];
     process.publish(unused);
     writes.published(unused, WriteBehind::kMinimumTokens, 1.0);
-    if (persistent) {
-      require(writes.nextWakeup() == kDelay && !writes.run(kDelay, kCopiesDemanded, false) && process.tier.demotions == 3,
-              "a persistent tier did not copy a point in use");
-      continue;
-    }
     require(writes.nextWakeup() == kDelay + 1 && !writes.run(kDelay + 1, kCopiesDemanded, false) &&
                 process.tier.demotions == 2 && writes.snapshot().waiting == 2,
             "the point in use was copied, or held back the one after it");
@@ -1423,10 +1418,14 @@ void testTemporaryPointsWaitForTheirRequests() {
                 !writes.nextWakeup(),
             "the point after the one in use was not copied, or the one in use woke the queue");
     use.reset();
-    require(writes.nextWakeup() == kDelay && !writes.run(kDelay + 3, kCopiesDemanded, false) && process.tier.demotions == 4,
-            "the point was not copied once its request ended");
+    writes.ended(used[1], WriteBehind::kMinimumTokens);
+    require(writes.nextWakeup() == 2 * kDelay + 2 && !writes.run(kDelay + 3, kCopiesDemanded, false) &&
+                process.tier.demotions == 2,
+            "the point was copied before the delay after its request's end had passed");
+    require(!writes.run(2 * kDelay + 2, kCopiesDemanded, false) && process.tier.demotions == 4,
+            "the point was not copied the delay after its request ended");
     process.tier.complete();
-    require(process.cache.pollTransfers() && writes.run(kDelay + 4, kCopiesDemanded, false) &&
+    require(process.cache.pollTransfers() && writes.run(2 * kDelay + 3, kCopiesDemanded, false) &&
                 writes.snapshot().durable == 2 && !writes.snapshot().waiting,
             "the point whose request ended did not get its copies");
     bool reclaimed = false;
@@ -1437,6 +1436,8 @@ void testTemporaryPointsWaitForTheirRequests() {
                 !process.cache.stateResident(used[1]) && !process.cache.stateResident(unused),
             "a reclaim wrote the copied points again or waited for a write");
 
+    if (persistent)
+      continue;
     const uint64_t last = process.cachePrompt(3, promptOf(3000, 1))[0];
     process.publish(last);
     writes.published(last, WriteBehind::kMinimumTokens, kDelay);

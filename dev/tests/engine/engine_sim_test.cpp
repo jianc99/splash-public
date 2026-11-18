@@ -675,10 +675,11 @@ void testRegrowthAfterABurstTakesOnlyCacheThatFreesNow() {
 // Critical pressure after the same burst, macOS's level sampled every half second for 6 s: each settled
 // second takes about the margin, cache that frees now before the store's chunk above its floor, never
 // the store below its floor, and the newest resume point stays in RAM while older cache covers the
-// margin.
+// margin. It comes once the burst's points have their copies, the delay after the last request ended
+// at 63.3 s (WriteBehind::ended): within it no cached point frees without a write.
 void testCriticalTakesTheMarginASecondAndKeepsTheResumePoint() {
   const Machine &machine = k35BStudio18G;
-  constexpr double critical = 66'000.0, normal = 72'000.0;
+  constexpr double critical = 76'000.0, normal = 82'000.0;
   std::vector<test::HostEvent> script;
   for (double at = critical; at < normal; at += 500.0)
     script.push_back({at, machine.otherBytes, engine::MemoryPressure::Critical});

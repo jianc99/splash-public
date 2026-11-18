@@ -27,19 +27,26 @@ struct WriteBehindSnapshot final {
 // stay in RAM, ahead of need (Cache::persist): a reclaim then frees their
 // memory at once instead of waiting for writes, and a persistent tier's next
 // process takes them back. An ordinary point published or reused at least
-// kMinimumTokens deep is copied once it has waited kDelayMilliseconds,
-// unless its conversation has gone on from it by then: a point newest only
-// briefly, like a tool-loop step, costs no write, and a shorter one
-// recomputes faster than its state writes.
+// kMinimumTokens deep is copied once its request has ended and
+// kDelayMilliseconds have passed since (ended), unless its conversation has
+// gone on from it by then: a point newest only briefly, like a tool-loop
+// step, costs no write, and a shorter one recomputes faster than its state
+// writes. Recorded agents sent their next request 0.1 s after the last one
+// ended (median; p99 0.7 s, at most 2.2 s, over 177 requests of six
+// clients). Counted from its publication, as before, a turn longer than the
+// delay had its point copied the moment it ended and superseded by the next
+// turn 0.1 s later: a 35-turn session of Qwen3.8-27B MLX 4-bit with room
+// (an M5 Max) wrote 2.46 GiB ahead and read none of it. A crash within the
+// delay of a turn's end loses that turn's point; a clean stop copies it
+// (flush).
 //
-// A persistent tier copies every point, in use or not, so a later start,
-// after a crash too, takes it back. A temporary tier's copies serve reclaims
-// alone, so there a point is copied only on the memory's demand for copies
-// (run): while claims recently reached cache a copy would have let go at
-// once, and only as far as the cache's victims that go at once do not cover
-// the claims ahead. A point is copied only once its request has ended, since
-// until then the request may go on from its chain and reclaims take the
-// point last. Without demand nothing is written ahead. A point its
+// A persistent tier copies every such point, so a later start, after a crash
+// too, takes it back. A temporary tier's copies serve reclaims alone, so
+// there a point is copied only on the memory's demand for copies (run):
+// while claims recently reached cache a copy would have let go at once, and
+// only as far as the cache's victims that go at once do not cover the claims
+// ahead. Until its request ends the request may go on from its chain, and
+// reclaims take the point last. Without demand nothing is written ahead. A point its
 // conversation went on from by its turn is given up then, unwritten
 // (Cache::newestPoint).
 //
@@ -64,6 +71,9 @@ public:
   // now (copying), of the demand the last step was asked with, which a
   // claim since changes at the next step.
   void published(uint64_t block, uint32_t tokens, double now);
+  // A point whose request ended, the newest of its conversation: it falls due kDelayMilliseconds from now, the
+  // engine's last step (run), whenever it was published.
+  void ended(uint64_t block, uint32_t tokens);
   // Steps the points that are due and not in use, unless a claim waits for
   // memory on its way back (claimWaiting), which needs the tier's writes and
   // the state write first. A temporary tier copies only while `demandBytes`
@@ -108,7 +118,7 @@ private:
   // (Cache::peek), plus what the copies ahead in flight free once they
   // land, is less than `demandBytes`.
   [[nodiscard]] bool demanded(uint64_t demandBytes) const;
-  // A temporary tier's point whose request has not ended.
+  // A point whose request has not ended.
   [[nodiscard]] bool inUse(uint64_t block) const noexcept;
 
   Cache &cache_;
@@ -124,6 +134,8 @@ private:
   bool copying_;
   // The demand the last step was asked with.
   uint64_t demandBytes_ = 0;
+  // The engine's time at its last step or publication.
+  double now_ = 0.0;
   WriteBehindSnapshot counters_;
 };
 
