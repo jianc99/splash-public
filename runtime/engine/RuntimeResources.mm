@@ -1211,7 +1211,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto kvPages = std::make_unique<kv::PageStorage>(
         *backend, memoryGovernor->allocationAdmission(), kvLayout,
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
-    auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
+    auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::runwayPages(budget.kvExtentPages));
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
         *backend, memoryGovernor->allocationAdmission(),
         loaded.stateLayout(config.stateFormat, !config.exactCachedStates), disk.states);

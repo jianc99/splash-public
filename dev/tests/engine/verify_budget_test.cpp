@@ -1102,18 +1102,27 @@ void invalidSteps() {
   // Four lanes of four rows hold their anchors alone.
   rejects([&] { StepCosts costs(kClasses, StepCosts::kLanes, false); }, "hold nothing past its lanes' anchors",
           "a table of the anchors alone was made");
-  // The startup runway's 128 pages from page 5 hold eight lanes of 28
-  // points, not of 29; a class every row makes more, while a MoE target's
-  // table of kClasses fits.
-  constexpr uint32_t kRunway = splash::model::ExecutionLimits::warmupKvPages;
-  require(kRunway == 128 && 5 + StepCosts::kLanes * StepCosts::lanePages(28) <= kRunway &&
+  // The startup runway is whole extents: 128-page extents' 128 pages from
+  // page 5 hold eight lanes of 28 points, not of 29, so a class every row
+  // makes leaves eight lanes unmeasured while a MoE target's table of
+  // kClasses fits every lane count; a BF16 KV's 32-page extents' 64 pages
+  // hold as many lanes as their pages do.
+  using splash::model::ExecutionLimits;
+  constexpr uint32_t kRunway = ExecutionLimits::runwayPages(128);
+  static_assert(ExecutionLimits::warmupKvPages == 64 && kRunway == 128 && ExecutionLimits::runwayPages(32) == 64);
+  require(5 + StepCosts::kLanes * StepCosts::lanePages(28) <= kRunway &&
               5 + StepCosts::kLanes * StepCosts::lanePages(29) > kRunway,
           "the runway holds other lanes than a measurement lays");
   std::vector<uint32_t> everyRow;
   for (uint32_t row = 1; row <= 64; ++row) everyRow.push_back(row);
-  rejects([&] { StepCosts(everyRow, 64, false).requireRunway(5, kRunway); }, "more pages than the startup runway",
+  const StepCosts every(everyRow, 64, false), moe(kClasses, 64, true);
+  require(!every.fits(StepCosts::kLanes, 5, kRunway) && every.fits(1, 5, kRunway),
           "a table whose measurement runs past the startup runway was taken");
-  StepCosts(kClasses, 64, true).requireRunway(5, kRunway);
+  for (uint32_t lanes = 1; lanes <= StepCosts::kLanes; ++lanes) {
+    require(moe.fits(lanes, 5, kRunway), "a MoE target's measurement did not fit the runway");
+    require(moe.fits(lanes, 5, 64) == (5 + lanes * StepCosts::lanePages(moe.points(lanes).size()) <= 64),
+            "a BF16 KV's runway took other lanes than its pages hold");
+  }
   StepCosts costs(kClasses, 64, false);
   const size_t points = costs.points(2).size();
   for (const std::vector<std::vector<double>> &replays :

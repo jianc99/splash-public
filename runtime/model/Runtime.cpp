@@ -755,10 +755,6 @@ struct Runtime::Impl {
         costLine.emplace(stepClasses);
       } else {
         stepCosts.emplace(stepClasses, mostStepRows, geometry.target.ffnKind == QwenFfnKind::SparseMoe);
-        // Each lane count's measurement fits the startup runway from its
-        // page 5 (Runtime::measureDecodeSteps): the most points today, a MoE
-        // target's 14 at eight lanes, take 69 of its 128 pages.
-        stepCosts->requireRunway(5, ExecutionLimits::warmupKvPages);
         for (uint32_t lanes = 1; lanes <= kLaneCount; ++lanes) {
           const std::optional<std::string> line = value.recallStepCosts ? value.recallStepCosts(lanes) : std::nullopt;
           if (!line)
@@ -4173,12 +4169,12 @@ void requireLanesSucceeded(std::span<const ModelStepResult> results) {
 }
 
 // Warmup runs on the startup runway the engine's KV pool allocated
-// (ExecutionLimits::warmupKvPages), whose pages its caller holds while it
+// (ExecutionLimits::runwayPages), whose pages its caller holds while it
 // runs (engine::KvPool::RunwayHold); it never allocates KV.
 void requireRunwayPages(const kv::PageStorage &storage,
                         std::span<const uint32_t> pages) {
   for (uint32_t page : pages) {
-    if (page >= ExecutionLimits::warmupKvPages || !storage.isAllocated(page)) {
+    if (page >= ExecutionLimits::runwayPages(storage.extentPages()) || !storage.isAllocated(page)) {
       throw std::logic_error("warmup KV page " + std::to_string(page) +
                              " is outside the startup runway");
     }
@@ -4445,7 +4441,15 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
   // The steps' costs, which no earlier start of this model and build on this
   // Mac measured and remembered, for later starts where steady
   // (StepCosts::kSteadySpread).
-  if (impl_->stepCosts && !impl_->stepCosts->measured(width)) {
+  // A lane count's measurement runs on the runway from its page 5
+  // (measureDecodeSteps). The runway is the tip's whole extents: 128 pages
+  // hold every lane count's (a MoE target's 14 points take 69 at eight
+  // lanes), a BF16 KV's 64 not a MoE target's eight lanes, whose cycles then
+  // take a draft's block a lane (StepCosts::choose).
+  if (impl_->stepCosts && !impl_->stepCosts->measured(width) &&
+      !impl_->stepCosts->fits(width, 5, ExecutionLimits::runwayPages(impl_->kvPages.extentPages()))) {
+    logLine("Decode step costs of ", width, " lanes not measured: they take more pages than the startup runway");
+  } else if (impl_->stepCosts && !impl_->stepCosts->measured(width)) {
     const double spread = measureDecodeSteps(width);
     const bool steady = spread <= StepCosts::kSteadySpread;
     logLine("Decode step costs of ", width, width == 1 ? " lane" : " lanes", " measured, medians within ", std::fixed,

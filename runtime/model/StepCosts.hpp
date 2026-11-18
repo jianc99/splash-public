@@ -130,9 +130,9 @@ public:
   // (Runtime::measureDecodeSteps): its prompt's token, a verify block a
   // point and one more.
   static uint32_t lanePages(size_t points);
-  // Throws where a lane count's measurement, its lanes laid from page
-  // `first`, runs past the `runway` pages it is measured on.
-  void requireRunway(uint32_t first, uint32_t runway) const;
+  // Whether a lane count's measurement, its lanes laid from page `first`,
+  // fits the `runway` pages it is measured on.
+  [[nodiscard]] bool fits(uint32_t lanes, uint32_t first, uint32_t runway) const;
   // A lane count's points' costs from its steps' replays: `replays[r][p]`
   // the wall milliseconds of replay r of point p's step. Returns its spread:
   // the most a point's median is past its fastest replay, a fraction of it.

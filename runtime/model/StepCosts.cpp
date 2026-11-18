@@ -124,10 +124,8 @@ uint32_t StepCosts::lanePages(size_t points) {
                                SPLASH_TARGET_KV_BLOCK_TOKENS);
 }
 
-void StepCosts::requireRunway(uint32_t first, uint32_t runway) const {
-  for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)
-    if (first + lanes * lanePages(table(lanes).size()) > runway)
-      throw std::logic_error("a lane count's step costs take more pages than the startup runway");
+bool StepCosts::fits(uint32_t lanes, uint32_t first, uint32_t runway) const {
+  return first + lanes * lanePages(table(lanes).size()) <= runway;
 }
 
 double StepCosts::measure(uint32_t lanes, std::span<const std::vector<double>> replays) {

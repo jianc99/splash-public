@@ -25,8 +25,7 @@ inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 // extents that hold the pages startup warmup runs on, which the KV pool
 // allocates when it is built.
 [[nodiscard]] constexpr uint64_t kvRunwayPages(uint32_t extentPages) noexcept {
-  return (uint64_t{model::ExecutionLimits::warmupKvPages} + extentPages - 1) /
-         extentPages * extentPages;
+  return model::ExecutionLimits::runwayPages(extentPages);
 }
 
 // What one request needs at the least: the fixed bytes, one lane's state and

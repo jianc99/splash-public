@@ -122,7 +122,7 @@ void testStateFormatStatus() {
 }
 
 // The minimum holds the KV runway, the whole smallest extents that hold the
-// pages startup warmup runs on: four of the 27B's 32-page BF16 extents.
+// pages startup warmup runs on: two of the 27B's 32-page BF16 extents.
 void testMinimumHoldsTheWarmupRunway() {
   auto profile = model();
   profile.targetKvLayout.format = kv::Format::BFloat16;
@@ -131,8 +131,7 @@ void testMinimumHoldsTheWarmupRunway() {
   const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
   const auto &budget = plan.breakdown();
   require(budget.minimumDynamicBytes ==
-              budget.laneStateBytes + model::ExecutionLimits::warmupKvPages *
-                                           (budget.kvPageBytes + 32 * model::kLookupIndexTokenBytes),
+              budget.laneStateBytes + 64 * (budget.kvPageBytes + 32 * model::kLookupIndexTokenBytes),
           "the minimum does not hold the warmup runway");
   const auto refused =
       evaluateEngineMemoryPlan(device(), profile, budget.minimumRequiredBytes - 1);
@@ -611,7 +610,7 @@ void testFlashNextOnTheThreeMacs() {
                   charged == hardBudget(mac),
               std::string("Flash-Next's experts on the ") + mac.name + " do not take what the floors leave");
     const uint32_t disk = static_cast<uint32_t>(
-        std::min<uint64_t>(1'010'000, (mac.activeLimit - model::ExecutionLimits::maximumBatchWidth * inputs.stateSlotBytes) / inputs.kvSlotBytes * 32));
+        std::min<uint64_t>(1'010'000, (mac.activeLimit - 4 * inputs.stateSlotBytes) / inputs.kvSlotBytes * 32));
     require(spill.memoryTokens == 1'010'000 && spill.diskTokens == disk &&
                 spill.floorTokens == std::min<uint32_t>(1'010'000, disk),
             std::string("Flash-Next's context bounds on the ") + mac.name + " are wrong");
@@ -967,13 +966,12 @@ void testSpillHoldsTheArenasOfASpillingRuntime() {
 // beside every lane's state: none leaves the resident context. A relaunch
 // keeps its first engine's context.
 void testDiskBoundsTheSpilledContext() {
-  constexpr uint64_t kLanes = model::ExecutionLimits::maximumBatchWidth;
   StreamedMemoryInputs inputs = kFlashNext.inputs(kStudio);
-  inputs.activeLimitBytes = kLanes * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
+  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
   const StreamedMemoryPlan plan = requirePlan(inputs);
   require(plan.spill.diskTokens == 32'000 && plan.spill.floorTokens == 32'000,
           "the disk bound is not the room's slots beside every lane's state");
-  inputs.activeLimitBytes = kLanes * inputs.stateSlotBytes;
+  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes;
   require(requirePlan(inputs).spill.diskTokens == 0, "a full SSD cache bounded nothing");
   // An explicit context is held at its own length.
   inputs = kFlashNext.inputs(kStudio);
@@ -983,11 +981,11 @@ void testDiskBoundsTheSpilledContext() {
   // room the volume has left since; more room serves more.
   inputs = kFlashNext.inputs(kStudio);
   inputs.relaunchContextTokens = 300'000;
-  inputs.activeLimitBytes = kLanes * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
+  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes + 1'000 * inputs.kvSlotBytes;
   const StreamedMemoryPlan relaunched = requirePlan(inputs);
   require(relaunched.spill.diskTokens == 300'000 && relaunched.spill.floorTokens == 300'000,
           "a relaunch served less than its first engine's context for want of SSD room");
-  inputs.activeLimitBytes = kLanes * inputs.stateSlotBytes + 20'000 * inputs.kvSlotBytes;
+  inputs.activeLimitBytes = 4 * inputs.stateSlotBytes + 20'000 * inputs.kvSlotBytes;
   require(requirePlan(inputs).spill.diskTokens == 640'000, "a relaunch did not take the SSD's room past its context");
 }
 
