@@ -2604,6 +2604,10 @@ void MetalBackend::preparePipelines(
     static_cast<void>(impl_->prepare(dispatches));
 }
 
+bool MetalBackend::hasFunction(std::string_view name) const {
+    return [impl_->library.functionNames containsObject:checkedNSString(name, "function name")];
+}
+
 void MetalBackend::beginServing() noexcept {
     impl_->serving.store(true, std::memory_order_relaxed);
 }
