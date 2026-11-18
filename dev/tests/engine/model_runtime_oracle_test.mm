@@ -4582,41 +4582,62 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
 }
 
 // What requireArgmaxChain compared: the tokens, those the target ranked
-// first, and the largest gap below the target's best of one it did not.
+// first, each token's gap below the one-row path's best logit, and each
+// row's rounding between the two paths (largestDifferenceOfTop).
 struct ArgmaxChain final {
   uint32_t tokens = 0;
   uint32_t first = 0;
-  float gap = 0.0F;
+  std::vector<float> gaps;
+  std::vector<float> rounding;
 };
 
+// The largest difference of two logit rows over the logits either ranks
+// among its kTop largest, where the token a row selects and its nearest
+// rivals are. Over the whole vocabulary the tail decides it: up to 25.6 on
+// Flint UD-Q4_K_XL and 2.1 on Qwen3.8-27B 4-bit between the same two paths
+// whose top differences stay at 9.6 and 1.7 at most (64 GB M5 Pro, 36 GB M5
+// Max).
+float largestDifferenceOfTop(std::span<const float> a, std::span<const float> b) {
+  constexpr size_t kTop = 16;
+  require(a.size() == b.size() && a.size() >= kTop, "two logit rows of different shapes");
+  std::vector<uint32_t> ids;
+  for (const std::span<const float> row : {a, b}) {
+    std::vector<uint32_t> order(row.size());
+    std::iota(order.begin(), order.end(), 0U);
+    std::partial_sort(order.begin(), order.begin() + kTop, order.end(),
+                      [&](uint32_t x, uint32_t y) { return row[x] > row[y]; });
+    ids.insert(ids.end(), order.begin(), order.begin() + kTop);
+  }
+  float largest = 0.0F;
+  for (const uint32_t id : ids)
+    if (!test::unselectableLogit(a[id]) && !test::unselectableLogit(b[id]))
+      largest = std::max(largest, std::fabs(a[id] - b[id]));
+  return largest;
+}
+
 // A greedy lane's `tokens`, which it emitted after `request`'s prompt, are
-// the target's argmax chain. The request again, in state lane `stateLane` on
-// `pages`, decodes one row a cycle (a forced step of one row: the target's
-// own decode, which verifies its anchor alone and so takes none of the
-// draft's trees, the step costs' rows and lane caps, the layout's packing or
-// the acceptance's walk), teacher-forced along the tokens by a thinking
-// budget of no tokens whose end they are (an end's rows select it whatever
-// their logits), and each token must be the largest of the raw logits of the
-// row that selected it (RuntimeInstrumentation::captureTargetLogits) among
-// the tokens a lane that ignores end-of-sequence admits, or within
-// kNearTie of it. A step of other rows rounds a row's logits otherwise (a
-// lane's logits alone and in a step of other rows keep cosines of 0.9996 to
-// 0.9999, requireMixedStepMatchesLanesAlone), which may order two nearly
-// equal tokens either way (the largest gaps of such ties this check found,
-// of about 500 tokens a run, were 0.08, 0.11 and 0.24 on Qwen3.6-35B-A3B
-// and 0.0015 on Qwen3.8-27B); a token the target ranks half a logit or more
-// below its best, twice the largest of them, is no rounding but a wrong
-// token, or one computed from a wrong history (a token emitted out of its
-// path's order, or an auto step's K/V committed along another path, lay
-// 10.8 and 11.0 below on the 35B). Forcing the
-// lane's own tokens keeps every later token checked
-// past such a tie. The end closes with a token the lane did not emit, the
-// only one that ends its thinking (ThinkingBudget::unusable), so that the
-// tokens may hold </think> anywhere; the check ends before the close.
+// the target's argmax chain within the rounding of its paths. The request
+// again, in state lane `stateLane` on `pages`, decodes one row a cycle (a
+// forced step of one row: the target's own decode, which verifies its anchor
+// alone and so takes none of the draft's trees, the step costs' rows and lane
+// caps, the layout's packing or the acceptance's walk), teacher-forced along
+// the tokens by a thinking budget of no tokens whose end they are (an end's
+// rows select it whatever their logits); each token's gap below the largest
+// of the raw logits of the row that selected it
+// (RuntimeInstrumentation::captureTargetLogits), among the tokens a lane that
+// ignores end-of-sequence admits, is its chain's (gaps). Its control, run
+// first: the same tokens forced the same way in steps of kControlRows rows,
+// branch-free, so that it runs no tree, no acceptance walk and no commit
+// along a chosen path, the errors the gaps exist to catch; each row's
+// largestDifferenceOfTop between the two paths is its rounding, which the
+// caller bounds the gaps with (requireNearTies). The end closes with a token
+// the lane did not emit, the only one that ends its thinking
+// (ThinkingBudget::unusable), so that the tokens may hold </think> anywhere;
+// both passes end before the close.
 ArgmaxChain requireArgmaxChain(model::Runtime &executor, const ops::StopTokens &stops, EngineRequest request,
                                uint32_t stateLane, const std::vector<uint32_t> &pages,
                                std::span<const uint32_t> checked) {
-  constexpr float kNearTie = 0.5F;
+  constexpr uint32_t kControlRows = 16;
   require(!checked.empty(), "a greedy lane emitted no token to check");
   uint32_t close = 0;
   while (std::ranges::find(checked, close) != checked.end() || stops.contains(close)) ++close;
@@ -4624,6 +4645,40 @@ ArgmaxChain requireArgmaxChain(model::Runtime &executor, const ops::StopTokens &
   end.push_back(close);
   request.thinkingBudget = ThinkingBudget{0, end, close};
   ArgmaxChain chain;
+  // The control's logits by the token their row selects (row r of a step
+  // whose anchor is token n - 1 selects token n + r); token 0, the prompt's
+  // last row, is the same row in both passes.
+  std::vector<std::vector<float>> control(checked.size());
+  {
+    EngineRequest forced = request;
+    forced.id = request.id + 100;
+    model::RuntimeInstrumentation::captureTargetLogits(executor, true);
+    beginCold(executor, forced, stateLane);
+    require(prefillChunk(executor, forced.id, 0, forced.prompt, pages).failure.empty(),
+            "the control of a greedy lane's chain failed its prompt");
+    static_cast<void>(model::RuntimeInstrumentation::takeTargetLogits(executor));
+    model::RuntimeInstrumentation::forceStepRows(executor, kControlRows);
+    for (size_t at = 1; at < checked.size();) {
+      BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+      plan.items.push_back({forced.id, 0});
+      const std::vector<ModelBatchItem> items{withRevision(
+          {.requestId = forced.id, .logicalPosition = forced.prompt.size() + at - 1, .pageTable = pages})};
+      const std::vector<ModelStepResult> results = executor.decode(plan, items);
+      std::vector<std::vector<float>> logits = model::RuntimeInstrumentation::takeTargetLogits(executor);
+      const uint32_t rows = model::RuntimeInstrumentation::lastVerifyRows(executor, 0);
+      require(results.size() == 1 && results[0].failure.empty() && !results[0].outputTokens.empty() &&
+                  logits.size() == 1 && rows && logits[0].size() % rows == 0,
+              "the control of a greedy lane's chain failed a step");
+      const size_t vocabulary = logits[0].size() / rows;
+      for (size_t row = 0; row < rows && at + row < checked.size(); ++row)
+        control[at + row].assign(logits[0].begin() + static_cast<std::ptrdiff_t>(row * vocabulary),
+                                 logits[0].begin() + static_cast<std::ptrdiff_t>((row + 1) * vocabulary));
+      at += results[0].outputTokens.size();
+    }
+    model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+    model::RuntimeInstrumentation::captureTargetLogits(executor, false);
+    executor.end(forced.id);
+  }
   // Row `at`'s logits, which selected checked[at].
   const auto check = [&](uint32_t at, std::optional<uint32_t> selected) {
     std::vector<std::vector<float>> rows = model::RuntimeInstrumentation::takeTargetLogits(executor);
@@ -4636,13 +4691,13 @@ ArgmaxChain requireArgmaxChain(model::Runtime &executor, const ops::StopTokens &
     for (uint32_t id = 0; id < logits.size(); ++id)
       if (!stops.contains(id) && !test::unselectableLogit(logits[id])) best = std::max(best, logits[id]);
     const float gap = best - logits.at(token);
-    require(!stops.contains(token) && !test::unselectableLogit(logits[token]) && gap <= kNearTie,
-            "a greedy lane's token " + std::to_string(at) + " (" + std::to_string(token) + ") lies " +
-                std::to_string(gap) + " below the target's best logit, past a near tie's " +
-                std::to_string(kNearTie));
+    require(!stops.contains(token) && !test::unselectableLogit(logits[token]),
+            "a greedy lane's token " + std::to_string(at) + " (" + std::to_string(token) +
+                ") is a stop token or one no lane may select");
     ++chain.tokens;
     chain.first += gap <= 0.0F;
-    chain.gap = std::max(chain.gap, gap);
+    chain.gaps.push_back(gap);
+    if (!control[at].empty()) chain.rounding.push_back(largestDifferenceOfTop(logits, control[at]));
   };
   model::RuntimeInstrumentation::captureTargetLogits(executor, true);
   model::RuntimeInstrumentation::forceStepRows(executor, 1);
@@ -4661,6 +4716,45 @@ ArgmaxChain requireArgmaxChain(model::Runtime &executor, const ops::StopTokens &
   model::RuntimeInstrumentation::captureTargetLogits(executor, false);
   executor.end(request.id);
   return chain;
+}
+
+// A greedy chain's tokens lie within the rounding of its two paths below the
+// one-row path's best: each gap at most twice the 90th percentile of the
+// rows' largestDifferenceOfTop against the control (a token emitted on one
+// path lies at most twice the two paths' largest difference below the other
+// path's best; a percentile, as the largest of hundreds of rows of a
+// heavy-tailed rounding is an outlier's), at least kFloor and at most
+// kCeiling. Measured, make test-real's first run (scratch probe, 11-17): the
+// control's 90th percentile and the chain's largest gap were 0.18 and 0.0015
+// on Qwen3.8-27B MLX 4-bit and 0.19 and 0.040 on its UD-Q4_K_M (36 GB M5
+// Max), 0.87 and 0.20 on Flint mixed-3-4bit and 1.19-1.30 and 0.35-0.56 on
+// Flint UD-Q4_K_XL (64 GB M5 Pro), whose gaps reached 0.80 in other runs
+// (and the mixed-3-4bit's 1.50 with bf16 K/V): its routed experts' tiles and
+// its attention carry a step's rounding further than the Qwen models'.
+// Errors lie far past kCeiling: a step's K/V committed along no accepted path
+// put a token 9.2 below the best on Qwen3.8-27B MLX 4-bit and 29.5 on Flint
+// UD-Q4_K_XL, a lane's tokens emitted out of order 17.5 and 28.8 (10.8 and
+// 11.0 on Qwen3.6-35B-A3B before), and kCeiling keeps a run whose own
+// rounding grows past it from calibrating itself into passing. What it cannot
+// do: a change that enlarges a model's rounding enlarges the control with it,
+// so this does not guard precision (dev/benchmarks/logit_compare.py does).
+// Nor does the control cover every width: it is a step of kControlRows rows,
+// so a change that makes one-row and 16-row steps alike drops the bound to
+// kFloor while wider steps still round.
+void requireNearTies(const ArgmaxChain &chains) {
+  constexpr float kFloor = 0.05F, kCeiling = 2.0F;
+  require(!chains.gaps.empty() && !chains.rounding.empty(), "the greedy chains checked no token");
+  std::vector<float> rounding = chains.rounding;
+  std::ranges::sort(rounding);
+  const float tenth = rounding[rounding.size() * 9 / 10];
+  const float bound = std::clamp(2.0F * tenth, kFloor, kCeiling);
+  const auto largest = std::ranges::max_element(chains.gaps);
+  require(*largest <= bound, "a greedy lane's token lies " + std::to_string(*largest) +
+                                 " below the target's best logit, past twice its paths' rounding (" +
+                                 std::to_string(tenth) + " at the 90th percentile of " +
+                                 std::to_string(rounding.size()) + " rows; bound " + std::to_string(bound) + ")");
+  std::cout << "budgeted_greedy_chain=PASS tokens=" << chains.tokens << " target_first=" << chains.first
+            << " largest_gap=" << *largest << " rounding_p90=" << tenth << " bound=" << bound << '\n';
 }
 
 // Under --verify-rows auto a decode cycle's rows follow the step costs the
@@ -4858,15 +4952,14 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
     const Lane &lane = lanes[index];
     EngineRequest direct = lane.request;
     direct.id = 820 + index;
-    const ArgmaxChain chain =
-        requireArgmaxChain(executor, stops, direct, lane.stateLane, lane.pages,
-                           std::span(lane.tokens).first(std::min<size_t>(lane.tokens.size(), 256)));
+    ArgmaxChain chain = requireArgmaxChain(executor, stops, direct, lane.stateLane, lane.pages,
+                                           std::span(lane.tokens).first(std::min<size_t>(lane.tokens.size(), 256)));
     chains.tokens += chain.tokens;
     chains.first += chain.first;
-    chains.gap = std::max(chains.gap, chain.gap);
+    chains.gaps.insert(chains.gaps.end(), chain.gaps.begin(), chain.gaps.end());
+    chains.rounding.insert(chains.rounding.end(), chain.rounding.begin(), chain.rounding.end());
   }
-  std::cout << "budgeted_greedy_chain=PASS tokens=" << chains.tokens << " target_first=" << chains.first
-            << " largest_gap=" << chains.gap << '\n';
+  requireNearTies(chains);
 
   // One lane's steps of every row count from 1 to a verify block's, those
   // of 9 to 15 rows at the cap of 16.
