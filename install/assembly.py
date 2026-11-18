@@ -275,6 +275,14 @@ def family(path: Path):
     return record and families.named(record["family"])
 
 
+def vision(path: Path) -> bool:
+    """Whether the assembly path names serves images: its record has a vision
+    tower, which the engine reads from the same record (ModelDescriptor.mm
+    inspectModelRoot) and announces in its Ready."""
+    record = recorded(path)
+    return record is not None and record["vision_format"] != "none"
+
+
 def vocabulary(path: Path) -> int:
     """The vocabulary the assembly path names serves: its DFlash2 draft's
     (draft/config.json), which the engine refuses unless it is its target's

@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
 from dataclasses import asdict, dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -54,7 +55,7 @@ from .errors import (
     field_error,
     remaining_request_time,
 )
-from .frontend import Frontend, accepts_sampling
+from .frontend import Frontend, accepts_sampling, served_names
 from .http_security import (
     OriginRefused,
     RefusedOriginLog,
@@ -63,7 +64,7 @@ from .http_security import (
     validate_headers,
 )
 from .images import MAX_ASPECT, MAX_IMAGE_BYTES
-from .latency import RequestLatency
+from .latency import LatencyMetrics, RequestLatency
 from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
 from .output import (
@@ -182,6 +183,11 @@ class Route:
     # Whether it takes no fields: a request carries no body or an empty JSON
     # object.
     fieldless: bool = False
+    # Whether a --lazy-load server answers it before its engine has loaded,
+    # from what the server knows without one (UnloadedApp): the chat page,
+    # the probes, the stored responses and a release. Every other route needs
+    # the engine, and its first request loads it (FrontendServer.frontend).
+    answers_unloaded: bool = False
     # A header that gives every answer on its path, by any method and errors
     # too, a fresh request id: TypeSafe's SDK reads one on the routes it
     # calls.
@@ -524,8 +530,22 @@ class FrontendHandler(BaseHTTPRequestHandler):
         route, captured = find_route(self.route, method)
         if route is None:
             self.safe_error(APIError(404, "not found", "not_found"))
-        else:
+        elif self._loaded(route):
             route.handler(self, *captured)
+
+    def _loaded(self, route):
+        """Whether the server can serve `route` now: where it needs the
+        engine, once the engine has loaded, which on a --lazy-load server
+        the first such request waits for (FrontendServer.frontend). False
+        once a load that failed has been answered."""
+        if route.answers_unloaded:
+            return True
+        try:
+            self.server.frontend()
+        except APIError as error:
+            self.safe_error(error)
+            return False
+        return True
 
     def _get_page(self):
         path = self.route
@@ -543,7 +563,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self.send_json(200, {"status": "ok"})
 
     def _get_ready(self):
-        ready = self.app.backend.is_ready()
+        backend = self.app.backend
+        if backend.unloaded:
+            # A request sent now is served, by loading the engine, as one is
+            # while the weights are released.
+            self.send_json(200, {"status": "unloaded"})
+            return
+        ready = backend.is_ready()
         self.send_json(
             200 if ready else 503, {"status": "ready" if ready else "unavailable"}
         )
@@ -618,6 +644,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
         route, _ = find_route(self.route, "POST")
         if route is None:
             self.safe_error(APIError(404, "not found", "not_found"))
+            return
+        if not self._loaded(route):
             return
         refusal = None if route.prompt_only else self.app.backend.refusal()
         if refusal is not None:
@@ -952,7 +980,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
 
 _MODEL_PATH = re.compile(r"/v1/models/(.*)", re.DOTALL)
-_PAGE = Route(FrontendHandler._get_page, public=True)
+_PAGE = Route(FrontendHandler._get_page, public=True, answers_unloaded=True)
 
 # Every endpoint, by its method and its path or path pattern.
 ROUTES = {
@@ -960,18 +988,29 @@ ROUTES = {
         ("GET", path): _PAGE
         for path in ("/", "/index.html", "/favicon.ico", *CHAT_ASSETS)
     },
-    ("GET", "/health"): Route(FrontendHandler._get_health, public=True),
-    ("GET", "/ready"): Route(FrontendHandler._get_ready, public=True),
-    ("GET", "/status"): Route(FrontendHandler._get_status),
-    ("GET", "/metrics"): Route(FrontendHandler._get_metrics),
-    ("GET", dialects.responses.RESPONSE_PATH): Route(dialects.responses.get),
-    ("DELETE", dialects.responses.RESPONSE_PATH): Route(dialects.responses.delete),
+    ("GET", "/health"): Route(
+        FrontendHandler._get_health, public=True, answers_unloaded=True
+    ),
+    ("GET", "/ready"): Route(
+        FrontendHandler._get_ready, public=True, answers_unloaded=True
+    ),
+    ("GET", "/status"): Route(FrontendHandler._get_status, answers_unloaded=True),
+    ("GET", "/metrics"): Route(FrontendHandler._get_metrics, answers_unloaded=True),
+    ("GET", dialects.responses.RESPONSE_PATH): Route(
+        dialects.responses.get, answers_unloaded=True
+    ),
+    ("DELETE", dialects.responses.RESPONSE_PATH): Route(
+        dialects.responses.delete, answers_unloaded=True
+    ),
     ("GET", "/v1/models"): Route(
         FrontendHandler._get_models,
         request_id_header=dialects.scoring.REQUEST_ID_HEADER,
+        answers_unloaded=True,
     ),
     ("GET", _MODEL_PATH): Route(
-        FrontendHandler._get_model, request_id_header=dialects.scoring.REQUEST_ID_HEADER
+        FrontendHandler._get_model,
+        request_id_header=dialects.scoring.REQUEST_ID_HEADER,
+        answers_unloaded=True,
     ),
     ("POST", "/v1/chat/completions"): Route(dialects.openai.post_chat),
     ("POST", "/v1/chat/completions/count_tokens"): Route(
@@ -998,7 +1037,7 @@ ROUTES = {
         request_id_header=dialects.scoring.REQUEST_ID_HEADER,
     ),
     ("POST", "/v1/memory/release"): Route(
-        FrontendHandler._post_memory_release, fieldless=True
+        FrontendHandler._post_memory_release, fieldless=True, answers_unloaded=True
     ),
 }
 
@@ -1031,6 +1070,100 @@ def path_errors(path):
     if path.startswith("/v1/messages/"):
         return dialects.anthropic.ERRORS
     return OPENAI_ERRORS
+
+
+class UnloadedApp:
+    """A --lazy-load server's app until its engine has loaded, which answers
+    from what the server knows without the engine (Route.answers_unloaded):
+    the probes, from the backend, which says the server is unloaded; the
+    model's names and the input it takes, with what only the engine's Ready
+    says (its context, and the reasoning its Frontend reports) null; the
+    stored responses; and a release of weights not loaded.
+
+    open() makes, for the first request that needs the engine, the start a
+    server without --lazy-load makes before it answers (`load`), and returns
+    the Frontend made from its Ready; the requests that arrive meanwhile wait
+    for that start and share its outcome. A start that fails fails them and
+    leaves the server unloaded: the next request starts again, as one does
+    after a restore that failed, and from the first Ready on the engine is
+    supervised as on any server."""
+
+    # What only the engine's Ready says.
+    max_context = None
+    reasoning = None
+    # The Frontend's, which read vision and the request timeout alone.
+    input_modalities = Frontend.input_modalities
+    request_deadline = Frontend.request_deadline
+
+    def __init__(
+        self,
+        backend,
+        model,
+        request_timeout,
+        response_store,
+        load,
+        *,
+        vision,
+        served_model_names=(),
+        announce_served_name=False,
+    ):
+        self.backend = backend
+        self.model = model
+        # The installation's, which the engine's Ready announces in turn
+        # (assembly.vision).
+        self.vision = vision
+        self.response_model, self.model_names = served_names(
+            model, served_model_names, announce_served_name
+        )
+        self.request_timeout = request_timeout
+        self.response_store = response_store
+        # Handed on to the Frontend, which goes on measuring with them.
+        self.latencies = LatencyMetrics()
+        # load(latencies): wait for the engine's Ready, then the Frontend.
+        self.load = load
+        self.lock = threading.Lock()
+        # The start under way, or the one that loaded the engine.
+        self.loading = None
+        # Why the last start failed, which /status reports; None once one
+        # loads.
+        self.failure = None
+
+    def status(self):
+        status = self.backend.status()
+        with self.lock:
+            failure = self.failure
+        if failure is not None:
+            status["transport"]["error"] = failure
+        status["latency"] = self.latencies.snapshot()
+        return status
+
+    def open(self):
+        with self.lock:
+            loading = self.loading
+            owner = loading is None
+            if owner:
+                loading = self.loading = Future()
+        if owner:
+            print_status(f"Loading · {self.model}")
+            try:
+                app = self.load(self.latencies)
+            except Exception as error:
+                print_status(f"Error · {self.model} did not load: {error}", error=True)
+                with self.lock:
+                    self.loading = None
+                    self.failure = str(error)
+                loading.set_exception(NativeBackend._api_error(error))
+            else:
+                with self.lock:
+                    self.failure = None
+                loading.set_result(app)
+        try:
+            return loading.result()
+        except APIError as error:
+            # Each request answers with its own.
+            raise APIError(
+                error.status, error.message, error.code, error.retry_after
+            ) from None
 
 
 class FrontendServer(HTTPServer):
@@ -1107,6 +1240,15 @@ class FrontendServer(HTTPServer):
         )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
+
+    def frontend(self):
+        """The Frontend, which serves the routes that need the engine: a
+        --lazy-load server's first request that needs it loads the engine,
+        and those that arrive meanwhile wait for that (UnloadedApp.open)."""
+        app = self.app
+        if isinstance(app, UnloadedApp):
+            app = self.app = app.open()
+        return app
 
     def status(self):
         status = self.app.status()
@@ -1412,15 +1554,20 @@ def main():
             # the reader thread, which must not block (on_warming):
             # print_status only queues the line for the console's one writer,
             # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
+            # A --lazy-load server's record says ready before its engine
+            # loads, and /status says how far that load is.
             print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
-            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+            if not args.lazy_load:
+                serve_record.warming(args.serve_record, event.steps_done, event.steps)
 
         # The engine starts now and reads its weights while this process
         # imports the tokenizer's library and loads the tokenizer and the
         # chat template, which it needs none of: on a 32-core M5 Max, with
         # the 27B and the 35B, that was 1.2-1.3 s of a 12.2 s start spent
         # before the engine was spawned. A failure here closes the engine
-        # (finally, below); one of the engine's is raised by wait_ready.
+        # (finally, below); one of the engine's is raised by wait_ready. A
+        # --lazy-load server starts it for its first request that needs it
+        # (UnloadedApp).
         runtime = engine_runtime.MultiplexedRuntime(
             _native_command(args, model_root),
             relaunch_command=lambda first: _native_command(
@@ -1429,7 +1576,8 @@ def main():
             pending_limit=args.queue_size,
         )
         runtime.on_warming = warming
-        runtime.start()
+        if not args.lazy_load:
+            runtime.start()
         # Imported here, while the engine loads: transformers takes 0.35-0.75 s.
         from transformers import AutoTokenizer
 
@@ -1484,33 +1632,69 @@ def main():
         # A server that serves nothing more stops as on SIGTERM and exits
         # ENGINE_STOPPED_STATUS below.
         backend.on_stopped = stop_serving
-        if not runtime.wait_ready():
-            raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
-        # The engine is authoritative for what it serves: it refuses a
-        # --max-context it cannot serve.
-        served = runtime.capabilities
-        check_capabilities(tokenizer, family.chat_format, served)
-        app = Frontend(
-            tokenizer,
-            backend,
-            args.model,
-            # No deadline unless given, as in vLLM and SGLang; a request still
-            # ends when its client disconnects.
-            math.inf if args.request_timeout is None else args.request_timeout,
-            constraint_factory=ConstraintFactory(grammar_table, served),
-            chat_templates=chat_templates,
-            chat_format=family.chat_format,
-            sampling_defaults=_sampling_defaults(family, args),
-            max_image_pixels=args.max_image_pixels,
-            thinking_codec=thinking_codec,
-            response_store=dialects.responses.ResponseStore(),
-            served_model_names=args.served_model_name,
-            announce_served_name=args.announce_served_name,
-            reasoning_effort=args.reasoning_effort,
-            default_reasoning_effort=args.default_reasoning_effort,
-            default_thinking_token_budget=args.thinking_token_budget,
+        # No deadline unless given, as in vLLM and SGLang; a request still
+        # ends when its client disconnects.
+        request_timeout = (
+            math.inf if args.request_timeout is None else args.request_timeout
         )
-        server.app = app
+        response_store = dialects.responses.ResponseStore()
+
+        def load(latencies=None):
+            """The rest of the start, once the engine is Ready: the Frontend
+            that serves it, which goes on with `latencies` where given."""
+            if not runtime.wait_ready():
+                raise engine_runtime.EngineUnhealthy(
+                    "native runtime did not become ready"
+                )
+            # The engine is authoritative for what it serves: it refuses a
+            # --max-context it cannot serve.
+            served = runtime.capabilities
+            check_capabilities(tokenizer, family.chat_format, served)
+            return Frontend(
+                tokenizer,
+                backend,
+                args.model,
+                request_timeout,
+                constraint_factory=ConstraintFactory(grammar_table, served),
+                chat_templates=chat_templates,
+                chat_format=family.chat_format,
+                sampling_defaults=_sampling_defaults(family, args),
+                max_image_pixels=args.max_image_pixels,
+                thinking_codec=thinking_codec,
+                response_store=response_store,
+                served_model_names=args.served_model_name,
+                announce_served_name=args.announce_served_name,
+                reasoning_effort=args.reasoning_effort,
+                default_reasoning_effort=args.default_reasoning_effort,
+                default_thinking_token_budget=args.thinking_token_budget,
+                latencies=latencies,
+            )
+
+        def serving():
+            """The context and input the engine serves, as Ready lines say."""
+            served = runtime.capabilities
+            tokens = served.max_context_tokens
+            context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
+            return f"context {context}" + ("" if served.vision else " · text only")
+
+        def load_lazily(latencies):
+            app = load(latencies)
+            print_status(f"Loaded · {args.model} · {serving()}")
+            return app
+
+        if args.lazy_load:
+            server.app = UnloadedApp(
+                backend,
+                args.model,
+                request_timeout,
+                response_store,
+                load_lazily,
+                vision=assembly.vision(model_root),
+                served_model_names=args.served_model_name,
+                announce_served_name=args.announce_served_name,
+            )
+        else:
+            server.app = load()
         server.server_activate()
         # The app takes the server for ready from its record alone: one that
         # cannot say so has not started (serve_record).
@@ -1522,10 +1706,8 @@ def main():
             if server.address_family == socket.AF_UNIX
             else f"http://{args.host}:{server.server_port}"
         )
-        tokens = served.max_context_tokens
-        context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
-        mode = "" if served.vision else " · text only"
-        print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
+        loaded = "loads on the first request" if args.lazy_load else serving()
+        print_status(f"Ready · {args.model} · {loaded} · {address}")
         server.serve_forever()
     except engine_runtime.EngineStartFailed as error:
         _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))

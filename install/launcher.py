@@ -26,7 +26,7 @@ if __name__ == "__main__" and not __package__:
 # The options, the record and the console serve shares with the server, in
 # modules of the standard library alone: the launcher runs before .venv
 # exists.
-from server import diagnostics, serve_options, serve_record, unix_socket
+from server import diagnostics, serve_options, serve_record, supervision, unix_socket
 
 from . import clients, paths
 from . import models as model_artifacts
@@ -125,13 +125,22 @@ def _base_url(port):
 _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "0.0.0.0")
 
 
+# How long past the server's own bound on a load the launcher waits for the
+# server's answer.
+HTTP_ANSWER_SECONDS = 30
+
 # The server is on this Mac's loopback: requests to it connect directly, so
 # no proxy, the environment's or the system's, receives the server's key.
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT):
+def _request_json(path, timeout=2, *, port=serve_options.DEFAULT_PORT, body=None):
+    """The server's JSON answer to a GET of `path`, or to a POST of `body`;
+    None for no answer or an error but a refused key."""
     request = urllib.request.Request(_base_url(port) + path)
+    if body is not None:
+        request.data = json.dumps(body).encode()
+        request.add_header("Content-Type", "application/json")
     if key := os.environ.get("SPLASH_API_KEY"):
         request.add_header("Authorization", f"Bearer {key}")
     try:
@@ -577,6 +586,32 @@ def coding_client(args):
             )
         raise LauncherError(message)
     models = listing.get("data", []) if isinstance(listing, dict) else []
+    if (
+        isinstance(models, list)
+        and models
+        and isinstance(models[0], dict)
+        and models[0].get("owned_by") == "splash"
+        and models[0].get("context_length") is None
+    ):
+        # A --lazy-load server that has not loaded its model, whose context
+        # the agent is set up with: it loads it for the cheapest request
+        # that needs it, a token count, which waits for the load. The server
+        # gives up on a load after its start timeout and answers why.
+        diagnostics.print_line(f"Loading {models[0].get('id')}...")
+        if (
+            _request_json(
+                "/v1/chat/completions/count_tokens",
+                supervision.START_TIMEOUT_SECONDS + HTTP_ANSWER_SECONDS,
+                port=args.port,
+                body={"messages": [{"role": "user", "content": "hi"}]},
+            )
+            is None
+        ):
+            raise LauncherError(
+                "Splash could not load its model; the server's log says why"
+            )
+        listing = _request_json("/v1/models", port=args.port)
+        models = listing.get("data", []) if isinstance(listing, dict) else []
     if (
         not isinstance(models, list)
         or not models

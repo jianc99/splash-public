@@ -630,6 +630,14 @@ class MultiplexedRuntime:
             )
 
     @property
+    def starting(self) -> bool:
+        """Whether an engine's startup is under way, until its Ready or its
+        failure."""
+        with self._state_lock:
+            attempt = self._startup_attempt
+            return attempt is not None and not attempt.event.is_set()
+
+    @property
     def last_start_seconds(self) -> float | None:
         """The seconds the latest engine took from its spawn to Ready; None
         until an engine was Ready."""

@@ -138,6 +138,7 @@ class StatusRouteTests(HarnessTestCase):
             snapshot["transport"],
             {
                 "ready": True,
+                "unloaded": False,
                 "recovering": False,
                 "stopped": False,
                 "pending": 0,

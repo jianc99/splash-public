@@ -85,6 +85,51 @@ the Mac from sleeping automatically, as `caffeinate -i` does; the display may
 still sleep, and closing the lid or choosing Sleep still sleeps the Mac.
 `serve --allow-idle-sleep` lets it sleep automatically.
 
+### Loading on the first request
+
+`serve --lazy-load` starts the server without its engine: it loads the
+tokenizer and the chat template, answers at once, and leaves the weights on
+the SSD until a request needs them, for a server started at login and used
+hours later, or never. The first request that needs the engine starts it as a
+start without the option does: it loads the weights, warms up and, on a
+model's first start with a new version, prepares the GPU's programs and
+measures its decode steps, which can take a couple of minutes. On a 64 GB M5
+Pro with Qwen3.6-35B-A3B's GGUF, its weights in macOS's file cache and its
+step costs measured by an earlier start, the first request's first token came
+5.3 s after it arrived (the second request's 0.03 s, a request's after an idle
+release 3.3 s); weights read from the SSD, or a first start with a new
+version, take longer. Every
+request that arrives meanwhile waits for that one load and is then served as
+on a server that loaded at start, its `timeout` and `--request-timeout`
+counting from its arrival; a load is given up after 600 s. Nothing reaches the
+client before the load ends, a stream's headers included, so a client's
+timeout for a response's headers must cover it.
+
+Generation in each API, `/v1/judgments`, `/v1/systemone` and the endpoints
+that only count or render a prompt (`count_tokens`, `/tokenize`,
+`/apply-template`) need the engine: they are checked against the context the
+loaded engine serves. Until the first load ends the server answers the rest
+without loading: `/health`; `/ready` with 200 and `{"status": "unloaded"}`, as
+a request sent then is served; `/status` and `/metrics` with
+`transport.unloaded` true, `ready` false and `weights.released` true,
+`weights.restoring` while the load runs ([status](api.md#status-readiness-and-metrics));
+`/v1/models` with the names, the input the model takes and `limits`, and
+`null` for `context_length`, `max_model_len` and `reasoning`, which the
+loaded engine and its chat template give; stored responses (none);
+and `POST /v1/memory/release`, 200 with nothing loaded, 409 `engine_busy`
+while the load runs. A load that fails answers every request waiting for it
+with 503 `runtime_unavailable` and the failure, which the console prints and
+`transport.error` reports; the server stays up and unloaded, and the next
+request loads again, as a request does after a restore of released weights
+that failed. From the first load on, the engine is the one [engine restarts](#engine-restarts-and-sleep)
+and `--idle-release` describe, and the server never returns to unloaded. The
+[serve record](#serve-record) says `ready` once the server answers, before the
+load; the load's warm-up lines reach the console. The agent commands (`splash
+claude` and the others) have an unloaded server load its model before they
+read its context (`Loading MODEL...`). The SSD cache's options act when the
+engine starts, so `--max-cache-disk auto` follows the volume's free space at
+the first request.
+
 ### Serve record
 
 `splash serve` writes what it is at to `serve-PORT.json` in the runtime
@@ -180,6 +225,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--expert-memory` | Auto | MoE targets: the memory routed experts keep, e.g. `16G`; they stream through a store of exactly this size, which neither grows nor gives memory back, and read the other experts from the SSD when a step routes them; a size that holds every expert, or `off`, loads them all. Auto loads them all where memory holds them, else gives them what the context leaves, given back down to their floor while requests need it. See [streamed experts](#streamed-experts). |
 | `--sparse-kv-memory` | Auto | Qwen3.8-Flash-Next: memory for the KV blocks read back from the SSD for requests whose KV is there, e.g. `1200M`; never below its floor, which auto keeps. See [KV on the SSD](#kv-on-the-ssd). |
 | `--idle-release` | `10m` | Time without a request before the engine unwires its memory and frees the weights; the next request restores them. `off` keeps both, though `POST /v1/memory/release` still frees the weights. See [weight loading](internals.md#weight-loading). |
+| `--lazy-load` | Off | Start without loading the model: the first request that needs it loads the weights and warms up, and requests that arrive meanwhile wait for that load. See [loading on the first request](#loading-on-the-first-request). |
 | `--max-cache-disk` | `auto` | SSD quota for cached KV pages and states: `auto` follows the volume, a quarter of its free space beyond a floor of 10 GiB (5% of a volume under 200 GiB), at most 32 GiB; a size such as `16G` is held as given while the volume keeps that floor; `0` turns the cache off. Kept for the session, or across restarts with `--persistent-cache`. See [SSD cache](#ssd-cache). |
 | `--max-cache-disk-writes` | `0` (no limit) | The most the SSD cache writes a day, e.g. `200G`. See [SSD cache](#ssd-cache). |
 | `--persistent-cache` | Off | Keep the SSD cache across restarts. See [persistent cache](#persistent-cache). |

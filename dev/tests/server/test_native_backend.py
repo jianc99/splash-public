@@ -883,6 +883,7 @@ class NativeBackendContractTests(unittest.TestCase):
             status["transport"],
             {
                 "ready": True,
+                "unloaded": False,
                 "recovering": False,
                 "stopped": False,
                 "pending": 0,

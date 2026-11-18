@@ -464,6 +464,7 @@ class FakeRuntime:
         self.restart_count = 0
         self.last_start_seconds = 0.0
         self.spawned_at = None
+        self.starting = False
         self.last_crash_trace = None
         self.status_event = native_peer.status_event()
         self.release_event = native_peer.status_event(weights=RELEASED_WEIGHTS)
@@ -915,6 +916,7 @@ def main_args(**overrides):
             "max_context": None,
             "max_memory": None,
             "idle_release": None,
+            "lazy_load": False,
             "max_cache_disk": None,
             "max_cache_disk_writes": 0,
             "persistent_cache": False,
