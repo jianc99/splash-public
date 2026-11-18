@@ -191,10 +191,11 @@ final class AppState {
         case .ready:
             let look: MarkLook = switch server.serving {
             case .running: .on
-            case .sleeping: .asleep
-            case .recovering: .loading
+            case .sleeping, .notLoaded: .asleep
+            case .recovering, .loading: .loading
+            case .loadFailed: .failed
             }
-            return ServerStatus(look: look, phrase: server.serving.rawValue)
+            return ServerStatus(look: look, phrase: server.serving.rawValue, note: server.serving == .loadFailed ? server.loadError : nil)
         case .failed:
             return ServerStatus(look: .failed, phrase: "Ran into a problem")
         }

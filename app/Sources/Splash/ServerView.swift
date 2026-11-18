@@ -52,11 +52,12 @@ private struct ServerSections: View {
         let first = state.installed.isEmpty
         let failed = if case .failed = state.server.phase { true } else { false }
         let warming = state.server.phase == .starting && state.server.step == .warming
+        let loadFailed = state.server.phase == .ready && state.server.serving == .loadFailed
         Group {
             if state.server.phase == .ready {
                 ActivitySection(advanced: advanced)
             }
-            if first || failed || warming || state.installer.failure != nil || state.installer.finished != nil
+            if first || failed || loadFailed || warming || state.installer.failure != nil || state.installer.finished != nil
                 || state.installer.running || state.keyProblem != nil {
                 GroupedSection {
                     if let problem = state.keyProblem {
@@ -71,6 +72,10 @@ private struct ServerSections: View {
                         NoticeRow(title: "\(state.displayName(of: model)) ran into a problem", message: message,
                                   log: .server, dismiss: state.server.dismissFailure,
                                   action: state.server.remedy.map { remedy in (remedy.title, { state.retry(model, with: remedy) }) })
+                    }
+                    // A first load that failed leaves the server up: the next message loads again.
+                    if loadFailed, let model = state.server.model, let error = state.server.loadError {
+                        NoticeRow(title: "\(state.displayName(of: model)) couldn’t load", message: error, log: .server)
                     }
                     if warming { WarmupRow() }
                     if let failure = state.installer.failure {
@@ -243,6 +248,16 @@ private struct ControlBar: View {
 
     private var look: MarkLook { othersFailure ? .off : state.serverStatus.look }
 
+    /// What the words of a ready server leave unsaid, for their help.
+    private static func help(_ serving: Server.Serving) -> String {
+        switch serving {
+        case .sleeping: "It freed its memory while idle and loads again with the next message."
+        case .notLoaded: "It loads the model with the first message."
+        case .loadFailed: "It loads the model again with the next message."
+        case .running, .recovering, .loading: ""
+        }
+    }
+
     @ViewBuilder private var detail: some View {
         let server = state.server
         switch server.phase {
@@ -257,7 +272,7 @@ private struct ControlBar: View {
         case .ready where !server.recovering:
             HStack(spacing: 4) {
                 Text(verbatim: "\(server.serving.rawValue) · Port \(server.settings.port)")
-                    .help(server.asleep ? "It freed its memory while idle and loads again with the next message." : "")
+                    .help(Self.help(server.serving))
                 CopyButton(copy: state.copyAPIAddress)
                     .buttonStyle(.hover)
                     .help("Copy API Address: \(state.apiAddress)")
