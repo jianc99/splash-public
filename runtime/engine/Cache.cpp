@@ -3062,18 +3062,7 @@ PersistStatus Cache::persist(uint64_t block) {
 }
 
 bool Cache::newestPoint(uint64_t block) const {
-  return kv_.contains(block) && states_.ordinary(block) && !superseded(block);
-}
-
-bool Cache::superseded(uint64_t block) const {
-  if (!kv_.stateBelow(block))
-    return false;
-  uint32_t branches = 0;
-  for (const uint64_t child : kv_.children(block)) {
-    if (holdsOrdinaryState(child) && ++branches > 1)
-      return false;
-  }
-  return branches == 1;
+  return kv_.contains(block) && states_.ordinary(block) && !states_.superseded(block);
 }
 
 uint64_t Cache::copyBytes(uint64_t block) const {
@@ -3095,22 +3084,6 @@ bool Cache::pointFits(const PersistCursor &point) const {
       lacking += copyBytes(id);
   const uint64_t taken = diskBudget_->usedBytes() + diskBudget_->committedBytes();
   return taken <= limit && lacking <= limit - taken;
-}
-
-bool Cache::holdsOrdinaryState(uint64_t block) const {
-  std::vector<uint64_t> pending{block};
-  while (!pending.empty()) {
-    const uint64_t id = pending.back();
-    pending.pop_back();
-    if (states_.ordinary(id))
-      return true;
-    // Only where a state lies below is there anything to find.
-    if (kv_.stateBelow(id)) {
-      const std::vector<uint64_t> children = kv_.children(id);
-      pending.insert(pending.end(), children.begin(), children.end());
-    }
-  }
-  return false;
 }
 
 CacheSnapshot Cache::snapshot() const {

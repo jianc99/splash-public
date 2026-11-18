@@ -516,7 +516,7 @@ private:
     // match reaching a block that reply's state was captured at
     // (CacheLookup::rendersReply): its conversation's next prompt is likely
     // to render its own reply back, so its end keeps that reply's last state
-    // (Cache::keepReply).
+    // as its conversation's newest point (Cache::keepReplyAsPoint).
     bool rendersReplies = false;
     // The block of the prompt's replay boundary, where the conversation's
     // next turn resumes: its state is in use from the moment the request

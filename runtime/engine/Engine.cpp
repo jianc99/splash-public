@@ -1535,6 +1535,9 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     static_cast<void>(retireCheckpoint(active));
   active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                        : StateCheckpoint{};
+  // A junction is where this request leaves another's chain: a branch point, which no state below it supersedes.
+  if (!checkpoint && !replay)
+    cache_.markBranchPoint(block);
   if (!checkpoint)
     writeBehind_.published(block, objective.tokens, now);
   return true;
@@ -2207,19 +2210,14 @@ void Engine::finishFailure(Request &active, LaneEnd end) {
 
 void Engine::vacateLane(Request &active, bool keepContinuation) {
   const uint64_t id = active.request.id;
-  // An ended request whose prompt rendered an earlier reply back keeps its
-  // own reply's last state (Cache::keepReply), which a reclaim then writes
-  // as any checkpoint: its conversation renders replies back, as agent
-  // clients that send reasoning back do (their follow-ups resumed after the
-  // reply 15 times of 15), so its next turn is likely to resume there too.
-  // Only a reply that saves its next turn the prefill of a point worth a
-  // write over its prompt's replay point (WriteBehind::kMinimumTokens) is
-  // kept: a shorter one recomputes faster than its state writes. Kept, the
-  // 384-token replies of 12 agent conversations at a 27 GB limit wrote 24%
-  // more to the SSD to save 2.4% of their prefill.
-  if (!keepContinuation && active.rendersReplies &&
-      active.exactTokens.size() >= promptReplayBoundary(active) + WriteBehind::kMinimumTokens)
-    cache_.keepReply(active.latestCheckpoint);
+  // An ended request whose prompt rendered an earlier reply back keeps its own reply's last state as its
+  // conversation's newest point (Cache::keepReplyAsPoint): its conversation renders replies back, as agent clients
+  // that send reasoning back do (their follow-ups resumed after the reply 15 times of 15). Its prompt's replay point
+  // is then superseded, which a reclaim drops rather than writes. Kept as checkpoints that a reclaim wrote, the
+  // 384-token replies of 12 agent conversations at a 27 GB limit wrote 24% more to the SSD to save 2.4% of their
+  // prefill; left opportunistic, a reply capture at the budget gave way first, and a turn read its reply again.
+  if (!keepContinuation && active.rendersReplies)
+    cache_.keepReplyAsPoint(active.latestCheckpoint);
   if (passCommand_.holds(id))
     settleEnded(passCommand_.yield());
   discardPendingStateBoundaries(active);

@@ -257,7 +257,10 @@ void testWindowedCopiesNameTheirForm() {
   constexpr CacheWindowPolicy window{2};
   Process earlier(true, nullptr, std::nullopt, window);
   const std::vector<uint64_t> blocks = earlier.cachePrompt(1, prompt);
+  // The point at the second block is written while it is the newest: once the fourth's supersedes it, a reclaim
+  // drops it unwritten.
   earlier.publish(blocks[1]);
+  require(earlier.persist(blocks[1]) == PersistStatus::Durable, "the first point did not become durable");
   earlier.publish(blocks[3]);
   earlier.writeEverything();
   std::vector<std::vector<std::byte>> copies = earlier.kvLabels();
