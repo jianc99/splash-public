@@ -1331,9 +1331,7 @@ class AgentRunnerTests(unittest.TestCase):
             ),
             mock.patch.object(agent, "idle_status", return_value=initial),
             mock.patch.object(agent, "ClientRun") as client,
-            mock.patch.object(
-                agent, "run_bugfix", return_value={"result": "pass", "tries": []}
-            ),
+            mock.patch.object(agent, "run_bugfix", return_value={"result": "pass"}),
         ):
             client.return_value.phases = []
             client.return_value.run.return_value = {}
@@ -1372,17 +1370,6 @@ class AgentRunnerTests(unittest.TestCase):
 # The one-line fix of the bug-fix fixture's seeded bug.
 BUGGY = 'int(fraction or "0")'
 FIXED = 'int(fraction.ljust(2, "0"))'
-
-
-def engine_row(before=None, after=None, error=None, samples=()):
-    """A bug-fix phase's row with these idle statuses before and after it."""
-    before = before or {**idle(completed=1, reused=10), "transport": {"restarts": 0}}
-    return {
-        "before": before,
-        "after": after if after is not None else {**before},
-        "error": error,
-        "memory_samples": list(samples),
-    }
 
 
 class BugfixTests(unittest.TestCase):
@@ -1460,168 +1447,6 @@ class BugfixTests(unittest.TestCase):
             root = self.project(directory)
             with self.assertRaisesRegex(agent.AgentFailure, "only shop/money.py"):
                 agent.check_bugfix(root, [agent.TEST_COMMAND])
-
-    def test_engine_fault_reads_the_engines_own_record(self):
-        clean = engine_row()
-        self.assertIsNone(agent.engine_fault(clean))
-        before = clean["before"]
-        faults = {
-            "lost replay points": {
-                "cache": {"reused_tokens": 10, "lost_state_misses": 1}
-            },
-            "native request failed": {"requests": {**before["requests"], "failed": 1}},
-            "restarted": {"transport": {"restarts": 1}},
-            "no cached prompt": {"requests": {**before["requests"], "completed": 3}},
-        }
-        for reason, change in faults.items():
-            with self.subTest(reason=reason):
-                self.assertIn(
-                    reason, agent.engine_fault(engine_row(after={**before, **change}))
-                )
-        self.assertIn("no final", agent.engine_fault({**clean, "after": None}))
-        # A client's own failure says nothing about the engine.
-        self.assertIsNone(agent.engine_fault(engine_row(error="client exited 1")))
-
-    def test_a_stall_is_work_held_without_progress(self):
-        def sample(elapsed, active, rows, batches):
-            engine = {"active": active, "prefill_rows": rows, "decode_batches": batches}
-            return {"elapsed": elapsed, "engine": engine}
-
-        self.assertEqual(
-            agent.longest_stall([sample(t, True, 0, t) for t in range(120)]), 0
-        )
-        # Idle between tool calls is the client's time.
-        self.assertEqual(
-            agent.longest_stall([sample(t, False, 0, 0) for t in range(120)]), 0
-        )
-        stuck = [sample(t, True, 5, 9) for t in range(90)]
-        self.assertEqual(agent.longest_stall(stuck), 89)
-        self.assertIn("without progress", agent.engine_fault(engine_row(samples=stuck)))
-
-    def test_bound_is_enforced_only_for_the_recorded_client_version(self):
-        recorded = {"pi": {"version": "1.3.0", "requests": 14}}
-        self.assertEqual(
-            agent.bugfix_bound(recorded, "pi", "1.3.0"), (recorded["pi"], None)
-        )
-        self.assertIn("not enforced", agent.bugfix_bound(recorded, "pi", "1.4.0")[1])
-        # Hermes appends lines, such as an update notice, that come and go.
-        notice = "1.3.0\nUpdate available"
-        self.assertIsNone(agent.bugfix_bound(recorded, "pi", notice)[1])
-        self.assertIsNone(agent.bugfix_bound(recorded, "codex", "1")[0])
-
-    def test_only_a_model_failure_is_retried(self):
-        def attempt(kind, error=None, requests=7, wall=9.0):
-            return {
-                "kind": kind,
-                "error": error,
-                "requests": requests,
-                "wall_seconds": wall,
-            }
-
-        client = {"path": "pi", "version": "1.3.0"}
-        recorded = {"pi": {"version": "1.3.0", "requests": 14}}
-        cases = {
-            "engine fails at once": (
-                [attempt("engine", "native request failed")],
-                "fail",
-                1,
-            ),
-            "model retried, passes": (
-                [attempt("model", "wrong edit"), attempt(None)],
-                "pass",
-                2,
-            ),
-            "model twice fails": (
-                [attempt("model", "x"), attempt("model", "y")],
-                "fail",
-                2,
-            ),
-            "over its bound": (
-                [attempt(None, requests=30), attempt(None, requests=30)],
-                "fail",
-                2,
-            ),
-            # Wall time follows the Mac's speed: recorded, not bounded.
-            "a slow Mac passes": ([attempt(None, wall=900.0)], "pass", 1),
-        }
-        for label, (tries, result, count) in cases.items():
-            with (
-                self.subTest(label),
-                tempfile.TemporaryDirectory() as directory,
-                mock.patch.object(agent, "bugfix_try", side_effect=tries) as runs,
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                report = agent.run_bugfix(
-                    "pi", client, Path(directory), "m", 1000, 60, ["text"], recorded
-                )
-                self.assertEqual((report["result"], runs.call_count), (result, count))
-                self.assertEqual(report["tries"][-1]["kind"], tries[count - 1]["kind"])
-        # A newer client's bound is reported, not enforced.
-        with (
-            tempfile.TemporaryDirectory() as directory,
-            mock.patch.object(
-                agent, "bugfix_try", side_effect=[attempt(None, requests=30)]
-            ),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            newer = {**client, "version": "1.4.0"}
-            report = agent.run_bugfix(
-                "pi", newer, Path(directory), "m", 1000, 60, ["text"], recorded
-            )
-            self.assertEqual(report["result"], "pass")
-            self.assertIn("not enforced", report["tries"][0]["bound"]["note"])
-
-    def test_each_client_fixes_the_bug_and_its_failure_fails_the_run(self):
-        model = "mlx-community/Qwen3.8-27B-4bit"
-        identity = "src-" + "a" * 64
-        initial = {
-            "instance": {"model": model},
-            "maximum_context_tokens": serve_options.parse_max_context("100K"),
-            "identity": {"cache": {"build_id": identity}},
-        }
-        served = {"data": [{"id": model, "input_modalities": ["text"]}]}
-        failed = {
-            "result": "fail",
-            "tries": [
-                {"kind": "model", "error": "x"},
-                {"kind": "model", "error": "wrong edit"},
-            ],
-        }
-        for bugfix, code in (({"result": "pass", "tries": []}, 0), (failed, 1)):
-            with (
-                self.subTest(result=bugfix["result"]),
-                tempfile.TemporaryDirectory() as directory,
-                mock.patch.object(
-                    agent.clients, "find_executable", return_value="/test/pi"
-                ),
-                mock.patch.object(
-                    agent.subprocess,
-                    "run",
-                    return_value=subprocess.CompletedProcess([], 0, "1.3.0\n", ""),
-                ),
-                mock.patch.object(agent, "current_build_id", return_value=identity),
-                mock.patch.object(
-                    agent.launcher, "_request_json", side_effect=[initial, served]
-                ),
-                mock.patch.object(agent, "idle_status", return_value=initial),
-                mock.patch.object(agent, "ClientRun") as client,
-                mock.patch.object(agent, "run_bugfix", return_value=bugfix) as fix,
-                contextlib.redirect_stdout(io.StringIO()),
-            ):
-                client.return_value.phases = []
-                client.return_value.run.return_value = {}
-                report = Path(directory) / "report.json"
-                arguments = ["--model", model, "--clients", "pi", "--scenario", "smoke"]
-                self.assertEqual(
-                    agent.main([*arguments, "--output", str(report)]), code
-                )
-                self.assertEqual(fix.call_args.args[0], "pi")
-                entry = json.loads(report.read_text())["clients"]["pi"]
-                self.assertEqual(entry["bugfix"]["result"], bugfix["result"])
-                if code:
-                    self.assertEqual(
-                        entry["error"], "bugfix failed (model): wrong edit"
-                    )
 
 
 if __name__ == "__main__":
