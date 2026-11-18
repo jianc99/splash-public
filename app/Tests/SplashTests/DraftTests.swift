@@ -69,9 +69,11 @@ struct DraftTests {
         #expect(reopened.text == "A new chat's question")
         #expect(reopened.chats == [a])
 
-        // Sent, and deleted with its chat: gone at once, and the next opening has neither.
+        // Sent, and deleted with its chat: gone once the drafts are written, and the next opening
+        // has neither.
         reopened.take(from: nil)
         reopened.forget([a])
+        try await Task.sleep(for: .seconds(1.3))
         let last = Draft(files: next.attachments, kept: next.drafts) { open }
         #expect(last.chats.isEmpty && last.text.isEmpty)
     }

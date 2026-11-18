@@ -82,7 +82,6 @@ final class Draft {
         self.saved = saved
         for (key, draft) in saved {
             let chat = UUID(uuidString: key)
-            guard chat != nil || key == Self.key(nil) else { continue }
             var restored = Kept()
             restored.text = draft.text
             restored.attachments = draft.attachments
@@ -113,8 +112,8 @@ final class Draft {
         }
     }
 
-    /// Writes the drafts that hold a message now, if they changed: as one is taken, carried or
-    /// forgotten, and as the app quits.
+    /// Writes the drafts that hold a message now, if they changed: a second after the last change
+    /// (`saveSoon`), and as the app quits.
     func save() {
         saving?.cancel()
         saving = nil
@@ -238,7 +237,6 @@ final class Draft {
     /// with it.
     func take(from chat: UUID?) {
         drafts[chat] = nil
-        save()
     }
 
     /// Takes `chat`'s draft into the new chat, without what the composer said of it there, as a
@@ -249,7 +247,6 @@ final class Draft {
         draft.notice = nil
         drafts[chat] = nil
         drafts[nil] = draft
-        save()
     }
 
     /// Forgets the drafts of `chats`, deleted (`AppState.delete`). An attachment of theirs still
@@ -257,7 +254,6 @@ final class Draft {
     /// finds no chat naming it (`ChatStore.adoptFiles`).
     func forget(_ chats: Set<UUID>) {
         for chat in chats { drafts[chat] = nil }
-        save()
     }
 
     /// Takes back `refused`, what a request that came to nothing gives back, in its chat's draft:
