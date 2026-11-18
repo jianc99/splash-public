@@ -2377,17 +2377,33 @@ Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
 planned within one prefill chunk (2048 tokens) of where the request resumes or
 of its replay boundary. Each retires only once the next one or a junction is
 published, which takes its buffers, when memory refuses others, only after its
-command has completed: a request whose command is cancelled, expires or fails
-keeps it, and a retry resumes there. One only on the SSD retires when that
-state lands.
+command has completed. A checkpoint its command ended at the lane holds, its
+state still the lane's (`Engine::Request::heldCheckpoint`): its RAM copy is one
+a reclaim frees with no write, and refused RAM it has no other. The lane stores
+it only when it leaves it without a later boundary in its next command, the
+replay point aside, or stops at it (suspended, cancelled, refused or ended
+between commands): the RAM copy becomes one a reclaim writes, or the lane's
+state goes to the SSD. A later checkpoint replaces it with no write, so a long
+prompt at the memory wall, whose commands end at its checkpoints where
+streamed weights or spilled history group its chunks, writes only its last one:
+written at once, a 50,842-token prompt of Qwen3.6-35B-A3B at `--max-memory 10.3G`
+on a 16 GB M4 wrote 6 of 19.6 MiB, and their successors retired 5 unread. A
+request that stops between commands resumes, or its retry, from the state it
+stopped at; one whose command fails inside, or whose process dies, from the
+last state stored, which may be more than one command back. A state can be
+stored only at a planned boundary: a cached state needs the whole draft window
+up to it (`QwenStateStorage::validateLengths`), which the draft plan captures
+only before its boundaries (`planDraftContext`). One only on the SSD retires
+when the state after it lands.
 The last stays cached once the replay point is published: a later request that
 shares the prompt up to it, such as another conversation with the same long
 system prompt, resumes there instead of from the start. It stays only if the
 replay state fits beside it; refused memory, the replay state takes its buffers
-rather than another lane's checkpoint. With the SSD cache it costs a write as
+rather than another lane's checkpoint, and writes it to the SSD first when the
+cache has one and its staging buffer is free. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
-SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
-when no RAM slot took it, stays there. These writes draw on the SSD cache's
+SSD, this one too (47 MiB for 27B), and one the lane wrote to the SSD, when
+no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
