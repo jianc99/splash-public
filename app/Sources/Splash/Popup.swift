@@ -310,22 +310,17 @@ final class ScrollTarget: NSObject {
     /// once too, before the change's `onChange` runs: its growth can't tell how far it has got.
     var height: CGFloat = 0
     private var link: CADisplayLink?
-    private var margin: CGFloat = 12
     /// Where the content and `pushed` were as the unfolding began.
     private var start: (y: CGFloat, pushed: CGFloat)?
-    /// Where `pushed` was when it last moved, and when.
-    private var moved: (at: CGFloat, time: CFTimeInterval)?
     /// Where it put the content last, to tell the reader's scrolling, and where `pushed` was then.
     private var placed: (y: CGFloat, pushed: CGFloat)?
 
     /// Puts the view at the top of its scroll view, as far as the content goes, as what is under it
     /// unfolds.
-    func scrollToTop(margin: CGFloat = 12) {
+    func scrollToTop() {
         guard let pushed, let scrollView = pushed.enclosingScrollView, let document = scrollView.documentView else { return }
-        self.margin = margin
         let at = pushed.convert(pushed.bounds, to: document).maxY
         start = (scrollView.contentView.bounds.minY, at)
-        moved = (at, CACurrentMediaTime())
         // As if placed there: the reader's scrolling from the click on, as momentum still running,
         // takes over before the scroll's first frame too.
         placed = start
@@ -342,21 +337,15 @@ final class ScrollTarget: NSObject {
         // Moved by someone else since: the reader scrolls.
         if let placed, abs(y - placed.y) > 0.5 { return stop() }
         let at = pushed.convert(pushed.bounds, to: document).maxY, foot = top.convert(top.bounds, to: document).minY + height
-        if at != moved?.at { moved = (at, link.timestamp) }
         // Not moved yet, or not since the last frame: SwiftUI draws the unfolding's frames on its
-        // own, the first some frames after the click on a busy main thread. One that stands still
-        // for `settle`'s whole length has ended.
-        guard at != start.pushed, at != placed?.pushed, foot > start.pushed else {
-            if let moved, link.timestamp - moved.time > Motion.settleSpring.settlingDuration { stop() }
-            return
-        }
-        // Below the toolbar the content scrolls under, as far as its inset goes.
+        // own, the first some frames after the click on a busy main thread.
+        guard at != start.pushed, at != placed?.pushed, foot > start.pushed else { return }
+        // 12 points below the toolbar the content scrolls under, as far as its inset goes.
         let frame = view.convert(view.bounds, to: document), inset = scrollView.contentInsets.top
-        let goal = document.isFlipped ? frame.minY - margin - inset : frame.maxY + margin - clip.bounds.height + inset
+        let goal = document.isFlipped ? frame.minY - 12 - inset : frame.maxY + 12 - clip.bounds.height + inset
         let lowest = -inset
         let reach = min(max(goal, lowest), max(document.frame.height - clip.bounds.height + scrollView.contentInsets.bottom, lowest))
-        // At its end as the layout rounds it to the screen's pixels.
-        let share = abs(foot - at) < 0.5 ? 1 : min(max((at - start.pushed) / (foot - start.pushed), 0), 1)
+        let share = min(max((at - start.pushed) / (foot - start.pushed), 0), 1)
         clip.setBoundsOrigin(NSPoint(x: clip.bounds.minX, y: start.y + (reach - start.y) * share))
         scrollView.reflectScrolledClipView(clip)
         placed = (clip.bounds.minY, at)
