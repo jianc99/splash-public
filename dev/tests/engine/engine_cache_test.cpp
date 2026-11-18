@@ -2159,12 +2159,13 @@ void testEvictedCheckpointsAndSupersededPointsStayOnTheSsd() {
   control->ready = true;
   control->capacity = 4;
   // The system prompt ends at the first block, with its last checkpoint; the
-  // conversation's point at the second block is superseded by the one at its
-  // last.
+  // conversation's point at the second block is the one behind its newest, at
+  // its last, which a reclaim keeps and writes and a temporary tier does not
+  // copy ahead.
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), true);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
-  require(!fixture.cache.newestPoint(fixture.blocks[1]) && fixture.cache.newestPoint(fixture.blocks[3]),
+  require(!fixture.cache.copiedAhead(fixture.blocks[1]) && fixture.cache.copiedAhead(fixture.blocks[3]),
           "the conversation's points are not as the test needs");
   // In-service work takes everything, each write landing before its next
   // step.

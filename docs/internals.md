@@ -2894,11 +2894,11 @@ the one in flight (`MemoryLedger::copyDemand`), whether it wrote it, waited
 for it or passed over it; what leaves through a copy it has counts for
 nothing, nor does a state the idle staging buffer writes, which frees at
 once, so the copies stop once claims find what they take copied. Without
-that nothing is written ahead. A point that waits for demand keeps its turn
-while it stays its conversation's newest: a publication meanwhile drops the
-queued points their conversations went on from or that are gone
-(`Cache::newestPoint`), so that demand, once it comes, finds no backlog of
-superseded points. There a point also waits while it is in use, as its request
+that nothing is written ahead. A point that waits for demand is copied when
+its turn comes only if it is still what the tier brings back
+(`Cache::copiedAhead`): a conversation's newest point or a junction, and in a
+persistent tier the one behind the newest too, which a restart's regenerate
+resumes from; one the tier no longer copies by then is given up unwritten. There a point also waits while it is in use, as its request
 holds its chain and may go on from it, and its copies take only the room the
 quota has free beside the other copies and the commitments of Spill requests,
 giving up no copy: the redundant copies a full quota gives up first hold what

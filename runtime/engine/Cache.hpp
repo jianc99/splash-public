@@ -422,16 +422,21 @@ public:
   // the budget, as every KV write does. Nothing starts while the tier serves
   // what is needed now, a restore that waits, a reclaim's demotion or a
   // Spill request's write through, and the pages take a small share of the
-  // tier's writes. A point is unneeded unless it is still the newest of its
-  // conversation (newestPoint). Every point is refused once a file stopped
+  // tier's writes. A point is unneeded unless the tier still copies it
+  // (copiedAhead). Every point is refused once a file stopped
   // taking writes, and one larger than the room it may take (pointFits) or
   // given up to make room for itself.
   [[nodiscard]] PersistStatus persist(uint64_t block);
-  // The block holds a restore point a conversation still resumes from: an
-  // ordinary state with no ordinary state below it, or with ordinary states
-  // on more than one of its branches, which no single conversation went on
-  // from. persist() copies only such a point.
-  [[nodiscard]] bool newestPoint(uint64_t block) const;
+  // The block holds a point this tier copies ahead: what the tier exists to
+  // bring back. A persistent tier brings back what a restart needs, the
+  // points a reclaim keeps (StateCache::superseded): a conversation's newest,
+  // the kKeptBehind behind it, and junctions, so that a regenerate after a
+  // restart resumes at the last prompt's end. A temporary tier brings back what
+  // memory pressure evicts and a next turn reads, the newest point and
+  // junctions (StateCache::newest): the point behind, written when a reclaim
+  // takes it, was copied ahead and never read in four agent sessions on the 27B
+  // MLX at --max-memory 21G (993 of 1,030 copied pages unread).
+  [[nodiscard]] bool copiedAhead(uint64_t block) const;
   // What the copies ahead of need in flight (persist) let a reclaim free at
   // once after they land: the bytes of the pages they copy and of the RAM
   // copy of the state they write.

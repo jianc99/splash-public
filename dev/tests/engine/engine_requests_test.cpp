@@ -1069,6 +1069,52 @@ void testAReclaimWritesNoSupersededPoint() {
           "the fourth turn resumed from " + std::to_string(events.starts.back()) + ", not " + std::to_string(replyEnd));
 }
 
+// With a persistent tier, a turn's two kept points, its prompt's replay point and the reply's state after it,
+// are copied ahead the delay after the request ends (WriteBehind::ended), both of them: a restart then finds the
+// point a regenerate of the last turn resumes from. Neither is copied sooner, as another request steps the engine,
+// though the replay point was published longer than the delay before the request ended.
+void testATurnsKeptPointsAreCopiedTheDelayAfterItEnds() {
+  constexpr double kDelay = WriteBehind::kDelayMilliseconds;
+  test::EngineHarness h({.pages = 512, .tier = test::TierOptions{.capacity = 512, .transferLimit = 8, .bytesPerMillisecond = 1e6, .persistent = true}});
+  h.model.offloadTier = std::make_shared<OffloadControl>();
+  h.model.offloadTier->ready = true;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  std::vector<uint32_t> prompt(WriteBehind::kMinimumTokens + 200);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  // Turns whose deadlines lie past the delays the test waits.
+  const auto turn = [&](uint64_t id, const std::vector<uint32_t> &tokens) {
+    EngineRequest result = conversationTurn(id, tokens, 70);
+    result.deadlineMilliseconds = now + 10 * kDelay;
+    return result;
+  };
+  engine.submit(turn(1, prompt));
+  tickUntil(h, now, [&] { return idle(engine); }, "the first turn did not complete");
+  now += 2 * kDelay;
+  tickUntil(h, now, [&] { return !engine.snapshot().writeBehind.waiting; }, "the first turn's point was not settled");
+  const uint64_t durable = engine.snapshot().writeBehind.durable;
+  // The second turn renders the reply back; its decode outlasts the delay.
+  engine.submit(turn(2, nextTurn(prompt, 70)));
+  tickUntil(h, now, [&] { return events.outputs[2].size() >= 10; }, "the second turn did not decode");
+  now += kDelay + 5000;
+  tickUntil(h, now, [&] { return idle(engine); }, "the second turn did not complete");
+  const double ended = h.now();
+  const uint32_t demotions = h.tier->demotions;
+  // Another conversation's short request a second later steps the engine within the delay.
+  now = ended + 1000;
+  engine.submit(turn(3, std::vector<uint32_t>(97, 3)));
+  tickUntil(h, now, [&] { return idle(engine); }, "the other request did not complete");
+  require(h.now() < ended + kDelay && h.tier->demotions == demotions && engine.snapshot().writeBehind.waiting == 2,
+          "a point of the turn was copied before the delay after its end, or was not waiting for it");
+  now = ended + kDelay + 1;
+  tickUntil(h, now, [&] { return !engine.snapshot().writeBehind.waiting; }, "the turn's points were not copied");
+  require(engine.snapshot().writeBehind.durable == durable + 2,
+          "the delay after the turn copied " + std::to_string(engine.snapshot().writeBehind.durable - durable) +
+              " points, not its replay point and its reply's state");
+}
+
 // A finished request's KV holds part of the budget, so a later request's KV
 // meets the wall as it grows, where each wall test's budget puts it; captured
 // states are OffloadStates from then on, which reclaim may write to the SSD
@@ -2574,6 +2620,7 @@ std::span<const test::TestCase> requestsTests() {
       {"testRunningReplyCheckpointIsDropped", testRunningReplyCheckpointIsDropped},
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
       {"testAReclaimWritesNoSupersededPoint", testAReclaimWritesNoSupersededPoint},
+      {"testATurnsKeptPointsAreCopiedTheDelayAfterItEnds", testATurnsKeptPointsAreCopiedTheDelayAfterItEnds},
       {"testFourConversationsKeepEachOthersPoints", testFourConversationsKeepEachOthersPoints},
       {"testReplyCheckpointsAreNotWrittenAtTheWall", testReplyCheckpointsAreNotWrittenAtTheWall},
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},

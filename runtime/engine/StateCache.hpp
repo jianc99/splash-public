@@ -202,16 +202,18 @@ public:
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // An ordinary state, in either tier.
   [[nodiscard]] bool ordinary(uint64_t kvBlock) const noexcept;
-  // Ordinary states below the block sit on exactly one of its branches, more than `behind` of them nested: a turn
-  // resumes past it, and only an edit of what lies between would come back to it. A conversation's newest point
-  // and a junction, which two continuations share, never are. Write-behind copies none (behind 0). A reclaim takes
-  // those `kKeptBehind` behind first and never writes them: of a 35-turn agent session at its memory wall on
-  // Qwen3.6-35B-A3B (a 16 GB M4 Mac mini), 33 of the 34 states written on eviction were superseded and none was
-  // read.
-  [[nodiscard]] bool superseded(uint64_t kvBlock, uint32_t behind = 0) const;
-  // The points a reclaim keeps as it keeps the newest: the newest point's own prompt-end, which a regenerate of
-  // the last answer resumes from, at the wall too. The strict rule (0), which drops that point as well, is for a
-  // diagnostic build, to measure the hit rate it costs.
+  // The state at the block is ordinary and superseded: ordinary states below it sit on exactly one of its
+  // branches, more than kKeptBehind of them nested, so a turn resumes past it and only an edit of what lies between
+  // would come back to it. A conversation's newest point, the kKeptBehind points behind it and a junction, which two
+  // continuations share, are kept. A reclaim takes superseded points first and never writes them, and write-behind
+  // copies none (Cache::copiedAhead): of a 35-turn agent session at its memory wall on Qwen3.6-35B-A3B (a
+  // 16 GB M4 Mac mini), 33 of the 34 states written on eviction were superseded and none was read.
+  [[nodiscard]] bool superseded(uint64_t kvBlock) const noexcept;
+  // A conversation's newest point, or a junction: no ordinary state below it on one branch alone.
+  [[nodiscard]] bool newest(uint64_t kvBlock) const;
+  // The points kept behind the newest: its own prompt-end, which a regenerate or an edit of the last turn resumes
+  // from, at the wall and after a restart. The strict rule (0), which drops that point as well, is for a diagnostic
+  // build, to measure the hit rate it costs.
   static constexpr uint32_t kKeptBehind = 1;
   // Its request ended rendering an earlier reply back: the reply's state, a checkpoint, becomes its
   // conversation's newest point, an ordinary state, which its next turn resumes from.
@@ -355,7 +357,7 @@ private:
     bool checkpoint = false;
     // A reply's state (markReply) until its request keeps it as a point (keepReplyAsPoint).
     bool opportunistic = false;
-    // An ordinary state another below it supersedes (superseded()), set as the states below it change.
+    // An ordinary state another below it supersedes (supersededBelow()), set as the states below it change.
     bool superseded = false;
     bool branchPoint = false;
     bool invalid = false;
@@ -433,6 +435,8 @@ private:
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
   // An ordinary state at the block or anywhere below it.
   [[nodiscard]] bool holdsOrdinaryState(uint64_t kvBlock) const;
+  // Whether the state at the block has more than `behind` ordinary states nested below it on one branch alone.
+  [[nodiscard]] bool supersededBelow(uint64_t kvBlock, uint32_t behind) const;
   // Sets the superseded mark of the block's state and of the nearest ordinary states above it, kKeptBehind + 1 of
   // them, whose marks an ordinary state appearing or leaving at the block can change.
   void markSuperseded(uint64_t kvBlock);

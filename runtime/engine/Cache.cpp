@@ -2993,7 +2993,7 @@ PersistStatus Cache::persist(uint64_t block) {
       persisting_ = {};
     return status;
   };
-  if (!newestPoint(block))
+  if (!copiedAhead(block))
     return settled(PersistStatus::Unneeded);
   if (!kvTierWritable())
     return settled(PersistStatus::Refused);
@@ -3061,8 +3061,9 @@ PersistStatus Cache::persist(uint64_t block) {
   return settled(inFlight ? PersistStatus::Started : PersistStatus::Durable);
 }
 
-bool Cache::newestPoint(uint64_t block) const {
-  return kv_.contains(block) && states_.ordinary(block) && !states_.superseded(block);
+bool Cache::copiedAhead(uint64_t block) const {
+  return kv_.contains(block) && states_.ordinary(block) &&
+         (persistent() ? !states_.superseded(block) : states_.newest(block));
 }
 
 uint64_t Cache::copyBytes(uint64_t block) const {

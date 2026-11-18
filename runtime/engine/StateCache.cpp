@@ -282,7 +282,17 @@ bool StateCache::ordinary(uint64_t kvBlock) const noexcept {
   return found != entries_.end() && !found->second.invalid && !found->second.checkpoint;
 }
 
-bool StateCache::superseded(uint64_t kvBlock, uint32_t behind) const {
+bool StateCache::superseded(uint64_t kvBlock) const noexcept {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && found->second.superseded;
+}
+
+bool StateCache::newest(uint64_t kvBlock) const {
+  const auto found = entries_.find(kvBlock);
+  return found != entries_.end() && ordinary(kvBlock) && (found->second.branchPoint || !supersededBelow(kvBlock, 0));
+}
+
+bool StateCache::supersededBelow(uint64_t kvBlock, uint32_t behind) const {
   if (!kv_.stateBelow(kvBlock))
     return false;
   uint64_t branch = 0;
@@ -330,7 +340,7 @@ void StateCache::markSuperseded(uint64_t kvBlock) {
     const auto found = entries_.find(id);
     if (found == entries_.end())
       return;
-    const bool superseded = ordinary(id) && !found->second.branchPoint && this->superseded(id, kKeptBehind);
+    const bool superseded = ordinary(id) && !found->second.branchPoint && supersededBelow(id, kKeptBehind);
     if (found->second.superseded == superseded)
       return;
     found->second.superseded = superseded;
