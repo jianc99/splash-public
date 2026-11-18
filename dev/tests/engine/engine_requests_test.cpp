@@ -1064,10 +1064,11 @@ void testFourConversationsKeepEachOthersPoints() {
 
 // A conversation that renders its replies back, three turns with an SSD tier: a reclaim of every state not in use
 // writes only the conversation's newest point, its last reply's state, and the point before it, the last prompt's
-// replay point that a regenerate resumes from (StateCache::kKeptBehind); the fourth turn resumes at the newest from
-// the disk. Its earlier points go unwritten: before, a reclaim wrote the three prompts' replay points and dropped
-// the replies' states, so the fourth turn resumed at its prompt's last replay point and read the third reply
-// again.
+// replay point that a regenerate resumes from (StateCache::kKeptBehind). A regenerate of the last answer resumes
+// there from the disk, and the fourth turn at the newest. Its earlier points go unwritten: before, a reclaim wrote
+// the three prompts' replay points and dropped the replies' states, so the fourth turn resumed at its prompt's last
+// replay point and read the third reply again; keeping the newest point alone, the regenerate resumed at the reply
+// before and read the last prompt's own text again.
 void testAReclaimWritesNoSupersededPoint() {
   test::EngineHarness h({.pages = 64, .tier = test::TierOptions{.capacity = 64, .transferLimit = 8}});
   h.model.offloadTier = std::make_shared<OffloadControl>();
@@ -1078,9 +1079,11 @@ void testAReclaimWritesNoSupersededPoint() {
   double now = 1;
   std::vector<uint32_t> prompt(97);
   std::iota(prompt.begin(), prompt.end(), 1);
+  std::vector<uint32_t> last;
   for (uint64_t turn = 1; turn <= 3; ++turn) {
     engine.submit(conversationTurn(turn, prompt, 70));
     tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+    last = prompt;
     prompt = nextTurn(prompt, 70);
   }
   const StateCacheSnapshot before = h.cache.snapshot().stateCache;
@@ -1093,8 +1096,14 @@ void testAReclaimWritesNoSupersededPoint() {
   require(after.offloads - before.offloads == 1 + StateCache::kKeptBehind,
           "a reclaim wrote " + std::to_string(after.offloads - before.offloads) +
               " states, not the newest and the points it keeps behind it");
+  require(!after.bytes, "a state stayed in RAM past the reclaim");
   h.model.restoreControl->ready = true;
-  engine.submit(conversationTurn(4, prompt, 1));
+  engine.submit(conversationTurn(4, last, 1));
+  tickUntil(h, now, [&] { return idle(engine); }, "the regenerate did not complete");
+  const uint32_t replay = static_cast<uint32_t>(last.size() - 7) / KvCache::pageTokens * KvCache::pageTokens;
+  require(events.starts.back() == replay, "the regenerate after the reclaim resumed from " +
+                                              std::to_string(events.starts.back()) + ", not " + std::to_string(replay));
+  engine.submit(conversationTurn(5, prompt, 1));
   tickUntil(h, now, [&] { return idle(engine); }, "the fourth turn did not complete");
   const uint32_t replyEnd = static_cast<uint32_t>(prompt.size() - 41) / KvCache::pageTokens * KvCache::pageTokens;
   require(events.starts.back() == replyEnd,
@@ -1187,40 +1196,6 @@ void testASecondConversationResumesAtASharedHead() {
                                               ": the second conversation resumed from " +
                                               std::to_string(events.starts.back()) + ", not " + std::to_string(head));
   }
-}
-
-// A conversation that renders its replies back, three turns with an SSD tier: a reclaim of every state not in use
-// drops the points two turns behind and writes the last turn's prompt-end, the point behind the newest
-// (StateCache::kKeptBehind), so a regenerate of the last answer resumes there, from the SSD. Keeping the newest point
-// alone, the regenerate resumed at the reply before and read the last prompt's own text again.
-void testARegenerateAfterAReclaimResumesAtItsPromptEnd() {
-  test::EngineHarness h({.pages = 64, .tier = test::TierOptions{.capacity = 64, .transferLimit = 8}});
-  h.model.offloadTier = std::make_shared<OffloadControl>();
-  h.model.offloadTier->ready = true;
-  h.model.decodeFinishes = false;
-  Events &events = h.events;
-  engine::Engine &engine = h.engine;
-  double now = 1;
-  std::vector<uint32_t> prompt(97);
-  std::iota(prompt.begin(), prompt.end(), 1);
-  std::vector<uint32_t> last;
-  for (uint64_t turn = 1; turn <= 3; ++turn) {
-    engine.submit(conversationTurn(turn, prompt, 70));
-    tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
-    last = prompt;
-    prompt = nextTurn(prompt, 70);
-  }
-  for (uint32_t step = 0; step < 8; ++step) {
-    reclaimUpToInUse(h.cache);
-    static_cast<void>(h.cache.pollTransfers());
-  }
-  require(!h.cache.snapshot().stateCache.bytes, "a state stayed in RAM past the reclaim");
-  h.model.restoreControl->ready = true;
-  engine.submit(conversationTurn(4, last, 1));
-  tickUntil(h, now, [&] { return idle(engine); }, "the regenerate did not complete");
-  const uint32_t replay = static_cast<uint32_t>(last.size() - 7) / KvCache::pageTokens * KvCache::pageTokens;
-  require(events.starts.back() == replay, "the regenerate after the reclaim resumed from " +
-                                              std::to_string(events.starts.back()) + ", not " + std::to_string(replay));
 }
 
 // A finished request's KV holds part of the budget, so a later request's KV
@@ -2729,7 +2704,6 @@ std::span<const test::TestCase> requestsTests() {
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
       {"testAReclaimWritesNoSupersededPoint", testAReclaimWritesNoSupersededPoint},
       {"testATypedOnMessageResumesFromAOneTokenRead", testATypedOnMessageResumesFromAOneTokenRead},
-      {"testARegenerateAfterAReclaimResumesAtItsPromptEnd", testARegenerateAfterAReclaimResumesAtItsPromptEnd},
       {"testATurnsKeptPointsAreCopiedTheDelayAfterItEnds", testATurnsKeptPointsAreCopiedTheDelayAfterItEnds},
       {"testFourConversationsKeepEachOthersPoints", testFourConversationsKeepEachOthersPoints},
       {"testASecondConversationResumesAtASharedHead", testASecondConversationResumesAtASharedHead},

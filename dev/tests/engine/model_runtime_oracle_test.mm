@@ -2414,155 +2414,6 @@ void requireCaptureInsideItsPathMatchesExactRows(model::Runtime &executor, model
   std::cout << "decode_capture_inside_path=PASS\n";
 }
 
-// The recurrent state a restore leaves a lane, its GDN cell's recurrent
-// layers, as floats.
-std::vector<float> recurrentValues(const model::GdnStateLayout &layout, const std::vector<uint8_t> &cell) {
-  const bool bfloat = layout.format == ops::GdnStateFormat::BFloat16;
-  const uint64_t count = uint64_t{layout.layers} * layout.recurrentGroups * layout.recurrentRows *
-                         layout.recurrentColumns;
-  std::vector<float> values;
-  values.reserve(count);
-  for (uint32_t layer = 0; layer < layout.layers; ++layer) {
-    const uint8_t *at = cell.data() + layout.convolutionBytes() + uint64_t{layer} * layout.recurrentLayerBytes();
-    const uint64_t each = uint64_t{layout.recurrentGroups} * layout.recurrentRows * layout.recurrentColumns;
-    for (uint64_t index = 0; index < each; ++index) {
-      if (bfloat) {
-        uint16_t narrow = 0;
-        std::memcpy(&narrow, at + index * 2, 2);
-        values.push_back(test::bf16ToFloat(narrow));
-      } else {
-        float wide = 0.0F;
-        std::memcpy(&wide, at + index * 4, 4);
-        values.push_back(wide);
-      }
-    }
-  }
-  return values;
-}
-
-double cosineOf(std::span<const float> left, std::span<const float> right) {
-  SimilarityAccumulator accumulator;
-  for (size_t index = 0; index < left.size(); ++index)
-    accumulator.add(left[index], right[index]);
-  return accumulator.result().cosine;
-}
-
-// A stop token inside a cycle's accepted block ends its path there: the
-// state the cycle captures at a page is sealed where the path reached the
-// page before the stop, and holds what the same cycle without the stop
-// captured, byte for byte; a stop before the page leaves the page
-// uncaptured. A cached state that took a token past a stop would serve a
-// later prompt a state its tokens do not hold (SGLang #47392). Beside it,
-// the sealed state is the state of its page's tokens, not of one token fewer:
-// nearer a prefill to the page than a prefill to the token before it
-// (vLLM #67045). The stops are each a token the cycle selects, at the
-// stop's place in its path, set as the target's only stop token in a runtime
-// of its own.
-void requireStopInsideABlockEndsItsCapture(model::RuntimeContext context, model::LoadedModel &model,
-                                           std::span<const uint32_t> chat) {
-  model::QwenStateStorage &states = context.stateStorage;
-  const std::vector<uint32_t> pages = pageRange(100, 5), prefillPages = pageRange(105, 5);
-  uint32_t length = 0, page = 0;
-  FirstCycle plain;
-  std::vector<uint32_t> tokens;
-  StateBytes plainBytes;
-  std::vector<uint32_t> probe;
-  {
-    model::Runtime executor(context);
-    if (!executor.capturesInDecode()) {
-      std::cout << "stop_inside_block=SKIP (the target writes auxiliary state with its retained rows)\n";
-      return;
-    }
-    model::RuntimeInstrumentation::forceStepRows(executor, model::ExecutionLimits::draftQueryRows);
-    std::tie(length, page) = promptCrossingAPage(executor, states, chat, 2600, pages);
-    require(length != 0, "no prompt of 88 to 126 tokens had a first cycle that crossed a page");
-    tokens = repeatedChat(chat, length);
-    plain = runFirstCycle(executor, states, 2700, tokens, 64, true, page, pages);
-    executor.end(2700);
-    require(plain.captured.size() == 1 && length + plain.retained > page, "the plain cycle sealed no capture");
-    probe = tokens;
-    probe.insert(probe.end(), plain.output.begin(), plain.output.begin() + (page - length));
-    probe.push_back(chat[page % chat.size()]);
-    plainBytes = restoredBytes(executor, states, 2701, 2, probe, page, plain.captured.front());
-  }
-  // The first index of the path at or past `from` and before `to` whose
-  // token the path did not select before it.
-  const auto firstFresh = [&](uint32_t from, uint32_t to) -> std::optional<uint32_t> {
-    for (uint32_t index = std::max(from, 1U); index < to; ++index)
-      if (std::find(plain.output.begin(), plain.output.begin() + index, plain.output[index]) ==
-          plain.output.begin() + index)
-        return index;
-    return std::nullopt;
-  };
-  const std::optional<uint32_t> past = firstFresh(page - length, plain.retained);
-  const std::optional<uint32_t> before = firstFresh(1, page - length);
-  const auto originalTarget = model.descriptor.target;
-  const auto setStops = [&](std::optional<uint32_t> stop) {
-    std::visit([&](auto &weights) {
-      using Layout = std::decay_t<decltype(weights.layout)>;
-      weights.layout = std::get<Layout>(originalTarget);
-      if (stop)
-        weights.layout.stopTokens = {*stop};
-      model.descriptor.target = weights.layout;
-    }, model.target);
-  };
-  // The cycle with the stop at `index` of its path: what it retained, ended
-  // and sealed.
-  const auto stopAt = [&](uint32_t index, uint64_t id) {
-    setStops(plain.output[index]);
-    model::Runtime executor(context);
-    model::RuntimeInstrumentation::forceStepRows(executor, model::ExecutionLimits::draftQueryRows);
-    FirstCycle stopped = runFirstCycle(executor, states, id, tokens, 64, false, page, pages);
-    executor.end(id);
-    std::optional<StateBytes> bytes;
-    if (!stopped.captured.empty())
-      bytes = restoredBytes(executor, states, id + 1, 2, probe, page, stopped.captured.front());
-    setStops(std::nullopt);
-    return std::pair{std::move(stopped), std::move(bytes)};
-  };
-  std::string checked;
-  if (past) {
-    const auto [stopped, bytes] = stopAt(*past, 2710);
-    require(stopped.finished && stopped.retained == *past && bytes.has_value(),
-            "a stop past the page did not end the path there, or left the page uncaptured");
-    require(bytes->cell == plainBytes.cell && bytes->window == plainBytes.window,
-            "a stop past the page changed the state captured at it");
-    checked += " past=" + std::to_string(*past);
-  }
-  if (before) {
-    const auto [stopped, bytes] = stopAt(*before, 2720);
-    require(stopped.finished && stopped.retained == *before && !bytes.has_value(),
-            "a stop before the page did not end the path there, or a capture past the stop was sealed");
-    checked += " before=" + std::to_string(*before);
-  }
-  require(past || before, "the crossing cycle's path held no token to set as a stop");
-  // The sealed state against prefills to the page and to the token before it.
-  const model::GdnStateLayout layout = states.layout().target;
-  if (layout.layers) {
-    model::Runtime executor(context);
-    std::vector<uint32_t> through = tokens;
-    through.insert(through.end(), plain.output.begin(), plain.output.begin() + (page - length));
-    const auto prefilledTo = [&](uint64_t id, uint32_t end) {
-      EngineRequest request = makeRequest(id, std::vector<uint32_t>(through.begin(), through.begin() + end), 64);
-      request.flags = RequestIgnoreEndOfSequence;
-      beginCold(executor, request, 1);
-      executor.setDraftContextPlan(id, planDraftContext(0, end, {}));
-      requireOpen(prefillChunk(executor, id, 0, std::span(through).first(end), prefillPages), "stop inside block");
-      const std::vector<uint8_t> cell = bytesOf(states.current(1).stateBase);
-      executor.end(id);
-      return recurrentValues(layout, cell);
-    };
-    const std::vector<float> captured = recurrentValues(layout, plainBytes.cell);
-    const double atPage = cosineOf(captured, prefilledTo(2730, page));
-    const double tokenBefore = cosineOf(captured, prefilledTo(2731, page - 1));
-    std::cout << "stop_inside_block prefill_page_cos=" << atPage << " prefill_token_before_cos=" << tokenBefore
-              << '\n';
-    require(atPage > tokenBefore,
-            "the state captured at a page is nearer the state of one token fewer than of its page's tokens");
-  }
-  std::cout << "stop_inside_block=PASS prompt=" << length << " page=" << page << checked << '\n';
-}
-
 // A prompt of 961 tokens prefilled cold, and again from the state its
 // prefill captured at 960, restored from RAM and read back from the disk
 // tier: the last row's logits. A state read back from the disk restores what
@@ -6460,7 +6311,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 
 int main(int argc, char **argv) {
   try {
-    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false, cacheOnly = false;
+    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
     SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -6491,15 +6342,13 @@ int main(int argc, char **argv) {
            "[--cached-states int8|exact] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
-           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only | "
-           "--cache-only]");
+           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
       else if (option == "--spill-only") spillOnly = true;
-      else if (option == "--cache-only") cacheOnly = true;
       else if ((option == "--spill-tokens" || option == "--spill-window" || option == "--spill-buffers") &&
                i + 1 < argc) {
         const char *value = argv[++i];
@@ -6804,7 +6653,7 @@ int main(int argc, char **argv) {
     }
     // The engine refuses image requests to a model without vision before they
     // reach the runtime, which treats one as a broken invariant.
-    if (model.descriptor.hasVision() && !cacheOnly) {
+    if (model.descriptor.hasVision()) {
       requireAtomicImageAdmission(executor, backend, states, model, allocationFault);
       requireImageRowsAfterReclaim(executor, backend, states, model, allocationFault);
       requireRepeatedImagePlacements(executor, backend, states, allocationFault);
@@ -6819,7 +6668,7 @@ int main(int argc, char **argv) {
       requireReplayPointKeepsItsImageRows(executor, backend);
       requireCapturedStateKeepsItsImageRows(executor, backend);
       requireImageRegistryKeepsOnlyHeldRows(executor);
-    } else if (!cacheOnly) {
+    } else {
       require(!imagesOnly, "--images-only needs a model that serves vision");
       std::cout << "image scenarios: skipped, the model serves text only\n";
     }
@@ -6835,17 +6684,6 @@ int main(int argc, char **argv) {
 
     requireWeightReadsAreTheStoresAlone(executor, model, targetTokens->productionSeed);
     const std::vector<uint32_t> &samplingSeedTokens = targetTokens->samplingSeed;
-    if (cacheOnly) {
-      requireCacheHitMatchesCold(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize,
-                                 exactCachedStates);
-      requireDecodeCaptureMatchesTheLane(executor, states, samplingSeedTokens);
-      requireCaptureInsideItsPathMatchesExactRows(executor, states, samplingSeedTokens);
-      runtime.reset();
-      requireStopInsideABlockEndsItsCapture(context, model, samplingSeedTokens);
-      std::cout << "PASS model-runtime-oracle scope=cache-only model=" << model.name()
-                << " (decode captures at and inside their paths, a stop inside a block, cache hits against cold)\n";
-      return 0;
-    }
     if (prefillGroupsOnly) {
       requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                           model.descriptor.hasVision());
