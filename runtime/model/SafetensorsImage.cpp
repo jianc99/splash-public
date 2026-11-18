@@ -160,13 +160,11 @@ public:
     floatRows(module, rows, columns, image_.section(bytes));
   }
 
-  // An F32 vector the kernels read as stored, of its bf16 values widened or
-  // its F32 values (Flint's attention sinks).
+  // An F32 vector the kernels read, of its bf16 values widened (Flint's
+  // attention sinks, bf16 in mlx-community/flint-mixed-3-4bit).
   void floatVector(const std::string &name, uint64_t elements) {
-    const SourceTensor &tensor = require(name, {"BF16", "F32"}, {elements});
-    const bool bfloat16 = tensor.dtype == "BF16";
-    image_.copy(rows(name, tensor, bfloat16 ? ggml::kBF16 : ggml::kF32, 1, tensor.bytes),
-                bfloat16 ? Conversion::WidenToFloat32 : Conversion::None);
+    const SourceTensor &tensor = require(name, {"BF16"}, {elements});
+    image_.copy(rows(name, tensor, ggml::kBF16, 1, tensor.bytes), Conversion::WidenToFloat32);
   }
 
   // The token table's rows, which the embedding kernel gathers: native rows
