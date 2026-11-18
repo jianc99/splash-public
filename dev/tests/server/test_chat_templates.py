@@ -689,6 +689,62 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             app.tokenizer(history, add_special_tokens=False)["input_ids"],
         )
 
+    def test_requests_carry_the_end_of_their_head(self):
+        """A prompt that opens with a system prompt or with tools, which the
+        template renders in its first message, carries where that message
+        ends, so that the engine keeps a state there for the next conversation
+        sharing it; a prompt without such a message carries none."""
+        app = fixtures.make_frontend(
+            chat_tokenizer(source("qwen38_gguf"), "<|im_start|>", "<|im_end|>"),
+            None,
+            "test-model",
+            4096,
+            10,
+            2,
+            vision=False,
+        )
+        end = app.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        first = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Again"},
+        ]
+        other = [{"role": "user", "content": "Something else"}]
+        system = {"role": "system", "content": "Leading instructions"}
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Reads a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name, head, tools in (
+            ("system", [system], None),
+            ("tools", [], [tool]),
+            ("neither", [], None),
+        ):
+            with self.subTest(name=name):
+                jobs = [
+                    app.prepare(
+                        {
+                            "model": "test-model",
+                            "messages": head + conversation,
+                            **({"tools": tools} if tools else {}),
+                        },
+                        deadline=fixtures.FOREVER,
+                    )
+                    for conversation in (first, other)
+                ]
+                if not head and not tools:
+                    self.assertEqual([job.head_tokens for job in jobs], [0, 0])
+                    continue
+                expected = jobs[0].prompt_tokens.index(end) + 1
+                self.assertEqual([job.head_tokens for job in jobs], [expected] * 2)
+                self.assertEqual(
+                    jobs[0].prompt_tokens[:expected], jobs[1].prompt_tokens[:expected]
+                )
+
     def test_an_agent_loop_extends_the_previous_prompt_and_reply_in_every_api(self):
         """After a tool loop with thinking, the next request of each API,
         whether it adds a tool result, a user message or a user message with
