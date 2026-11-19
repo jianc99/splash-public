@@ -60,6 +60,9 @@ struct QwenTargetDimensions {
   // after its queries, by whose sigmoid the attention's output rows multiply
   // (Qwen3.5's attn_output_gate); else it holds the queries alone.
   bool attentionGate = true;
+  // Whether each attention layer holds a learned sink per query head, which
+  // its reduce adds (Flint's).
+  bool attentionSinks = false;
   // The rotated dimension pairs of each attention head and their RoPE base.
   uint32_t rotaryPairs = 0;
   float rotaryTheta = 0.0F;
@@ -206,9 +209,9 @@ struct QwenTargetDimensions {
 // A family's layout: its name, its dimensions and the cache layouts they
 // make. A layout type is an architecture, whose code its families share; each
 // family is a value of it (model::kFamilies) that sets every value its FFN
-// uses. The type states its config's model type, the architecture of its GGUFs
-// and whether a safetensors checkpoint of it loads (modelType,
-// ggufArchitecture, loadsSafetensors), and, where its config.json holds the
+// uses. The type states its config's model type and the architecture of its
+// GGUFs, which also names its walk of a safetensors checkpoint (modelType,
+// ggufArchitecture), and, where its config.json holds the
 // text model's keys at its top level instead of in a text_config (a
 // multimodal Qwen checkpoint's), flatConfig.
 struct QwenHybridLayout : QwenTargetDimensions {

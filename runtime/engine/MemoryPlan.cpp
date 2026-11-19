@@ -373,6 +373,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       model.footprint.runtime.sharedPrefillPlannedAllocatedBytes;
   breakdown.sharedDecodeBytes =
       model.footprint.runtime.sharedDecodePlannedAllocatedBytes;
+  breakdown.maximumBatchWidth = model.footprint.runtime.lanes;
   breakdown.pipelineReserveBytes = model::kPipelineReserveBytes;
   breakdown.runtimeOverheadReserveBytes = model::kRuntimeOverheadReserveBytes;
   breakdown.stateStagingBytes = model.footprint.stateStagingBytes;
@@ -409,9 +410,12 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       breakdown.hardBudgetBytes > breakdown.fixedRuntimeBytes
           ? breakdown.hardBudgetBytes - breakdown.fixedRuntimeBytes
           : 0;
+  // The minimum holds four lanes' arenas (ModelMemoryPlan::minimumArenaBytes).
+  const model::ModelMemoryPlan &runtime = model.footprint.runtime;
+  const uint64_t fixed = breakdown.fixedRuntimeBytes - (runtime.minimumArenaBytes ? breakdown.sharedPrefillBytes +
+      breakdown.sharedDecodeBytes - runtime.minimumArenaBytes : 0);
   const std::optional<uint64_t> required =
-      minimumRequiredBytes(breakdown.fixedRuntimeBytes,
-                           breakdown.laneStateBytes, model.targetKvLayout);
+      minimumRequiredBytes(fixed, breakdown.laneStateBytes, model.targetKvLayout);
   if (!required) {
     return {std::nullopt,
             failure(BudgetErrorCode::ArithmeticOverflow,
@@ -419,7 +423,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
                     std::move(breakdown))};
   }
   breakdown.minimumRequiredBytes = *required;
-  breakdown.minimumDynamicBytes = *required - breakdown.fixedRuntimeBytes;
+  breakdown.minimumDynamicBytes = *required - fixed;
   breakdown.kvIndexPageBytes = model.targetKvLayout.indexBytesPerModelPage();
   breakdown.kvSpill = model.spill;
   // A windowed layout's request keeps Full only its lane's window and the
@@ -492,4 +496,9 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   return {std::move(plan), std::move(status)};
 }
 
+bool eightLanesHold(const EngineMemoryPlan &four, const EngineMemoryPlanResult &eight) noexcept {
+  const KvSpillPlan &a = four.breakdown().kvSpill, *b = eight.plan ? &eight.plan->breakdown().kvSpill : nullptr;
+  return b && eight.plan->maximumContextTokens() == four.maximumContextTokens() && b->enabled == a.enabled &&
+         b->memoryTokens == a.memoryTokens;
+}
 } // namespace splash::engine

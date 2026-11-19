@@ -233,7 +233,7 @@ void checkGrouping(uint32_t queryHeads, kv::Layout layout) {
   const auto wide = planOf(lanes, queryHeads, layout, kBf16, 4 * kv::kAttentionMaximumSplits);
   require(wide.dispatches().size() == 1 && wide.dispatches()[0].slots <= 4 * kv::kAttentionMaximumSplits,
           "a decode step's 16-row lanes at the longest context do not attend in one dispatch");
-  for (const size_t count : {size_t{0}, size_t{5}}) {
+  for (const size_t count : {size_t{0}, size_t{SPLASH_MAXIMUM_BATCH_WIDTH + 1}}) {
     const std::vector<kv::ChunkedPrefillParams> many(count, sequenceOf(0, 8));
     rejects([&] { (void)planOf(many, queryHeads, layout); }, "invalid attention sequences",
             "an attention of no sequences or more than a batch was accepted");
@@ -1710,10 +1710,12 @@ void attentionBlocks(metal::MetalBackend &backend) {
       // layout.
       const auto bindsLists = [&](const metal::ComputeDispatch &split, const metal::ComputeDispatch &reduce,
                                   uint32_t after) {
-        return split.buffers.size() == 9 + 3 + after && split.buffers[7].buffer.sameView(partials) &&
-               split.buffers[8].buffer.sameView(laneRows) && split.buffers[9].buffer.sameView(boundLists) &&
-               split.buffers[10].buffer.sameView(boundCounts) && split.buffers[11].buffer.sameView(partials) &&
-               split.bytes.size() == 1 && split.bytes[0].index == 12 + after && reduce.buffers.size() == 8 &&
+        // The lanes' page tables from index 3, then the tree rows' place.
+        constexpr uint32_t t = 3 + SPLASH_MAXIMUM_BATCH_WIDTH;
+        return split.buffers.size() == t + 5 + after && split.buffers[t].buffer.sameView(partials) &&
+               split.buffers[t + 1].buffer.sameView(laneRows) && split.buffers[t + 2].buffer.sameView(boundLists) &&
+               split.buffers[t + 3].buffer.sameView(boundCounts) && split.buffers[t + 4].buffer.sameView(partials) &&
+               split.bytes.size() == 1 && split.bytes[0].index == t + 5 + after && reduce.buffers.size() == 8 &&
                reduce.buffers[2].buffer.sameView(packed) && reduce.buffers[3].buffer.sameView(hidden) &&
                reduce.buffers[4].buffer.sameView(hidden) && reduce.buffers[5].buffer.sameView(hidden) &&
                reduce.buffers[6].buffer.sameView(laneRows) && reduce.buffers[7].buffer.sameView(boundCounts) &&
@@ -1739,8 +1741,8 @@ void attentionBlocks(metal::MetalBackend &backend) {
         metal::CommandGraph located;
         attend(located, {listBuffer, counts, listStride, first, locations, locationPages});
         const metal::ComputeDispatch &split = located.dispatches()[0];
-        require(bindsLists(split, located.dispatches()[1], 2) && split.buffers[12].buffer.sameView(locations) &&
-                    split.buffers[13].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
+        require(bindsLists(split, located.dispatches()[1], 2) && split.buffers[8 + SPLASH_MAXIMUM_BATCH_WIDTH].buffer.sameView(locations) &&
+                    split.buffers[9 + SPLASH_MAXIMUM_BATCH_WIDTH].buffer.sameView(locationPages) && split.pipelineName == locatedSplitName(layout),
                 "a located split does not bind its lists' locations and their pages before its parameters");
         rejects([&] { attend(refused, {listBuffer, counts, listStride, first, locations, {}}); },
                 "attention block locations need their pages", "block locations without pages were taken");
@@ -1771,10 +1773,11 @@ void attentionBlocks(metal::MetalBackend &backend) {
     metal::CommandGraph masked, listless, unmasked;
     attendTree(masked, {listBuffer, counts, entries, first, {}, {}, rowMasks});
     attendTree(listless, {listBuffer, counts, 0, 0, {}, {}, rowMasks});
-    require(masked.dispatches()[0].buffers[7].buffer.sameView(treeRows) &&
-                masked.dispatches()[0].buffers[8].buffer.sameView(treeLayout) &&
-                masked.dispatches()[0].buffers[11].buffer.sameView(rowMasks) &&
-                listless.dispatches()[0].buffers[11].buffer.sameView(partials),
+    constexpr uint32_t t = 3 + SPLASH_MAXIMUM_BATCH_WIDTH;
+    require(masked.dispatches()[0].buffers[t].buffer.sameView(treeRows) &&
+                masked.dispatches()[0].buffers[t + 1].buffer.sameView(treeLayout) &&
+                masked.dispatches()[0].buffers[t + 4].buffer.sameView(rowMasks) &&
+                listless.dispatches()[0].buffers[t + 4].buffer.sameView(partials),
             "a sparse split of tree rows does not bind their row masks after its lists' counts");
     rejects([&] { attendTree(unmasked, {listBuffer, counts, entries, first}); },
             "attention row masks buffer holds 0 bytes, needs 64", "tree rows took lists without row masks");

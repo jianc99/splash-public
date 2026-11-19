@@ -61,10 +61,7 @@ uint32_t DenseLinear::paddedRows(uint32_t rows) noexcept { return (rows + kRowTi
 void DenseLinear::add(metal::CommandGraph &graph, const DenseWeights &weights, uint32_t outputSize,
                       uint32_t inputSize, const metal::MetalBuffer &input, const metal::MetalBuffer &output,
                       uint32_t rows, DenseEpilogue epilogue) const {
-  if (!rows || !outputSize || !inputSize || inputSize % kInputMultiple || outputSize % kOutputMultiple)
-    throw std::invalid_argument("a dense projection takes rows of inputs and outputs of whole 128s");
-  requireBytes(weights.weight, uint64_t{outputSize} * inputSize * 2, "dense weight");
-  requireBytes(weights.bias, uint64_t{outputSize} * 2, "dense bias");
+  // The weights and their 128 multiples are the tower's, which ops::Vision checks once; the rows are the image's.
   requireBytes(input, uint64_t{paddedRows(rows)} * inputSize * 2, "dense input");
   const uint64_t outputBytes = epilogue == DenseEpilogue::Residual ? 4 : 2;
   requireBytes(output, uint64_t{rows} * outputSize * outputBytes, "dense output");

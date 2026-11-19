@@ -42,7 +42,9 @@ struct ExpertStoreStats final {
   // route their lanes' verify rows, ops::MoeBuffers::lanes): the
   // blocks loaded, the distinct experts they routed, those not resident and
   // of them those read ahead, the experts read ahead whole (routed or not),
-  // the bytes read from the sources (ahead or not, routed or not), and the
+  // the bytes read from the sources (ahead or not, routed or not), the reads
+  // planned and the bytes of them built on the CPU (rows of a quantized
+  // float tensor, permuted rows, a tensor scale's), and the
   // round trips of the loads' host steps, one per round (metal::
   // HostStepTiming: the GPU's work before a step to the runner taking it up,
   // its work, its end to the GPU's work after it).
@@ -53,6 +55,8 @@ struct ExpertStoreStats final {
     uint64_t prefetched = 0;
     uint64_t readAhead = 0;
     uint64_t readBytes = 0;
+    uint64_t reads = 0;
+    uint64_t builtBytes = 0;
     LatencyStats pickup, work, resume;
   };
   Use uses[2];

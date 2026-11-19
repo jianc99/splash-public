@@ -144,7 +144,9 @@ struct StreamedExperts {
 };
 // Where a table's rows are in its GGUF (tableRows), for reading them from the
 // file (model/SparseRowStore.hpp) instead of loading the table's image: the
-// rows exactly as the image would hold them.
+// rows exactly as the image would hold them. A safetensors table's rows are
+// those its image's copies read (model/SafetensorsTarget.hpp streamTable),
+// its file and offset 0.
 struct StreamedRows final {
   std::string tensor;
   uint32_t file = 0;   // the part of a split GGUF that holds it

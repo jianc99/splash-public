@@ -350,6 +350,10 @@ extension LaunchOption {
                           choices: [("30m", "After 30 Minutes"), ("1h", "After 1 Hour"), ("off", "Never")],
                           custom: duration(message: "Seconds, or with s, m or h, such as 45m."))),
         LaunchOption(
+            flag: "--lazy-load", title: "Load the model on first use",
+            help: "Starts without loading the model, so that it takes no memory until the first message, which loads it.",
+            section: .main, kind: .toggle(on: true)),
+        LaunchOption(
             flag: "--language-only", title: "Text only",
             help: "Leaves the model’s vision out: it loads less, and refuses images and PDFs.",
             section: .main, kind: .toggle(on: true)),

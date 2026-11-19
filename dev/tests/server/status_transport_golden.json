@@ -2,6 +2,7 @@
   "capabilities": {"max_context_tokens": 131072},
   "transport": {
     "ready": false,
+    "unloaded": false,
     "recovering": false,
     "stopped": true,
     "pending": 0,

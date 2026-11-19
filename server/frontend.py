@@ -210,6 +210,18 @@ class GenerationOptions:
     thinking_token_budget: int | None
 
 
+def served_names(model, served_model_names=(), announce_served_name=False):
+    """The name generation and scoring responses report, and every name a
+    request may give, in /v1/models order: the reported name first, so a
+    client configured from data[0] (splash <client>) requests the name it gets
+    back. Every name stays accepted."""
+    names = tuple(served_model_names)
+    if announce_served_name and not names:
+        raise ValueError("announce_served_name needs a served model name")
+    response_model = names[0] if announce_served_name else model
+    return response_model, tuple(dict.fromkeys((response_model, model, *names)))
+
+
 class Frontend:
     def __init__(
         self,
@@ -230,6 +242,7 @@ class Frontend:
         default_reasoning_effort=None,
         default_thinking_token_budget=None,
         sampling_defaults=None,
+        latencies=None,
     ):
         # What the engine serves, from its Ready (backend.runtime.capabilities):
         # the context follows the latest engine (max_context); its lanes and
@@ -238,7 +251,9 @@ class Frontend:
         served = backend.runtime.capabilities
         preparation_capacity = served.max_concurrent_requests
         self.vision = served.vision
-        self.latencies = LatencyMetrics()
+        # A lazy server's, which measured its requests before the engine
+        # loaded (server.UnloadedApp).
+        self.latencies = LatencyMetrics() if latencies is None else latencies
         self.tokenizer = tokenizer
         # Probed at startup; requests choose among these, never the
         # tokenizer's own.
@@ -253,15 +268,9 @@ class Frontend:
         # The model id the engine loaded. /status reports it, so an alias
         # can never hide what served a request.
         self.model = model
-        names = tuple(served_model_names)
-        if announce_served_name and not names:
-            raise ValueError("announce_served_name needs a served model name")
-        # The name generation and scoring responses report.
-        self.response_model = names[0] if announce_served_name else model
-        # /v1/models order: the name responses report first, so a client
-        # configured from data[0] (splash <client>) requests the name it gets
-        # back. Every name stays accepted.
-        self.model_names = tuple(dict.fromkeys((self.response_model, model, *names)))
+        self.response_model, self.model_names = served_names(
+            model, served_model_names, announce_served_name
+        )
         # The effort the server gives every chat request in place of whatever
         # the request says of reasoning (--reasoning-effort); None where each
         # request's own, or the default below, decides.

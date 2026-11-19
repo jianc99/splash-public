@@ -263,7 +263,8 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybri
 // holds the rest of what the kernels compute; a GGUF's is what the installer
 // derived from the GGUF's metadata, which the GGUF planner checks
 // (gguf::planImages).
-void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source) {
+void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, TargetSource source,
+                        bool statesAttentionGate = true) {
   const std::string_view name = sourceName(source);
   if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
   if (source != TargetSource::Safetensors) return;
@@ -287,8 +288,12 @@ void validateTextConfig(NSDictionary *text, const QwenHybridLayout &target, Targ
                    {{"intermediate_size", target.intermediateSize}});
   requireBooleans(text, "text config",
                   {{"attention_bias", false},
-                   {"attn_output_gate", true},
                    {"tie_word_embeddings", false}});
+  if (statesAttentionGate) requireBooleans(text, "text config", {{"attn_output_gate", true}});
+  // The gate of the GDN's gated norm, where a config names it.
+  if (text[@"output_gate_type"])
+    requireEqual(requireString(text, @"output_gate_type", "text config output_gate_type"),
+                 target.gdnSigmoidGate ? "sigmoid" : "swish", name, "text config output_gate_type");
   requireEqual(requireString(text, @"hidden_act", "text config hidden_act"),
                "silu", name, "text config hidden_act");
   requireLayerTypes(requireArray(text, @"layer_types", "text config layer_types"),
@@ -320,6 +325,36 @@ void requireWholes(NSArray *values, std::span<const uint32_t> expected, std::str
   };
   throw std::invalid_argument(label + " mismatch: " + std::string(source) + " " + text(found) + ", runtime " +
                               text(expected));
+}
+
+// Qwen3.8-Flash-Next's text configuration: the hybrid's (validateTextConfig
+// above) but attn_output_gate, which it leaves unstated (its attention is
+// gated: Qwen4ExpLayout's packedFullWidth), then, where a safetensors config
+// states them (a GGUF's metadata
+// does, which its planner checks), its hyper-connections, its QSA indexer
+// (its heads, head width, one key head, the tokens of a block and the tokens
+// its blocks select), its PLE n-gram embedding (n-grams, heads, convolution,
+// width, its layer by its 1-based id), and the end-of-sequence token its
+// hash reads (Qwen4ExpLayout::pleEosToken).
+void validateTextConfig(NSDictionary *text, const Qwen4ExpLayout &target, TargetSource source) {
+  validateTextConfig(text, static_cast<const QwenHybridLayout &>(target), source, false);
+  if (source != TargetSource::Safetensors) return;
+  requireNumbers(text, sourceName(source), "text config",
+                 {{"hc_count", target.hyperConnections},
+                  {"hc_lowrank", target.hyperRank},
+                  {"indexer_n_heads", target.indexerHeads},
+                  {"indexer_head_dim", target.indexerHeadDimension},
+                  {"indexer_kv_heads", 1},
+                  {"indexer_compress_ratio", target.indexerBlockTokens},
+                  {"indexer_budget", target.indexerTokens()},
+                  {"ngram_size", target.pleNgram},
+                  {"heads_per_ngram", target.pleHeadsPerNgram},
+                  {"ple_conv_kernel_size", target.pleConvolutionTaps},
+                  {"ple_embed_dim", target.pleWidth()},
+                  {"eos_token_id", target.pleEosToken}});
+  const std::array<uint32_t, 1> pleLayers{target.pleLayer + 1};
+  requireWholes(requireArray(text, @"ple_layer_ids", "text config ple_layer_ids"), pleLayers, sourceName(source),
+                "text config ple_layer_ids");
 }
 
 // The layers of `mask` among `layers`, a bit each, in order.
@@ -430,7 +465,7 @@ uint32_t ggufRoutedExperts(NSDictionary *text, const QwenHybridLayout &target) {
 // beta's or the token table's, which the images read unquantized too, is
 // accepted.
 void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry,
-                            std::string_view architecture, safetensors::ModuleNames names) {
+                            safetensors::ModuleNames names) {
   const auto require = [](NSDictionary *entry, const std::string &label, bool module) {
     NSString *mode = entry[@"mode"] ?: @"affine";
     if (![mode isKindOfClass:[NSString class]]) throw std::invalid_argument(label + " mode must be a string");
@@ -450,7 +485,7 @@ void requireMlxQuantization(NSDictionary *quantization, const QwenTargetDimensio
   for (NSString *module in quantization)
     if ([quantization[module] isKindOfClass:[NSDictionary class]])
       require(quantization[module], "quantization " + std::string(module.UTF8String ?: ""), true);
-  for (const std::string &module : safetensors::quantizedModules(geometry, architecture, names)) {
+  for (const std::string &module : safetensors::quantizedModules(geometry, names)) {
     id entry = quantization[@(module.c_str())];
     if (entry && ![entry isKindOfClass:[NSDictionary class]])
       throw std::invalid_argument("quantization " + module +
@@ -483,8 +518,7 @@ std::vector<std::string> expertProjections(const std::string &experts, const Qwe
 // else a module no ignore pattern names, nor its experts' projections
 // (expertProjections). Its activation and KV cache quantization play no part:
 // the kernels read activations in bf16 and keep Splash's own KV formats.
-void requireModelOptimizerQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry,
-                                       std::string_view architecture) {
+void requireModelOptimizerQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry) {
   const auto requireAlgorithm = [](NSDictionary *entry, const std::string &label) {
     const std::string algorithm = requireString(entry, @"quant_algo", label + " quant_algo");
     if (algorithm == "FP8") return;
@@ -497,7 +531,7 @@ void requireModelOptimizerQuantization(NSDictionary *quantization, const QwenTar
                                   "; Model Optimizer NVFP4 loads in groups of 16");
   };
   const std::vector<std::string> required =
-      safetensors::quantizedModules(geometry, architecture, safetensors::ModuleNames::Transformers);
+      safetensors::quantizedModules(geometry, safetensors::ModuleNames::Transformers);
   NSDictionary *layers = quantization[@"quantized_layers"];
   if ([layers isKindOfClass:[NSDictionary class]]) {
     for (NSString *module in layers) {
@@ -586,8 +620,7 @@ private:
 // their projections, expertProjections) is a group's target that no ignore
 // entry names (ModuleMatcher). Its activation and KV cache schemes play no
 // part.
-void requireCompressedTensorsQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry,
-                                          std::string_view architecture) {
+void requireCompressedTensorsQuantization(NSDictionary *quantization, const QwenTargetDimensions &geometry) {
   NSDictionary *groups = quantization[@"config_groups"];
   if (![groups isKindOfClass:[NSDictionary class]] || !groups.count)
     throw std::invalid_argument("quantization_config config_groups must be a non-empty object");
@@ -628,7 +661,7 @@ void requireCompressedTensorsQuantization(NSDictionary *quantization, const Qwen
     throw std::invalid_argument("quantization_config ignore must be an array");
   const ModuleMatcher ignore(ignoreEntries, "quantization_config ignore");
   for (const std::string &module :
-       safetensors::quantizedModules(geometry, architecture, safetensors::ModuleNames::Transformers)) {
+       safetensors::quantizedModules(geometry, safetensors::ModuleNames::Transformers)) {
     const std::vector<std::string> names =
         module.ends_with(".experts") ? expertProjections(module, geometry) : std::vector<std::string>{module};
     for (const std::string &name : names)
@@ -643,21 +676,20 @@ void requireCompressedTensorsQuantization(NSDictionary *quantization, const Qwen
 // quantization_config of Model Optimizer or compressed-tensors. A checkpoint
 // with none of them holds BF16 weights, or another method's that a
 // transformers quantization_config states (GPTQ, AWQ, ...). The modules are
-// named as the family's checkpoints name them (safetensors::quantizedModules
-// by its layout's ggufArchitecture): an MLX config of a family whose config
-// is flat (flatConfig, Flint's) by mlx-lm's names.
+// named as the family's checkpoints name them (safetensors::quantizedModules):
+// an MLX config of a family whose config is flat (flatConfig, Flint's) by
+// mlx-lm's names.
 template <class Layout> void requireQuantization(NSDictionary *config, const Layout &layout) {
-  const std::string_view architecture = layout.ggufArchitecture;
   NSDictionary *mlxQuantization = config[@"quantization"];
   if ([mlxQuantization isKindOfClass:[NSDictionary class]])
-    return requireMlxQuantization(mlxQuantization, layout, architecture,
+    return requireMlxQuantization(mlxQuantization, layout,
                                   layout.flatConfig ? safetensors::ModuleNames::MlxLm : safetensors::ModuleNames::Mlx);
   NSDictionary *quantization = config[@"quantization_config"];
   if ([quantization isKindOfClass:[NSDictionary class]]) {
     if ([quantization[@"quant_method"] isEqual:@"modelopt"])
-      return requireModelOptimizerQuantization(quantization, layout, architecture);
+      return requireModelOptimizerQuantization(quantization, layout);
     if ([quantization[@"quant_method"] isEqual:@"compressed-tensors"])
-      return requireCompressedTensorsQuantization(quantization, layout, architecture);
+      return requireCompressedTensorsQuantization(quantization, layout);
   }
   throw std::invalid_argument("this model requires an MLX checkpoint (" + std::string(safetensors::kMlxAffineFormats) +
                               ", " + std::string(safetensors::kMlxFloatFormats) +
@@ -804,8 +836,6 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   // holds its draft's.
   DFlashDraftLayout dflashLayout;
   std::visit([&](auto &layout) {
-    if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
-      throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
     validateTextConfig(text, layout, targetSource);
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)

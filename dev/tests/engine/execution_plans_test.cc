@@ -30,7 +30,7 @@ constexpr std::array draftShapes{
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
 constexpr MoeShape routedShape{2048, 256, 8, 512};
 // A decode step's most rows: four lanes of a verify block's most.
-constexpr uint32_t kStepRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+constexpr uint32_t kStepRows = SPLASH_DECODE_STEP_ROWS;
 // A MoE target of F32 routers.
 constexpr uint32_t kRouterFormat = QuantizedSegment::kFloat32;
 constexpr std::array moeShapes{
@@ -352,8 +352,9 @@ void workspaceBounds() {
 void invalidLookupsAndContextEdges() {
   const ExecutionPlans plans(device(), Int8Activations::On);
   const auto kvLayout = attentionShapes[0].layout;
-  const auto workspace = workspaceOf(plans.laneAttentionWorkspace(24, kvLayout), 4);
-  const std::array<uint32_t, 5> histories{0, 1, 2, 3, 4};
+  const auto workspace = workspaceOf(plans.laneAttentionWorkspace(24, kvLayout), SPLASH_MAXIMUM_BATCH_WIDTH);
+  std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH + 1> histories{};
+  for (uint32_t lane = 0; lane < histories.size(); ++lane) histories[lane] = lane;
   for (const size_t lanes : {size_t{0}, histories.size()})
     rejects([&] { (void)plans.attention(lanesAfter(std::span(histories).first(lanes)), 24, kvLayout, workspace); },
             "invalid attention sequences", "an attention of no sequences or past a batch was accepted");

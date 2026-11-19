@@ -231,24 +231,9 @@ void StateCache::markReply(StateCheckpoint checkpoint) noexcept {
   const auto found = entries_.find(checkpoint.kvBlock);
   if (found == entries_.end() || !found->second.checkpoint || found->second.publication != checkpoint.publication)
     return;
-  markHeld(checkpoint);
-  kv_.noteReply(checkpoint.kvBlock);
-}
-
-void StateCache::markHeld(StateCheckpoint checkpoint) noexcept {
-  const auto found = entries_.find(checkpoint.kvBlock);
-  if (found == entries_.end() || !found->second.checkpoint || found->second.publication != checkpoint.publication)
-    return;
   found->second.opportunistic = true;
+  kv_.noteReply(checkpoint.kvBlock);
   // A reclaim no longer writes it: it leaves its order of writes.
-  reindex(checkpoint.kvBlock, found->second);
-}
-
-void StateCache::keepHeld(StateCheckpoint checkpoint) noexcept {
-  const auto found = entries_.find(checkpoint.kvBlock);
-  if (found == entries_.end() || found->second.publication != checkpoint.publication || !found->second.opportunistic)
-    return;
-  found->second.opportunistic = false;
   reindex(checkpoint.kvBlock, found->second);
 }
 
@@ -379,6 +364,14 @@ void StateCache::markBranchPoint(uint64_t kvBlock) {
     return;
   found->second.branchPoint = true;
   markSuperseded(kvBlock);
+}
+
+void StateCache::supersedeCheckpoint(uint64_t kvBlock, bool superseded) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || !found->second.checkpoint || found->second.superseded == superseded)
+    return;
+  found->second.superseded = superseded;
+  reindex(kvBlock, found->second);
 }
 
 bool StateCache::keepReplyAsPoint(StateCheckpoint checkpoint) {

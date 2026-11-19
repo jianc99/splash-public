@@ -883,6 +883,7 @@ class NativeBackendContractTests(unittest.TestCase):
             status["transport"],
             {
                 "ready": True,
+                "unloaded": False,
                 "recovering": False,
                 "stopped": False,
                 "pending": 0,
@@ -1474,81 +1475,29 @@ class CallbackStreamerTests(unittest.TestCase):
         # to U+FFFD, which is dropped; one that text follows stays.
         tokenizer = ByteLevelTestTokenizer([b"caf", b"\xc3", b" noir"])
         caf, lead, noir = tokenizer.token_ids
-        for incremental in (True, False):
-            for token_ids, expected in (
-                ([caf, lead], "caf"),
-                ([caf, lead, noir, lead], "caf\ufffd noir"),
-            ):
-                chunks = []
-                streamer = backend_api.CallbackStreamer(tokenizer, chunks.append)
-                if not incremental:
-                    # As an invalid DecodeStream prefix leaves it: the end
-                    # decodes the whole output.
-                    streamer.decode_stream = None
-                streamer.put_tokens(token_ids)
-                streamer.end()
-                self.assertEqual("".join(chunks), expected)
-
-    def test_callback_streamer_reconciles_an_invalid_decoder_prefix(self):
-        tokenizer = ByteLevelTestTokenizer([b'{"', b"value", b'":', b"123", b"}"])
-        chunks = []
-        streamer = backend_api.CallbackStreamer(tokenizer, chunks.append)
-        streamer.decode_stream = SimpleNamespace(
-            step=mock.Mock(side_effect=ValueError("Invalid prefix encountered"))
-        )
-        streamer.put_tokens(tokenizer.token_ids[:2])
-        self.assertEqual("".join(chunks), '{"value')
-        streamer.put_tokens(tokenizer.token_ids[2:])
-        streamer.end()
-        self.assertEqual("".join(chunks), tokenizer.decode(tokenizer.token_ids))
-
-    def test_an_invalid_decoder_prefix_stops_at_the_batch_that_holds_the_stop(self):
-        # Decoding the whole output at each token, a stop ends the request
-        # with the batch that completes it, and the output keeps the tokens up
-        # to the one that does, which its usage counts.
-        tokenizer = ByteLevelTestTokenizer(
-            [b"alpha ", b"<ST", b"OP>", b"hidden", b" trailing"]
-        )
-        chunks, stopped = [], []
-        streamer = backend_api.CallbackStreamer(
-            tokenizer, chunks.append, ("<STOP>",), lambda: stopped.append(True)
-        )
-        streamer.decode_stream = SimpleNamespace(
-            step=mock.Mock(side_effect=ValueError("Invalid prefix encountered"))
-        )
-        streamer.put_tokens(tokenizer.token_ids[:2])
-        self.assertEqual(stopped, [])
-        streamer.put_tokens(tokenizer.token_ids[2:])
-        self.assertEqual(stopped, [True])
-        self.assertEqual(streamer.token_ids, tokenizer.token_ids[:3])
-        streamer.put_tokens(tokenizer.token_ids)
-        streamer.end()
-        self.assertEqual("".join(chunks), "alpha ")
-        self.assertEqual(streamer.stop_sequence, "<STOP>")
-        self.assertEqual(streamer.token_ids, tokenizer.token_ids[:3])
+        for token_ids, expected in (
+            ([caf, lead], "caf"),
+            ([caf, lead, noir, lead], "caf\ufffd noir"),
+        ):
+            chunks = []
+            streamer = backend_api.CallbackStreamer(tokenizer, chunks.append)
+            streamer.put_tokens(token_ids)
+            streamer.end()
+            self.assertEqual("".join(chunks), expected)
 
     def test_the_stop_that_begins_first_ends_a_block_whatever_the_list_order(self):
         # A speculative step's block can complete two stops at once.
         tokenizer = ByteLevelTestTokenizer([b"A ST", b"OP B ", b"END and more"])
         for stops in (("END", "STOP"), ("STOP", "END")):
-            for incremental in (True, False):
-                with self.subTest(stops=stops, incremental=incremental):
-                    chunks = []
-                    streamer = backend_api.CallbackStreamer(
-                        tokenizer, chunks.append, stops
-                    )
-                    if not incremental:
-                        streamer.decode_stream = SimpleNamespace(
-                            step=mock.Mock(
-                                side_effect=ValueError("Invalid prefix encountered")
-                            )
-                        )
-                    streamer.put_tokens(tokenizer.token_ids)
-                    streamer.end()
-                    self.assertEqual(
-                        ("".join(chunks), streamer.stop_sequence), ("A ", "STOP")
-                    )
-                    self.assertEqual(streamer.token_ids, tokenizer.token_ids[:2])
+            with self.subTest(stops=stops):
+                chunks = []
+                streamer = backend_api.CallbackStreamer(tokenizer, chunks.append, stops)
+                streamer.put_tokens(tokenizer.token_ids)
+                streamer.end()
+                self.assertEqual(
+                    ("".join(chunks), streamer.stop_sequence), ("A ", "STOP")
+                )
+                self.assertEqual(streamer.token_ids, tokenizer.token_ids[:2])
 
     def test_callback_streamer_stops_across_token_boundaries(self):
         tokenizer = ByteLevelTestTokenizer([b"alpha <ST", b"OP>hidden", b" trailing"])
@@ -1603,14 +1552,6 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def refuse_incremental_decode(streamer):
-    """Make `streamer`'s DecodeStream refuse every step, as tokenizers does
-    where a decoder rewrites earlier text."""
-    streamer.decode_stream = SimpleNamespace(
-        step=mock.Mock(side_effect=ValueError("Invalid prefix encountered"))
-    )
-
-
 class AnswerStopTests(unittest.TestCase):
     """A request's stop sequences end its answer alone: they are not searched
     in its reasoning nor inside a tool call, the tags that bound those read
@@ -1618,9 +1559,8 @@ class AnswerStopTests(unittest.TestCase):
 
     def read(self, raw_tokens, stops, *, thinking=False, calls=False, start=False):
         """The streamer's reading of an output of `raw_tokens`, put one token,
-        three tokens or all at a time, with the incremental decode or without
-        it; each way must read the same. Returns the text, the stop, the kept
-        token count and the reasoning tokens."""
+        three tokens or all at a time; each way must read the same. Returns the
+        text, the stop, the kept token count and the reasoning tokens."""
         tokenizer = ByteLevelTestTokenizer([raw.encode() for raw in raw_tokens])
         ids = dict(zip(raw_tokens, tokenizer.token_ids))
         chat_format = dataclasses.replace(
@@ -1632,32 +1572,29 @@ class AnswerStopTests(unittest.TestCase):
         )
         readings = set()
         for size in (1, 3, len(raw_tokens)):
-            for incremental in (True, False):
-                chunks, stopped = [], []
-                streamer = backend_api.CallbackStreamer(
-                    tokenizer,
-                    chunks.append,
-                    stops,
-                    lambda: stopped.append(True),
-                    chat_format=chat_format,
-                    thinking=thinking,
-                    may_call_tools=calls,
-                    reads_calls=calls,
+            chunks, stopped = [], []
+            streamer = backend_api.CallbackStreamer(
+                tokenizer,
+                chunks.append,
+                stops,
+                lambda: stopped.append(True),
+                chat_format=chat_format,
+                thinking=thinking,
+                may_call_tools=calls,
+                reads_calls=calls,
+            )
+            for offset in range(0, len(tokenizer.token_ids), size):
+                streamer.put_tokens(tokenizer.token_ids[offset : offset + size])
+            streamer.end()
+            self.assertEqual(len(stopped), int(streamer.stop_sequence is not None))
+            readings.add(
+                (
+                    "".join(chunks),
+                    streamer.stop_sequence,
+                    len(streamer.token_ids),
+                    streamer.count_reasoning_tokens(chat_format, thinking, calls),
                 )
-                if not incremental:
-                    refuse_incremental_decode(streamer)
-                for offset in range(0, len(tokenizer.token_ids), size):
-                    streamer.put_tokens(tokenizer.token_ids[offset : offset + size])
-                streamer.end()
-                self.assertEqual(len(stopped), int(streamer.stop_sequence is not None))
-                readings.add(
-                    (
-                        "".join(chunks),
-                        streamer.stop_sequence,
-                        len(streamer.token_ids),
-                        streamer.count_reasoning_tokens(chat_format, thinking, calls),
-                    )
-                )
+            )
         self.assertEqual(len(readings), 1, readings)
         return readings.pop()
 

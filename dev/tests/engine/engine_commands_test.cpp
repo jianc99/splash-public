@@ -37,6 +37,14 @@ namespace {
 
 using splash::test::require;
 
+// The most lanes of a step, and the requests 1 to n.
+constexpr uint32_t kWidth = model::ExecutionLimits::maximumBatchWidth;
+std::vector<uint64_t> ids(uint64_t last) {
+  std::vector<uint64_t> result;
+  for (uint64_t id = 1; id <= last; ++id) result.push_back(id);
+  return result;
+}
+
 // A command in three passes over lanes 1 and 2, the lanes in `ended` ended,
 // on a scheduler that counts the commands given up.
 class PassesOfTwo final {
@@ -416,42 +424,43 @@ void testALaneSuspendedBetweenPassesAbandonsItsCommand() {
     // The Foreground start, of a higher priority, abandons the command
     // (Scheduler::yieldsTo).
     passing.targetTimes = true;
-    for (uint64_t id = 1; id <= 4; ++id)
-      passing.submit(id, 300, RequestPriority::Background);
+    // Every lane's prompt, the command's 1,200 rows shared among them.
+    for (uint64_t id = 1; id <= kWidth; ++id)
+      passing.submit(id, 1200 / kWidth, RequestPriority::Background);
     const auto lanes = [](const PassingEngine::Command &command, std::vector<uint64_t> ids) {
       return command.kind == WorkKind::Prefill && command.lanes == ids;
     };
     passing.tickUntil(
         [&] {
           return std::ranges::count_if(passing.commands, [&](const PassingEngine::Command &command) {
-                   return lanes(command, {1, 2, 3, 4});
+                   return lanes(command, ids(kWidth));
                  }) == 1 &&
                  !passing.engine.commandInFlight();
         },
         "the Background prompts did not run a pass of their command");
     if (cancelled) {
-      passing.engine.cancel(4);
+      passing.engine.cancel(kWidth);
       require(passing.engine.snapshot().cancelled == 0, "a lane cancelled between its command's passes left it");
     }
-    passing.submit(5, 100, RequestPriority::Foreground);
+    passing.submit(kWidth + 1, 100, RequestPriority::Foreground);
     passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
     std::vector<PassingEngine::Command> prefills;
     for (const PassingEngine::Command &command : passing.commands)
       if (command.kind == WorkKind::Prefill)
         prefills.push_back(command);
     // The lanes that run again: the command's, the suspended one resumed.
-    const std::vector<uint64_t> resumed = cancelled ? std::vector<uint64_t>{1, 2, 3} : std::vector<uint64_t>{1, 2, 3, 4};
+    const std::vector<uint64_t> resumed = ids(cancelled ? kWidth - 1 : kWidth);
     // The first prefill after the arrival's passes.
     const auto rerun = std::find_if(prefills.begin() + 1, prefills.end(),
-                                    [&](const PassingEngine::Command &command) { return !lanes(command, {5}); });
+                                    [&](const PassingEngine::Command &command) { return !lanes(command, {kWidth + 1}); });
     require(passing.engine.snapshot().prioritySuspensions == !cancelled &&
                 passing.engine.snapshot().cancelled == cancelled && prefills.size() > 2 &&
-                lanes(prefills[1], {5}) && prefills[1].pass == 0 && rerun != prefills.end() &&
+                lanes(prefills[1], {kWidth + 1}) && prefills[1].pass == 0 && rerun != prefills.end() &&
                 rerun->lanes == resumed && rerun->pass == 0 &&
                 std::ranges::count_if(prefills, [&](const PassingEngine::Command &command) {
                   return lanes(command, resumed) && command.pass;
                 }) == 5 &&
-                passing.events.completedCount == 5 && passing.events.failedCount == 0,
+                passing.events.completedCount == kWidth + 1 && passing.events.failedCount == 0,
             "a command whose lane was suspended between its passes ran on, the arrival did not run next, or its "
             "lanes did not run again");
   }
@@ -465,7 +474,7 @@ void testAStopBetweenPassesFinishesAsStop() {
   PassingEngine passing;
   // Lane 1, with the shortest prompt the least work, yields its lane to a
   // Foreground arrival.
-  for (uint64_t id = 1; id <= 4; ++id) {
+  for (uint64_t id = 1; id <= kWidth; ++id) {
     EngineRequest lane = request(id, std::vector<uint32_t>(id == 1 ? 100 : 300, static_cast<uint32_t>(id)));
     lane.priority = RequestPriority::Background;
     lane.maxNewTokens = 1000;
@@ -473,11 +482,11 @@ void testAStopBetweenPassesFinishesAsStop() {
   }
   passing.tickUntil(
       [&] {
-        return std::ranges::all_of(std::array<uint64_t, 4>{1, 2, 3, 4},
+        return std::ranges::all_of(ids(kWidth),
                                    [&](uint64_t id) { return !passing.events.outputs[id].empty(); });
       },
       "the Background lanes did not decode");
-  passing.submit(5, 100, RequestPriority::Foreground);
+  passing.submit(kWidth + 1, 100, RequestPriority::Foreground);
   const size_t arrived = passing.commands.size();
   const auto replayBetweenPasses = [&] {
     if (passing.engine.commandInFlight() || passing.commands.size() == arrived)
@@ -485,19 +494,19 @@ void testAStopBetweenPassesFinishesAsStop() {
     const PassingEngine::Command &last = passing.commands.back();
     return last.kind == WorkKind::Prefill && last.lanes == std::vector<uint64_t>{1} && last.pass + 1 < last.passes;
   };
-  passing.tickUntil([&] { return passing.events.usage.contains(5) && replayBetweenPasses(); },
+  passing.tickUntil([&] { return passing.events.usage.contains(kWidth + 1) && replayBetweenPasses(); },
                     "the suspended lane did not resume into a replay in passes");
   require(passing.engine.snapshot().prioritySuspensions == 1, "the arrival did not suspend the lane");
   const size_t emitted = passing.events.outputs.at(1).size();
 
   passing.engine.stop(1);
   passing.tickUntil([&] { return passing.events.reasons.contains(1); }, "the stopped lane did not end");
-  for (uint64_t id = 2; id <= 4; ++id)
+  for (uint64_t id = 2; id <= kWidth; ++id)
     passing.engine.cancel(id);
   passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
   const EngineSnapshot counts = passing.engine.snapshot();
   require(passing.events.reasons.at(1) == EngineFinishReason::Stop && passing.events.outputs.at(1).size() == emitted &&
-              counts.completed == 2 && counts.cancelled == 3 && counts.failed == 0,
+              counts.completed == 2 && counts.cancelled == kWidth - 1 && counts.failed == 0,
           "a stop between a replay's passes did not finish as Stop with nothing more emitted");
 }
 
@@ -506,7 +515,7 @@ void testAStopBetweenPassesFinishesAsStop() {
 // more of the lanes that remain.
 void testAStartThatTakesALaneRunsTheNextCommand() {
   PassingEngine passing;
-  for (uint64_t id = 1; id <= 4; ++id) {
+  for (uint64_t id = 1; id <= kWidth; ++id) {
     EngineRequest lane = request(id, std::vector<uint32_t>(300, static_cast<uint32_t>(id)));
     lane.priority = RequestPriority::Background;
     lane.maxNewTokens = 100'000;
@@ -516,25 +525,25 @@ void testAStartThatTakesALaneRunsTheNextCommand() {
   passing.tickUntil(
       [&] {
         return passing.engine.commandInFlight() &&
-               std::ranges::all_of(std::array<uint64_t, 4>{1, 2, 3, 4},
+               std::ranges::all_of(ids(kWidth),
                                    [&](uint64_t id) { return !passing.events.outputs[id].empty(); });
       },
       "the Background lanes did not decode");
   // The command in flight is the last recorded.
   const size_t arrived = passing.commands.size();
-  passing.submit(5, 100, RequestPriority::Foreground);
+  passing.submit(kWidth + 1, 100, RequestPriority::Foreground);
   passing.tickUntil([&] { return passing.commands.size() > arrived; }, "no command followed the one in flight");
   const PassingEngine::Command &next = passing.commands[arrived];
   require(passing.engine.snapshot().prioritySuspensions == 1 && next.kind == WorkKind::Prefill &&
-              next.lanes == std::vector<uint64_t>{5},
-          "the command after a Foreground arrival under four Background lanes was not its prompt's");
-  passing.tickUntil([&] { return passing.events.usage.contains(5); }, "the Foreground request did not end");
-  for (uint64_t id = 1; id <= 4; ++id)
+              next.lanes == std::vector<uint64_t>{kWidth + 1},
+          "the command after a Foreground arrival under every lane Background was not its prompt's");
+  passing.tickUntil([&] { return passing.events.usage.contains(kWidth + 1); }, "the Foreground request did not end");
+  for (uint64_t id = 1; id <= kWidth; ++id)
     passing.engine.cancel(id);
   passing.tickUntil([&] { return idle(passing.engine); }, "the requests did not end");
   const EngineSnapshot counts = passing.engine.snapshot();
-  require(counts.completed == 1 && counts.cancelled == 4 && passing.events.failedCount == 0,
-          "the requests did not end as one completed and four cancelled");
+  require(counts.completed == 1 && counts.cancelled == kWidth && passing.events.failedCount == 0,
+          "the requests did not end as one completed and every lane cancelled");
 }
 
 // A higher-priority prompt refused its KV takes the memory of the Background
@@ -1104,7 +1113,9 @@ void testACaptureCutReplansWithARowCap() {
   engine::Engine engine(test::engineConfig({.maxContext = 102400}), cache, model, events);
   guardReleases(storage, engine);
   model.time(test::passingTarget());
-  engine.submit(request(1, std::vector<uint32_t>(7000, 7)));
+  // Its replay point at 6272 lies too near 4096 for a tail checkpoint, which
+  // the command would pass the checkpoint at 4096 for.
+  engine.submit(request(1, std::vector<uint32_t>(6273, 7)));
   runUntilIdle(engine);
   const EngineSnapshot counts = engine.snapshot();
   require(events.completedCount == 1 && !commands.empty() &&
@@ -1112,7 +1123,7 @@ void testACaptureCutReplansWithARowCap() {
           "the command did not end at the boundary whose capture was refused");
   require(counts.captureCuts == 1 && counts.replans >= 1,
           "the capture cut was not planned again with the lane's rows capped");
-  require(commands.size() >= 2 && commands[1].front() == std::pair<uint64_t, uint32_t>{1, 7000 - 4096},
+  require(commands.size() >= 2 && commands[1].front() == std::pair<uint64_t, uint32_t>{1, 6273 - 4096},
           "the next command did not go on from the boundary");
 }
 
@@ -1231,9 +1242,9 @@ void testAPreemptingStartWaitsUntilItLeads() {
   // submitted once the first ran a command, the lanes suspended before the
   // first's last command, and whether the second leads as it arrives.
   for (const auto &[normals, second, afterCommand, suspended, leads] :
-       {std::tuple{3u, 3 * chunk + 400, false, 0u, false},
-        {4u, 3 * chunk + 400, false, 1u, false},
-        {4u, 2 * chunk + 4, true, 2u, true}}) {
+       {std::tuple{kWidth - 1, 3 * chunk + 400, false, 0u, false},
+        {kWidth, 3 * chunk + 400, false, 1u, false},
+        {kWidth, 2 * chunk + 4, true, 2u, true}}) {
     test::TestKvStorage storage(1024, 4096, 4);
     KvPool pool(storage, 0);
     engine::Cache cache(pool, nullptr, nullptr);
@@ -1254,22 +1265,22 @@ void testAPreemptingStartWaitsUntilItLeads() {
       submit(id, 300, RequestPriority::Normal, 100'000);
     tickUntil(engine, now, [&] { return engine.snapshot().scheduler.decoding == normals; },
               "the Normal requests did not decode");
-    submit(5, 3 * chunk + 100, RequestPriority::Foreground, 1);
-    tickUntil(engine, now, [&] { return std::ranges::count(events.startIds, 5u) == 1; },
+    submit(kWidth + 1, 3 * chunk + 100, RequestPriority::Foreground, 1);
+    tickUntil(engine, now, [&] { return std::ranges::count(events.startIds, uint64_t{kWidth + 1}) == 1; },
               "the first Foreground prompt did not start");
     if (afterCommand)
-      tickUntil(engine, now, [&] { return rowsLeft(engine, 5) == 2 * chunk + 100; },
+      tickUntil(engine, now, [&] { return rowsLeft(engine, kWidth + 1) == 2 * chunk + 100; },
                 "the first Foreground prompt did not run a command");
-    const uint32_t firstLeft = rowsLeft(engine, 5);
-    submit(6, second, RequestPriority::Foreground, 1);
+    const uint32_t firstLeft = rowsLeft(engine, kWidth + 1);
+    submit(kWidth + 2, second, RequestPriority::Foreground, 1);
     std::string early;
     tickUntil(
         engine, now,
         [&] {
           const EngineSnapshot counts = engine.snapshot();
-          const bool started = std::ranges::count(events.startIds, 6u) != 0;
+          const bool started = std::ranges::count(events.startIds, uint64_t{kWidth + 2}) != 0;
           if (early.empty() &&
-              ((rowsLeft(engine, 5) > chunk && ((started && !leads) || counts.prioritySuspensions > suspended)) ||
+              ((rowsLeft(engine, kWidth + 1) > chunk && ((started && !leads) || counts.prioritySuspensions > suspended)) ||
                (!started && counts.resourceResumptions)))
             early = std::to_string(counts.prioritySuspensions) + " lanes suspended, " +
                     std::to_string(counts.resourceResumptions) + " resumed, the second " +
@@ -1279,9 +1290,9 @@ void testAPreemptingStartWaitsUntilItLeads() {
         "the second Foreground prompt did not start");
     require(early.empty(), "before the first Foreground prompt's last command, of " + std::to_string(second) +
                                " tokens beside " + std::to_string(normals) + " Normal lanes: " + early);
-    require(!leads || (rowsLeft(engine, 5) == firstLeft && engine.snapshot().prioritySuspensions == suspended),
+    require(!leads || (rowsLeft(engine, kWidth + 1) == firstLeft && engine.snapshot().prioritySuspensions == suspended),
             "a second Foreground prompt that leads did not start with the lane it took: the first had " +
-                std::to_string(rowsLeft(engine, 5)) + " of its " + std::to_string(firstLeft) + " rows left");
+                std::to_string(rowsLeft(engine, kWidth + 1)) + " of its " + std::to_string(firstLeft) + " rows left");
   }
 }
 

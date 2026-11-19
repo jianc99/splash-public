@@ -627,6 +627,17 @@ SERVE_OPTIONS = (
         engine=EngineArgument("--idle-release", text=idle_release_text),
     ),
     ServeOption(
+        "--lazy-load",
+        "memory",
+        dict(
+            action="store_true",
+            default=False,
+            help="start without loading the model: the first request that needs "
+            "it loads the weights and warms up, and requests that arrive "
+            "meanwhile wait for that load (default: load at start)",
+        ),
+    ),
+    ServeOption(
         "--max-cache-disk",
         "cache",
         dict(

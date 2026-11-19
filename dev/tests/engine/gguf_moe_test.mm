@@ -1189,9 +1189,19 @@ void bufferExtents(MetalBackend &backend) {
 // The int8 passes (MoeConfig::int8Passes) of a block whose six projections are one MLX affine format: af4g64 and
 // af5g64 run them, each pass inside the int8 rule's interval, a row's result the same in every chunk (its codes and
 // sums depend on its own inputs alone); af3g64, which the int8 tile does not take, keeps the staged passes, and so
-// does a plan without int8Passes (--activations bf16).
+// does a plan without int8Passes (--activations bf16). As the plans select them, the passes run only where the
+// device's family runs the int8 prefill tile (ProjectionCalibration::prefillInt8: not Apple9, where the tile's
+// int8 fragments do not compute these products) and the shape holds them (MoeShape::int8Fits: not the wide
+// fixtures of gguf-moe-e512 and gguf-moe-sigmoid); elsewhere every plan keeps the staged passes.
 int int8Experts(MetalBackend &backend) {
   int failures = 0;
+  const bool family =
+      splash::ops::Linear(backend.capabilities(), splash::ops::Int8Activations::On).calibration().projection.prefillInt8;
+  const bool runs = family && kShape.int8Fits();
+  if (!runs)
+    printf("int8 passes: not run here (%s); every plan keeps the staged passes\n",
+           !family ? "the device's family does not run the int8 prefill tile"
+                   : "the experts are wider than the hidden size");
   Buffers b;
   b.input = activations(uint64_t{kMaximumRows} * kHidden);
   b.residual = activations(uint64_t{kMaximumRows} * kHidden);
@@ -1210,7 +1220,7 @@ int int8Experts(MetalBackend &backend) {
       uint32_t compared = 0;
       for (const uint32_t rows : {kMaximumRows, 33u, 16u, 1u}) {
         MoeConfig config{MoeExpertTile::M32};
-        config.int8Passes = on;
+        config.int8Passes = on && runs && takes;
         const MoePlan plan = MoE::plan(kShape, rows, config);
         const std::string label = std::string(fmtName(f)) + (on ? " int8" : " staged") + " prefill rows=" +
                                   std::to_string(rows);
@@ -1220,7 +1230,7 @@ int int8Experts(MetalBackend &backend) {
         const bool ran = std::ranges::any_of(graph.dispatches(), [](const ComputeDispatch &d) {
           return d.pipelineName.starts_with("moe_expert_int8_");
         });
-        if (ran != (on && takes)) {
+        if (ran != (on && takes && runs)) {
           printf("  %s: %s the int8 passes FAIL\n", label.c_str(), ran ? "ran" : "did not run");
           ++failures;
         }
@@ -1229,7 +1239,7 @@ int int8Experts(MetalBackend &backend) {
           widest = result;
           continue;
         }
-        if (on && takes) {
+        if (on && takes && runs) {
           // Every row of a narrower chunk is the widest chunk's, bitwise, whatever tiles its routes ran.
           for (uint32_t r = 0; r < rows; ++r, ++compared)
             if (!std::equal(result.output.begin() + uint64_t{r} * kHidden,
@@ -1243,7 +1253,7 @@ int int8Experts(MetalBackend &backend) {
       }
       printf("%-8s %s prefill 263/33/16/1: gate/up worst %.1e, down %.1e of sum|x w|, %u rows bitwise the widest "
              "chunk's %s\n",
-             fmtName(f), on && takes ? "int8  " : "staged", stats.gateUpWorst, stats.downWorst, compared,
+             fmtName(f), on && takes && runs ? "int8  " : "staged", stats.gateUpWorst, stats.downWorst, compared,
              failures > before ? "FAIL" : "ok");
     }
   }
@@ -1639,7 +1649,7 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
   // step.
   std::vector<SplashLaneRows> every;
   for (uint32_t first = 0; first < rows; first += 8) every.push_back({first, std::min(8u, rows - first)});
-  if (every.size() > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::logic_error("a step of more rows than four lanes of 8");
+  if (every.size() > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::logic_error("a step of more rows than the most lanes of 8");
   // Inputs within 0.25 of zero, which score an expert at most 1, and a row's
   // route k at 1 - k / (2 kTopK), which scores its expert above 2.
   std::mt19937 generator(0x5e1);

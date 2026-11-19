@@ -395,21 +395,11 @@ class CallbackStreamer:
                 break
 
     def _step(self, token_id):
-        """The text `token_id` adds to the output. Where tokenizers'
-        DecodeStream cannot continue, which a decoder that rewrites earlier
-        text can make it, each token decodes the whole output instead, so
-        that a stop sequence still ends the request at the token that
-        completes it, and the usage counts no token past it."""
-        if self.decode_stream is not None:
-            try:
-                return self.decode_stream.step(self.backend, token_id) or ""
-            except Exception as error:
-                # tokenizers raises a plain Exception with this message when
-                # an incremental decode cannot continue.
-                if not str(error).startswith("Invalid prefix encountered"):
-                    raise
-                self.decode_stream = None
-        return self._rest()
+        """The text `token_id` adds to the output. tokenizers' DecodeStream
+        holds back the bytes of a character it has not ended; the end
+        decodes what it held (_rest). An error in the incremental decode
+        fails the request: every tokenizer served decodes byte by byte."""
+        return self.decode_stream.step(self.backend, token_id) or ""
 
     def _rest(self):
         """The text of the whole output past the text put so far."""
@@ -832,7 +822,9 @@ class NativeBackend:
             if self.closing or self.stop_reason is not None:
                 return self._closed_error_locked()
             self._ensure_recovery_locked()
-            if self.runtime.ready:
+            # A server that has loaded no engine serves a request by loading
+            # it (server.UnloadedApp).
+            if self.runtime.ready or self.unloaded:
                 return None
             failure = self.engine_error
             retry_after = self._recovery_retry_after_locked()
@@ -881,7 +873,64 @@ class NativeBackend:
             print_status("Engine restarted")
         return True
 
+    @property
+    def unloaded(self):
+        """Whether no engine has been Ready: a --lazy-load server's until the
+        start its first request makes ends (server.UnloadedApp)."""
+        return self.runtime.capabilities is None
+
+    def _unloaded_weights(self):
+        """The weights of a server that has loaded none, as an engine reports
+        its weights released (status, release_weights): released, and
+        restoring while a start loads them."""
+        return {"released": True, "restoring": self.runtime.starting}
+
     def status(self, timeout=supervision.STATUS_PROBE_SECONDS):
+        unloaded = self.unloaded
+        if unloaded:
+            # No engine to ask: the server's own word, never stale.
+            snapshot, stale_error, stale_age_ms = (
+                {
+                    "schema_version": wire.STATUS_SCHEMA_VERSION,
+                    "ready": False,
+                    "weights": self._unloaded_weights(),
+                },
+                None,
+                None,
+            )
+        else:
+            snapshot, stale_error, stale_age_ms = self._engine_status(timeout)
+        with self.lock:
+            transport_ready = not self.closing and self.runtime.ready
+            engine_error = self.engine_error
+            stopped = self.stop_reason is not None
+        snapshot["transport"] = {
+            "ready": transport_ready,
+            "unloaded": unloaded,
+            "recovering": not unloaded
+            and not self.closing
+            and not stopped
+            and not transport_ready,
+            "stopped": stopped,
+            "pending": self.runtime.pending_count,
+            "pending_limit": self.runtime.pending_limit,
+            "restarts": self.runtime.restart_count,
+            "last_crash_trace": self.runtime.last_crash_trace,
+            "status_stale": stale_error is not None,
+            "status_age_ms": (
+                0.0 if stale_error is None or stale_age_ms is None else stale_age_ms
+            ),
+        }
+        if stale_error is not None:
+            snapshot["transport"]["error"] = engine_error or str(stale_error)
+        if not transport_ready:
+            snapshot["ready"] = False
+        return snapshot
+
+    def _engine_status(self, timeout):
+        """The engine's status, or the last one cached where it does not
+        answer: the snapshot, the error it did not answer for, and the
+        snapshot's age then (milliseconds; None for none cached)."""
         stale_error = None
         stale_age_ms = None
         with self.lock:
@@ -937,28 +986,7 @@ class NativeBackend:
         else:
             if not self._cache_status(snapshot, restarts):
                 snapshot["ready"] = False
-        with self.lock:
-            transport_ready = not self.closing and self.runtime.ready
-            engine_error = self.engine_error
-            stopped = self.stop_reason is not None
-        snapshot["transport"] = {
-            "ready": transport_ready,
-            "recovering": not self.closing and not stopped and not transport_ready,
-            "stopped": stopped,
-            "pending": self.runtime.pending_count,
-            "pending_limit": self.runtime.pending_limit,
-            "restarts": self.runtime.restart_count,
-            "last_crash_trace": self.runtime.last_crash_trace,
-            "status_stale": stale_error is not None,
-            "status_age_ms": (
-                0.0 if stale_error is None or stale_age_ms is None else stale_age_ms
-            ),
-        }
-        if stale_error is not None:
-            snapshot["transport"]["error"] = engine_error or str(stale_error)
-        if not transport_ready:
-            snapshot["ready"] = False
-        return snapshot
+        return snapshot, stale_error, stale_age_ms
 
     @staticmethod
     def _mask_provider(job):
@@ -1038,6 +1066,9 @@ class NativeBackend:
         with self.lock:
             if self.closing:
                 raise self._closed_error_locked()
+        if self.unloaded:
+            # Nothing is loaded to give back.
+            return {"weights": self._unloaded_weights()}
         restarts = self.runtime.restart_count
         try:
             event = self.runtime.release_weights(timeout=timeout)

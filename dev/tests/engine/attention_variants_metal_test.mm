@@ -122,7 +122,7 @@ struct Case final {
   HostKvExtents pool;
   SplashKvLayer layer;
   std::array<std::vector<uint32_t>, 4> pages;
-  std::array<metal::MetalBuffer, 4> tables;
+  std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> tables;
   uint32_t poisoned = 0;
   metal::MetalBuffer sinks;
 
@@ -226,7 +226,7 @@ Case makeCase(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
         }
       }
   }
-  for (uint32_t lane = lanes; lane < 4; ++lane) data.tables[lane] = data.tables[0];
+  for (uint32_t lane = lanes; lane < data.tables.size(); ++lane) data.tables[lane] = data.tables[0];
   return data;
 }
 
@@ -779,10 +779,10 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
                                  .block_list = 0};
       metal::CommandGraph graph;
       // Without tree rows the split binds another buffer in their place.
-      graph.add(plan.splitPipeline(),
-                {staging.queries, partials, statistics, data.tables[0], data.tables[1], data.tables[2], data.tables[3],
-                 partials, staging.layout},
-                params, {kKvHeads, data.lanes, splits});
+      std::vector<metal::MetalBuffer> split{staging.queries, partials, statistics};
+      split.insert(split.end(), data.tables.begin(), data.tables.end());
+      split.insert(split.end(), {partials, staging.layout});
+      graph.add(plan.splitPipeline(), std::move(split), params, {kKvHeads, data.lanes, splits});
       // The ungated plain reduce reads no packed row and writes no table, so
       // the output rows take those bindings too.
       graph.add(plan.reducePipeline(),
@@ -983,7 +983,7 @@ void checkProjection(metal::MetalBackend &backend, kv::Format format, bool rotat
                              (rotated ? "" : "_nope") + (float32 ? "_f32" : "");
   require(graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == kernel &&
               graph.dispatches()[0].threadsPerThreadgroup.x == kHeadDimension &&
-              graph.dispatches()[0].buffers.size() == (rotated ? 11U : 9U),
+              graph.dispatches()[0].buffers.size() == (rotated ? 7U : 5U) + SPLASH_MAXIMUM_BATCH_WIDTH,
           "the projection runs another kernel or binds tables it does not read");
   // A row's stored element of a K/V tensor: a BF16 page's value, or an INT8
   // page's code times its row's scale, and the scale.

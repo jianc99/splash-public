@@ -11,7 +11,7 @@
 namespace splash::ops {
 namespace {
 
-static_assert(kMaximumRegisterRows / GGUF_TABLE16_ROWS == SPLASH_MAXIMUM_BATCH_WIDTH,
+static_assert(kMaximumRegisterRows / GGUF_TABLE16_ROWS == kRegisterTableTiles,
               "a register boundary names each count of table tiles the register tile holds");
 static_assert(kMaximumPairRows <= kMaximumDecodeTileRows && kMaximumRegisterRows <= kMaximumDecodeTileRows &&
                   kMaximumInt8Rows <= kMaximumDecodeTileRows,
@@ -308,7 +308,7 @@ bool moeInt8Experts(std::span<const BlockMoeWeights *const> blocks) noexcept {
     return p.routed.formatId == p.shared.formatId && quant_prefill_int8_format(p.routed.formatId);
   };
   return !blocks.empty() && std::ranges::all_of(blocks, [&](const BlockMoeWeights *block) {
-    return !block->stream && takes(block->gate) && takes(block->up) && takes(block->down);
+    return takes(block->gate) && takes(block->up) && takes(block->down);
   });
 }
 

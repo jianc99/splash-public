@@ -79,7 +79,7 @@ std::optional<Part> resolve(const StreamedPart &part, std::string_view option, s
 // tableBytes), as they allocate them: the hot block cache's at a target of
 // `hotTargetBytes` and one for each of `buffers` buffers of staged history.
 uint64_t readerTableBytes(const StreamedMemoryInputs &in, uint64_t hotTargetBytes, uint32_t buffers) {
-  return model::KvBlockCache::tableBytes(in.kvLayout, *in.sparseKv, hotTargetBytes) +
+  return model::KvBlockCache::tableBytes(in.kvLayout, *in.sparseKv, hotTargetBytes, in.lanes) +
          buffers * model::KvHistoryStream::tableBytes(in.kvLayout);
 }
 
@@ -126,7 +126,8 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   const auto fits = [&](uint32_t tokens) { return spillFloors.bytes(tokens, 1) <= room; };
   if (!fits(0)) return spill;
   // The longest context the floors hold, and the longest the SSD cache's
-  // room for active KV holds beside every lane's state.
+  // room for active KV holds beside the planned lanes' states
+  // (ExecutionLimits::plannedLanes).
   uint32_t low = 0, high = in.windowTokens;
   while (low < high) {
     const uint32_t middle = high - (high - low) / 2;
@@ -135,7 +136,7 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
     else
       high = middle - 1;
   }
-  const uint64_t states = uint64_t{model::ExecutionLimits::maximumBatchWidth} * in.stateSlotBytes;
+  const uint64_t states = uint64_t{model::ExecutionLimits::plannedLanes} * in.stateSlotBytes;
   spill.enabled = true;
   spill.memoryTokens = low;
   // The room only bounds a first start's context: it follows the volume's
@@ -158,7 +159,7 @@ KvSpillPlan planSpill(const StreamedMemoryInputs &in, uint64_t floors) {
   spill.laneSlots = shape.laneSlots();
   spill.hotFloorBytes = spill.hotTargetBytes = spillFloors.hotFloorBytes;
   spill.hotLimitBytes = extentsBytes(
-      layout, shape.requiredSlots(model::ExecutionLimits::maximumBatchWidth) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
+      layout, shape.requiredSlots(in.lanes) >> SPLASH_ATTENTION_LOCATION_BLOCK_BITS,
       layout.kvBytesPerModelPage());
   spill.indexRunwayBytes = spillFloors.indexRunwayBytes;
   spill.stagingBytes = spillFloors.stagingBytes(spill.floorTokens, spill.stagingBuffers);

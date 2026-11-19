@@ -15,7 +15,6 @@ uint32_t roundUp(uint32_t value, uint32_t multiple) noexcept { return (value + m
 // The bytes of `tensor` the kernel reaches over `rows` rows of `width`
 // dimensions of every head.
 void requireTensor(const HeadTensor &tensor, uint32_t heads, uint32_t rows, uint32_t width, const char *what) {
-  if (tensor.rowStride < width) throw std::invalid_argument(std::string(what) + " rows are narrower than a head");
   const uint64_t last = uint64_t{heads - 1} * tensor.headStride + uint64_t{rows - 1} * tensor.rowStride + width;
   requireBytes(tensor.buffer, last * 2, what);
 }
@@ -28,8 +27,6 @@ uint32_t DenseAttention::paddedKeys(uint32_t rows) noexcept { return roundUp(row
 
 void DenseAttention::add(metal::CommandGraph &graph, const DenseAttentionTensors &tensors, uint32_t heads,
                          uint32_t dimensions, uint32_t rows, float scale) {
-  if (dimensions != 72) throw std::invalid_argument("dense attention takes heads of 72 dimensions");
-  if (!heads || !rows) throw std::invalid_argument("dense attention takes heads and rows");
   const uint32_t padded = roundUp(dimensions, 16);
   requireTensor(tensors.queries, heads, paddedQueries(rows), padded, "dense attention query");
   requireTensor(tensors.keys, heads, paddedKeys(rows), padded, "dense attention key");

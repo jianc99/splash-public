@@ -193,8 +193,7 @@ template <class Layout> void requireQwenLayout(const Layout &layout) {
 // with the files' loader, their format and the experts (readQwenTargetWeights,
 // or a family's own order). The target's allocations are all that loading it
 // allocates, its expert store's among them, and its fingerprint is its
-// files'. A family whose weights load from a GGUF only (loadsSafetensors
-// false) reads a GGUF's loader alone.
+// files'.
 template <class Weights, class Layout, class Read>
 [[nodiscard]] Weights
 loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTargetFiles &files, Read read) {
@@ -205,12 +204,8 @@ loadQwenTarget(metal::MetalBackend &backend, const Layout &layout, const QwenTar
   Weights weights = [&] {
     if (const auto *gguf = std::get_if<std::reference_wrapper<GgufTargetLoader>>(&files))
       return read(gguf->get(), BlockTargetFormat{}, experts);
-    if constexpr (Layout::loadsSafetensors) {
-      SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
-      return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
-    } else {
-      throw WeightStoreError(std::string(layout.family) + " loads from a GGUF only");
-    }
+    SafetensorsTargetLoader &safetensors = std::get<std::reference_wrapper<SafetensorsTargetLoader>>(files).get();
+    return read(safetensors, BlockTargetFormat{safetensors.float32Norms(), ops::GdnHeadOrder::Grouped}, experts);
   }();
   weights.experts = experts.store;
   weights.manifestFingerprintSha256 = weightManifestFingerprint(weights.files);

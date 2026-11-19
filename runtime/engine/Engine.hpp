@@ -32,6 +32,13 @@ inline constexpr uint32_t kPrefillCheckpointTokens =
 static_assert(kPrefillCheckpointTokens >= model::ExecutionLimits::draftContextTokens &&
                   kPrefillCheckpointTokens % KvCache::pageTokens == 0,
               "a prefill checkpoint interval spans a draft window and whole KV pages");
+// A checkpoint sits this many tokens before a prompt's replay boundary
+// (addTailCheckpoint): an agent's next turn that rewrites the tail of this
+// prompt's last message, as one trims a ~60-token status block, restores
+// within this distance of where it diverges.
+inline constexpr uint32_t kTrimmedTailTokens = 256;
+static_assert(kTrimmedTailTokens % KvCache::pageTokens == 0,
+              "a tail checkpoint sits on a KV page boundary");
 // How long a request waits for memory before it fails, and a resident
 // drain lasts, by default.
 inline constexpr double kResourceWaitTimeoutMilliseconds = 30000.0;
@@ -394,6 +401,9 @@ private:
       // leaves the last one cached when its own state fits beside it.
       // Otherwise a state a later request resumes from.
       bool disposable = false;
+      // The tail checkpoint addTailCheckpoint planned, which retires no
+      // checkpoint before it.
+      bool tail = false;
     };
 
     EngineRequest request;
@@ -512,9 +522,6 @@ private:
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
-    // The checkpoint its last command ended at, whose state the lane holds
-    // until it leaves it (storeHeldCheckpoint); 0 for none.
-    uint32_t heldCheckpoint = 0;
     // Its prompt rendered an earlier reply back token for token, its start's
     // match reaching a block that reply's state was captured at
     // (CacheLookup::rendersReply): its conversation's next prompt is likely
@@ -773,6 +780,9 @@ private:
   // replayStateBoundary while the lane replays only its prompt.
   [[nodiscard]] static uint32_t
   promptReplayBoundary(const Request &request) noexcept;
+  // Where the tail checkpoint sits, kTrimmedTailTokens before the prompt's
+  // replay boundary (addTailCheckpoint); 0 for a prompt too short for one.
+  [[nodiscard]] static uint32_t tailBoundary(const Request &request) noexcept;
   [[nodiscard]] static uint32_t sharedPrefillBoundary(const Request &left,
                                                       const Request &right);
   // An unstarted request waits while a resident producer has yet to publish
@@ -798,6 +808,11 @@ private:
   [[nodiscard]] DraftContextPlan
   configureDraftStatePlan(Request &request, uint32_t stateBoundary,
                           uint32_t junctionBoundary);
+  // Plans a disposable checkpoint kTrimmedTailTokens before the prompt's
+  // replay boundary, for a next turn that rewrites this prompt's tail, a
+  // prefill chunk or more past the state planned before it (or
+  // `stateBoundary`). It retires no checkpoint before it.
+  void addTailCheckpoint(Request &request, uint32_t stateBoundary);
   // Plans a state at `tokens`, past `after` and no later than the replay
   // boundary, keeping the plan in order; a boundary planned both ways is
   // reusable. A new one needs a whole draft window: unless the lane's draft
@@ -838,14 +853,11 @@ private:
   // cached there: `state`, captured, or without one taken from the lane
   // (fromLane) or written from it to the disk tier; `recycled` when its
   // buffers took room reclaimed from cache. The lane's recovery point
-  // retires as the boundary's kind has it; one its command ended at
-  // (atProgress) the lane holds. False when the state was refused.
+  // retires as the boundary's kind has it. False when the state was
+  // refused.
   bool publishStateBoundary(Request &request, Request::StateBoundary objective,
                             std::shared_ptr<const CompositeState> state, bool recycled,
-                            bool fromLane, bool atProgress, double nowMilliseconds);
-  // Stores the checkpoint the lane holds as it leaves it: a RAM copy a
-  // reclaim writes, or the lane's state written to the disk tier.
-  void storeHeldCheckpoint(Request &request);
+                            bool fromLane, double nowMilliseconds);
   // Takes what the plan's lanes need to run it as planned, and returns
   // Runnable with its items and captures; or, when that changed what the
   // plan was made from, Replan, the lanes refused added to `excluded`, a

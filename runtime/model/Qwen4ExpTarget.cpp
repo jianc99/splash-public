@@ -102,7 +102,7 @@ std::vector<metal::MetalBuffer> Qwen4ExpTarget::addPrefill(metal::CommandGraph &
       // A decode step's inputs are its lanes' (prepareVerifyLane,
       // addVerifyInput): the QSA blocks a lane's rows may complete from its
       // position.
-      step.scratch = steps_.verifyScratch(ExecutionLimits::maximumBatchWidth * ExecutionLimits::targetVerifyRows);
+      step.scratch = steps_.verifyScratch(SPLASH_DECODE_STEP_ROWS);
       std::array<uint32_t, ExecutionLimits::maximumBatchWidth> positions{};
       for (uint32_t lane = 0; lane < d->step.lanes; ++lane)
         positions[lane] = static_cast<uint32_t>(step.chunks[lane].committed_tokens);

@@ -41,7 +41,8 @@ inline void writeSyntheticShard(const std::filesystem::path &path,
   uint64_t offset = 0;
   std::vector<uint64_t> offsets;
   for (const SyntheticTensor &tensor : tensors) {
-    uint64_t bytes = tensor.dtype == "U32" || tensor.dtype == "F32"     ? 4
+    uint64_t bytes = tensor.dtype == "I64"                              ? 8
+                     : tensor.dtype == "U32" || tensor.dtype == "F32"     ? 4
                      : tensor.dtype == "U8" || tensor.dtype == "F8_E4M3" ? 1
                                                                          : 2;
     std::string shape;
@@ -120,12 +121,20 @@ inline std::vector<SyntheticTensor> draftTensors(const model::DFlashDraftLayout 
 // hybrid's names are mlx-vlm's (language_model.*); Flint's mlx-lm's (model.*,
 // lm_head), with its bf16 sinks and router, its leading dense layers and a
 // shared expert of its slices without a gate, as mlx-community's Flint holds
-// them.
+// them. Its norms are stored as their multipliers, as mlx-community's
+// checkpoints of both store them: the attention q and k norms, by which the
+// loader tells (safetensors::storesNormsBelowMultipliers), hold 1.40625, near
+// the 1.45 to 1.71 of those checkpoints.
 template <class Layout, class Quantization>
 std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization quantization) {
   std::vector<SyntheticTensor> result;
   const auto bfloat16 = [&](const std::string &name, std::vector<uint64_t> shape) {
     result.push_back({name, "BF16", std::move(shape)});
+  };
+  const auto multipliers = [&](const std::string &name, uint64_t elements) {
+    std::vector<uint8_t> data(elements * 2);
+    for (uint64_t at = 0; at < elements; ++at) data[2 * at + 1] = 0x3F, data[2 * at] = 0xB4; // bf16 1.40625
+    result.push_back({name, "BF16", {elements}, std::move(data)});
   };
   const auto quantized = [&](const std::string &module, uint64_t rows, uint64_t columns, uint64_t experts = 1) {
     const auto [bits, group] = quantization(module);
@@ -148,8 +157,8 @@ std::vector<SyntheticTensor> mlxTargetTensors(const Layout &layout, Quantization
       quantized(attention + "q_proj", (layout.attentionGate ? 2ull : 1ull) * layout.attentionWidth, hidden);
       quantized(attention + "k_proj", kv, hidden);
       quantized(attention + "v_proj", kv, hidden);
-      bfloat16(attention + "q_norm.weight", {layout.attentionHeadDimension});
-      bfloat16(attention + "k_norm.weight", {layout.attentionHeadDimension});
+      multipliers(attention + "q_norm.weight", layout.attentionHeadDimension);
+      multipliers(attention + "k_norm.weight", layout.attentionHeadDimension);
       quantized(attention + "o_proj", hidden, layout.attentionWidth);
       if (flint) bfloat16(attention + "softmax_offset", {layout.attentionQueryHeads});
     } else {

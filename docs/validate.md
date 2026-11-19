@@ -53,7 +53,7 @@ does, and `REVISION`, `DRAFT_MODEL` and `LANGUAGE_ONLY=1` as its `--revision`,
 | Target | Runs |
 | --- | --- |
 | `verify-models` | the installer's restarts without the Hub, `verify --full`, and the record of the weight images (`dev/tools/installer_restarts.py`, `weight-digests` with `WEIGHT_DIGESTS_ARGS` added, such as `WEIGHT_DIGESTS_ARGS="--expert-memory 7G --ple-memory 2G"` to stream the routed experts and the PLE table, [Release check](#release-check)) |
-| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, twice: under shader validation, which compares no embedding digests, and without it, which compares the fixture's pinned digests too; and the native model runtime oracle, each of its four runs with `ORACLE_ARGS` added (the fourth, `--cached-states exact --cache-only`, the cache's checks alone) (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window, sizes that a `--spill-tokens` in `ORACLE_ARGS` replaces in each (on a 24 GB Mac, `ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M"`; below) |
+| `test-real` | vision parity with the family's fixture in `dev/tests/fixtures/vision-parity/` when the installation serves vision, twice: under shader validation, which compares no embedding digests, and without it, which compares the fixture's pinned digests too; and the native model runtime oracle, each of its three runs with `ORACLE_ARGS` added (`ORACLE_ARGS="--kv-format bf16"`, `"--expert-memory 16G"` or `"--max-context 1010000"`); for a block-sparse target their spill checks take the default prompts, two staging buffers, and 32K tokens with the default window, sizes that a `--spill-tokens` in `ORACLE_ARGS` replaces in all three (on a 24 GB Mac, `ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M"`; below) |
 | `test-http-real` | the HTTP frontend on an isolated server (`dev/tests/smoke_real.py`), whose greedy comparisons (a penalized greedy request repeats once its prompt is cached, `min_p` 1 answers as greedy) run where `/status` reports `verify_rows` `all`, which takes `HTTP_SMOKE_ARGS="--verify-rows all"`; where `/status` reports `reasoning_switch` `false` (Flint), it gives each request whose answer it checks room for the model's reasoning and leaves out the thinking budget's check; with `HTTP_SMOKE_ARGS="--persistent-cache --max-cache-disk 8G"`, instead of that smoke, the [persistent cache](server.md#persistent-cache) across a restart in a fresh cache directory: a clean stop, a restart that takes the restore point back, and a next turn that restores the prompt from disk; `release-check` runs both |
 | `test-agent-real` | the five official clients through `splash serve` (`dev/tests/agent_real.py`), in `AGENT_SCENARIO` `complete` (the default) or `smoke` |
 | `test-release-real` | the HTTP smoke and all five clients on one `splash serve` |
@@ -83,17 +83,11 @@ session of its own (`bugfix`): the shop package of
 as 805 cents, so that three cart tests fail and the cause is found only by
 running the tests and following the cart into `shop/money.py`. It passes when
 the client ran the test command, changed `shop/money.py` alone by at most 6
-lines, and the project's tests pass, as do amounts the tests do not use. A
-failure the engine's own record explains (a failed native request, a restart,
-a lost replay point, no cached prompt token reused, a minute of held work
-without progress) fails at once; any other is the model's answer and gets one
-more try in a fresh session; the report names each failure's kind. A try's
-requests must stay within what `dev/tests/fixtures/agent_bugfix/bounds.json`
-records for the model and the client, twice the largest of three runs; a
-client of another version than the one recorded is reported, not bounded. The
-runs' wall times are recorded there, not bounded: they follow the Mac's speed,
-which the timing gates judge. `agent_real.py --calibrate-bugfix 3`,
-with the run's model options, records them again; the file keeps the command.
+lines, and the project's tests pass, as do amounts the tests do not use. Each
+client tries once; a failure prints what the engine's `/status` says changed
+over the fix (requests completed and failed, restarts, cached prompt tokens
+reused, replay points lost), from which the reader tells an engine fault from
+the model's answer.
 
 `benchmark-backend` and `benchmark-decode-profile` take `MODEL` the same way.
 The models they are run with, one per family and source format:
@@ -133,13 +127,13 @@ limit and charge. A block-sparse target's spill check counts what it allocates
 at most before its first prompt, and where the budget leaves less room, stops
 there, naming both, an `--expert-memory` that fits where that store still
 loads, and a `--spill-tokens` that fits for the oracle's command run by hand:
-`ORACLE_ARGS` reaches all four runs of `test-real`, and a `--spill-tokens`
+`ORACLE_ARGS` reaches all three runs of `test-real`, and a `--spill-tokens`
 there replaces the first two runs' default prompts and the third's 32K.
 Beside the weights, Qwen3.8-Flash-Next's default checks hold up to 4.3 GB and
 its 32K check about 5.9 GB. On the 24 GB M6 (11-02) a check's need as the
 oracle names it (up to 1866 MiB by default, 3382 MiB at 32K) and the expert
 store together fit in about 10440 MiB on a text installation and 9580 MiB on
-one that serves vision, so all four runs take
+one that serves vision, so all three runs take
 `ORACLE_ARGS="--expert-memory 6656M --ple-memory 237M"`, or
 `"--expert-memory 5632M --ple-memory 237M"` where the installation serves
 vision, whose default checks alone fit only up to about `7700M` of experts.

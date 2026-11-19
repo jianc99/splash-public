@@ -657,6 +657,16 @@ struct ExecutionLimits final {
   // (engine::KvPool::RunwayHold).
   static constexpr uint32_t warmupKvPages =
       (prefillTokenBudget + kv::kPageTokens - 1) / kv::kPageTokens;
+  // The runway in extents of `extentPages` pages: the whole extents that hold
+  // warmupKvPages, all of which the pool allocates and warmup holds.
+  [[nodiscard]] static constexpr uint32_t runwayPages(uint32_t extentPages) noexcept {
+    return (warmupKvPages + extentPages - 1) / extentPages * extentPages;
+  }
+  // The lanes a start plans its memory for: one to four requests reserve,
+  // and the longest context offered is, what they were before a step took
+  // eight lanes; a fifth to eighth lane is admitted against the memory and
+  // SSD room it finds.
+  static constexpr uint32_t plannedLanes = 4;
   static constexpr uint32_t draftQueryRows = SPLASH_DRAFT_QUERY_ROWS;
   static constexpr uint32_t draftProposalTokens = SPLASH_DRAFT_PROPOSAL_TOKENS;
   // The most rows of a lane's verify block, which every target kernel takes.
@@ -730,6 +740,12 @@ struct ModelMemoryPlan final {
   uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
+  // The lanes the arenas hold (QwenTargetGeometry::lanes).
+  uint32_t lanes = ExecutionLimits::maximumBatchWidth;
+  // The arenas of ExecutionLimits::plannedLanes lanes, which a start's
+  // minimum holds: one that holds no more runs four lanes. None: the arenas
+  // above.
+  uint64_t minimumArenaBytes = 0;
 };
 
 // Fixed reserves the memory plan carries beside the planned arenas: Metal

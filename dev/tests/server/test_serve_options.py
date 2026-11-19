@@ -255,6 +255,7 @@ OPTIONS = {
         {"secret-key": "secret-key"},
         ("", "two words", "key\n", "非ASCII"),
     ),
+    "--lazy-load": ([(["--lazy-load"], True)], []),
     "--allow-idle-sleep": ([(["--allow-idle-sleep"], True)], []),
     "--no-webui": ([(["--no-webui"], True)], []),
 }

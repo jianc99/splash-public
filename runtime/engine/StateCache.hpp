@@ -184,10 +184,6 @@ public:
   // writes it, as a next prompt resumes there only if it renders the reply
   // back token for token. A reuse by another publication, or a use, ends it.
   void markReply(StateCheckpoint checkpoint) noexcept;
-  // The same for a prefill checkpoint its lane holds and can write itself; keepHeld, once the lane stores it, makes
-  // it a checkpoint a reclaim writes.
-  void markHeld(StateCheckpoint checkpoint) noexcept;
-  void keepHeld(StateCheckpoint checkpoint) noexcept;
   // The matching checkpoint is pinned: retireCheckpointState refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept;
   // An unfinished request's conversation resumes from the state at this
@@ -216,8 +212,9 @@ public:
   // A conversation's newest point, or a junction: no ordinary state below it on one branch alone.
   [[nodiscard]] bool newest(uint64_t kvBlock) const;
   // The points kept behind the newest: its own prompt-end, which a regenerate or an edit of the last turn resumes
-  // from, at the wall and after a restart. The strict rule (0), which drops that point as well, is for a diagnostic
-  // build, to measure the hit rate it costs.
+  // from, at the wall and after a restart. Dropping it as well (0) left the hit rate of agent sessions and chat
+  // patterns unchanged on Qwen3.8-27B at a 64K, 21G wall. Not measured: a regenerate whose point a reclaim took,
+  // which with 0 resumes from the conversation's start (an engine test shows it).
   static constexpr uint32_t kKeptBehind = 1;
   // Its request ended rendering an earlier reply back: the reply's state, a checkpoint, becomes its
   // conversation's newest point, an ordinary state, which its next turn resumes from.
@@ -226,6 +223,10 @@ public:
   // A junction's state, published where a request leaves another's chain: a branch point, never superseded, though
   // its second continuation holds no state below it until that request publishes one.
   void markBranchPoint(uint64_t kvBlock);
+  // A checkpoint a later checkpoint and the replay point of the same request lie past (Engine::addTailCheckpoint):
+  // superseded, a reclaim takes it first and never writes it, while a lookup still restores it. False again once a
+  // lane takes it as its recovery point. Only a checkpoint; an ordinary state's mark follows its branches.
+  void supersedeCheckpoint(uint64_t kvBlock, bool superseded) noexcept;
   // The size of the state at this block; zero without one.
   [[nodiscard]] uint64_t bytes(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
@@ -359,8 +360,7 @@ private:
     uint32_t pins = 0;
     uint64_t lastUsed = 0;
     bool checkpoint = false;
-    // A reply's state (markReply) until its request keeps it as a point (keepReplyAsPoint), or a prefill checkpoint
-    // its lane holds (markHeld) until the lane stores it (keepHeld).
+    // A reply's state (markReply) until its request keeps it as a point (keepReplyAsPoint).
     bool opportunistic = false;
     // An ordinary state another below it supersedes (supersededBelow()), set as the states below it change.
     bool superseded = false;

@@ -139,7 +139,9 @@ void checkGateUpLayers() {
             "vocabulary head must reserve workspace only in decode");
     const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
     for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes) {
-      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, lanes * model::kDecodeRows,
+      // A step's rows: a verify block a lane, at most the step's.
+      const uint32_t rows = std::min(lanes * model::kDecodeRows, model::kDecodeStepRows);
+      const auto plan = plans.linear().plan({{up.outputSize, up.inputSize}, rows,
           ops::LinearEpilogue::GateUp}, up);
       const auto required = plan.scratchSize();
       require(scratch.input >= required.input && scratch.sums >= required.sums &&
@@ -149,12 +151,12 @@ void checkGateUpLayers() {
               "the gate/up workspace is too small");
       // The F16 and Q8_0 pair stages, at rows the storage of the target's
       // projections over a step's rows holds (ops::Linear::storageRows).
-      const auto pair = plans.linear().plan(mixed.upProjection, lanes * model::kDecodeRows,
+      const auto pair = plans.linear().plan(mixed.upProjection, rows,
                                             ops::LinearEpilogue::GateUp, &mixed.gateProjection);
       const auto paired = pair.scratchSize();
       uint32_t storage = 0;
       for (const auto &shape : geometry.target.decodeProjections)
-        storage = std::max(storage, plans.linear().storageRows(lanes * model::kDecodeRows, shape));
+        storage = std::max(storage, plans.linear().storageRows(rows, shape));
       require(pair.configuration().tile == ops::LinearTile::GgufStaged && pair.storageRows() <= storage,
               "a gate/up pair with an F16 gate did not stage within the decode storage");
       require(scratch.input >= paired.input && scratch.sums >= paired.sums && scratch.partials >= paired.partials &&
@@ -252,7 +254,8 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
         for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
           for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
                                 ops::LinearEpilogue::GateUp}) {
-            const auto need = plans.linear().plan({matrix, lanes * laneRows, epilogue}).scratchSize();
+            const auto need =
+                plans.linear().plan({matrix, std::min(lanes * laneRows, model::kDecodeStepRows), epilogue}).scratchSize();
             require(scratch.input >= need.input && scratch.sums >= need.sums && scratch.partials >= need.partials &&
                         scratch.counters >= need.counters,
                     "decode arena scratch below a lane's plan");
@@ -260,8 +263,8 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
     }
 }
 
-// A decode step of any rows its lanes may give it, up to four lanes of a
-// verify block's 16, finds its MoE plan's workspace in the decode arena: past
+// A decode step of any rows its lanes may give it, up to its 64, finds its
+// MoE plan's workspace in the decode arena: past
 // 32 rows the 35B's and the 122B's plans take 32-row expert tiles, whose 274
 // tiles at 64 rows a bound of four lanes of 8 rows did not hold.
 void checkDecodeStepMoe(const model::LoadedModel &loaded) {
@@ -272,8 +275,8 @@ void checkDecodeStepMoe(const model::LoadedModel &loaded) {
     device.gpuCoreCount = 20;
     const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
     const model::TargetRows step = model::decodeTargetRows(geometry, plans);
-    require(step.rows == model::kLaneCount * model::ExecutionLimits::targetVerifyRows,
-            "the decode arena does not hold four lanes of a verify block's rows");
+    require(step.rows == model::kDecodeStepRows,
+            "the decode arena does not hold a step's rows");
     for (uint32_t rows = 1; rows <= step.rows; ++rows) {
       const ops::MoeWorkspace need =
           plans.moe(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat, rows).workspace();
@@ -291,6 +294,20 @@ void checkDecodeStepMoe(const model::LoadedModel &loaded) {
 // and chunks of 64 rows or fewer keep the staged experts' exact activations.
 void checkMoeInt8Passes(const model::LoadedModel &loaded) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  // Experts in the int8 tile's formats take the passes as the start keeps
+  // them resident and not as it streams them, whether the geometry comes
+  // from the files or from the model as it loaded: both go through
+  // RuntimeGeometry::from with the start's streamed parts.
+  for (const bool streamed : {false, true}) {
+    model::QwenTargetGeometry target = geometry.target;
+    target.moeInt8Experts = true;
+    const auto planned = model::RuntimeGeometry::from(loaded.descriptor, loaded.draft.layout, target,
+                                                      kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                      {.experts = streamed});
+    require(planned.target.moeShape().int8Experts == !streamed,
+            streamed ? "a start that streams its experts plans their int8 passes"
+                     : "a start that keeps its experts resident plans no int8 passes");
+  }
   for (uint32_t family : {9U, 10U, 11U})
     for (const ops::Int8Activations setting : {ops::Int8Activations::On, ops::Int8Activations::Off})
       for (const bool experts : {false, true}) {
@@ -311,7 +328,7 @@ void checkMoeInt8Passes(const model::LoadedModel &loaded) {
         }
       }
   // The int8 passes hold the gate's rows in the expert output, rows of the
-  // hidden size: a block whose experts are wider is refused, not overrun.
+  // hidden size: a block whose experts are wider keeps the staged passes.
   DeviceCapabilities device;
   device.appleGpuFamily = 10;
   device.gpuCoreCount = 20;
@@ -319,15 +336,9 @@ void checkMoeInt8Passes(const model::LoadedModel &loaded) {
   ops::MoeShape wide = geometry.target.moeBlockShape();
   wide.int8Experts = true;
   wide.expertIntermediateSize = wide.hiddenSize + 64;
-  bool refused = false;
-  try {
-    static_cast<void>(plans.moe(wide, geometry.target.moeRouterFormat, 2048));
-  } catch (const std::invalid_argument &) {
-    refused = true;
-  }
-  require(refused, "a MoE plan ran int8 passes over experts wider than the hidden size");
-  wide.int8Experts = false;
-  static_cast<void>(plans.moe(wide, geometry.target.moeRouterFormat, 2048));
+  const ops::MoePlan plan = plans.moe(wide, geometry.target.moeRouterFormat, 2048);
+  require(!plan.configuration().int8Passes && !plan.workspace().groupedCodesBytes,
+          "a MoE plan runs int8 passes over experts wider than the hidden size");
 }
 
 // The decode arena's plan counts each buffer it allocates in whole host
@@ -350,6 +361,34 @@ void checkDecodeArenaPages(const model::LoadedModel &loaded) {
     require(model::decodeArenaBytes(geometry, plans) == pages,
             "the decode arena's plan does not count each of its buffers in whole host pages");
   }
+}
+
+// Four lanes' arenas are main's before a step took eight lanes, to the
+// byte, on Apple9 and on Apple10 and later, int8 and BF16 K/V alike: a start
+// that keeps four lanes (engine::eightLanesHold) plans what main did. Eight
+// lanes' hold more: each lane's tensors, its GDN tape and its logits most.
+void checkFourLanesAreMains(const char *name, const model::LoadedModel &loaded, uint64_t decode9, uint64_t decode10,
+                            uint64_t prefill9, uint64_t prefill10) {
+  const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
+  for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+    const auto four = model::RuntimeGeometry::from(loaded, format, ops::GdnStateFormat::Float32, parts,
+                                                   model::ExecutionLimits::plannedLanes);
+    const auto eight = model::RuntimeGeometry::from(loaded, format, ops::GdnStateFormat::Float32, parts, 8);
+    for (uint32_t family : {9U, 10U, 11U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = 20;
+      const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+      require(model::plannedDecodeBytes(four, plans) == (family == 9 ? decode9 : decode10) &&
+                  model::plannedPrefillBytes(four, plans) == (family == 9 ? prefill9 : prefill10),
+              std::string(name) + "'s four lanes' arenas are not main's on Apple" + std::to_string(family));
+      require(model::plannedDecodeBytes(eight, plans) > model::plannedDecodeBytes(four, plans),
+              std::string(name) + "'s eight lanes' arenas hold no more than four's");
+    }
+  }
+  rejects([&] { static_cast<void>(model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32,
+                                                               parts, model::ExecutionLimits::maximumBatchWidth + 1)); },
+          "invalid model runtime lanes", "a runtime of more lanes than a step holds was planned");
 }
 
 // A model served with YaRN reaches the runtime's geometry with its scaling
@@ -593,6 +632,16 @@ int main() {
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    // The arenas main planned before a step took eight lanes (d1c6acebe).
+    checkFourLanesAreMains("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), 450'576'384,
+                                                  434'864'128, 746'455'040, 730'349'568);
+    checkFourLanesAreMains("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(),
+                                                     279'281'664, 273'874'944, 539'017'216, 533'446'656);
+    checkFourLanesAreMains(
+        "Qwen3.5-122B-A10B", loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()),
+        462'028'800, 455'098'368, 887'439'360, 880'263'168);
+    checkFourLanesAreMains("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>(),
+                                                   409'796'608, 403'963'904, 1'124'614'144, 1'118'781'440);
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>());

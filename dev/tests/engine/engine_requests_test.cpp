@@ -229,10 +229,10 @@ void testSharedPrefillRebuildsTheMissingJunctionOnce() {
   std::vector<uint32_t> branch(6575, 7);
   std::fill(branch.begin() + 6517, branch.end(), 8);
   {
-    // The prompt kept its last checkpoint, at 4096; the branch point has KV
-    // and no state.
+    // The prompt kept its last checkpoint, its tail at 6272; the branch point
+    // has KV and no state.
     auto hit = cache.lookup(branch, {});
-    require(hit.kvBoundary == 6496 && hit.resumeBoundary() == 4096,
+    require(hit.kvBoundary == 6496 && hit.resumeBoundary() == 6272,
             "fixture did not recreate an internal branch past the kept checkpoint");
   }
   const uint32_t before = model.prefillRows;
@@ -241,8 +241,8 @@ void testSharedPrefillRebuildsTheMissingJunctionOnce() {
     engine.submit(request(id, branch));
   }
   h.runUntilIdle();
-  require(model.prefillRows - before == (6496 - 4096) + 4 * (6575 - 6496) &&
-              model.restored == 4096 + 3 * 6496 && events.completedCount == 5,
+  require(model.prefillRows - before == (6496 - 6272) + 4 * (6575 - 6496) &&
+              model.restored == 6272 + 3 * 6496 && events.completedCount == 5,
           "concurrent internal branches each rebuilt the missing GDN state");
 }
 
@@ -452,18 +452,19 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
   };
   // Its replay point is where the producer resumes, and another
   // conversation's KV goes on with the prompt to 6400, where the producer
-  // plans a junction; that conversation's checkpoint at 4096 is evicted.
+  // plans a junction; that conversation's checkpoints, at 4096 and its
+  // tail's at 6336, are evicted.
   engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 1057)));
   h.runUntilIdle();
   engine.submit(request(2, branch(6400, 900'000)));
   h.runUntilIdle();
-  // The checkpoint leaves alone: an eviction would take the producer's resume point first, which the other
+  // The checkpoints leave alone: an eviction would take the producer's resume point first, which the other
   // conversation's replay point below it supersedes.
-  {
-    const CacheLookup checkpoint = resources.lookup(std::span(prompt).first(4097), {});
-    require(checkpoint.state && checkpoint.state->boundary() == 4096, "the other conversation left no checkpoint");
-    const uint64_t block = checkpoint.state->kvBlock();
-    resources.invalidateState(block);
+  for (const uint32_t boundary : {4096u, 6336u}) {
+    const std::vector<uint32_t> other = branch(6400, 900'000);
+    const CacheLookup checkpoint = resources.lookup(std::span(other).first(boundary + 1), {});
+    require(checkpoint.state && checkpoint.state->boundary() == boundary, "the other conversation left no checkpoint");
+    resources.invalidateState(checkpoint.state->kvBlock());
   }
   require(resources.snapshot().stateCache.checkpointEntries == 0,
           "the other conversation's checkpoint was not evicted");
@@ -504,8 +505,10 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
   require(start(3) == 1056 && start(4) == 4096 && start(5) == 6976 && start(6) == 7232 &&
               start(7) == 8192,
           "a late sibling did not resume from the producer's state it shares");
+  // Each conversation published its checkpoint at 4096 and its tail
+  // checkpoint, at 6336 and 11744; the producer's at 8192 became a junction.
   const auto counters = engine.snapshot();
-  require(counters.checkpointPublications == 2 && events.completedCount == 7 &&
+  require(counters.checkpointPublications == 4 && events.completedCount == 7 &&
               events.failedCount == 0 &&
               resources.lookup(branch(8192, 2'000'000), {}).resumeBoundary() == 8192,
           "the checkpoint a late sibling shares was not published as a junction");
@@ -515,6 +518,8 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
 // (6144) or past it (6784) gets that checkpoint, or a junction after it, as its
 // junction; the producer's next command ends there, and a junction past the
 // checkpoint takes its place, so the command does not capture the checkpoint.
+// The producer publishes its checkpoints at 4096 and 8192 and its tail one at
+// 11744.
 void testLateSiblingJunctionAtOrPastAPlannedCheckpoint() {
   for (const uint32_t shared : {6144u, 6784u}) {
     test::EngineHarness h({.pages = 2048, .engine = {.prefillCheckpointTokens = 2048}});
@@ -558,7 +563,7 @@ void testLateSiblingJunctionAtOrPastAPlannedCheckpoint() {
     const auto counters = engine.snapshot();
     require(events.completedCount == 3 && events.failedCount == 0 &&
                 events.starts.back() == shared && counters.captureCuts == 1 &&
-                counters.junctionMaterializations == 1 && counters.checkpointPublications == 2 &&
+                counters.junctionMaterializations == 1 && counters.checkpointPublications == 3 &&
                 counters.checkpointPublicationFailures == 0 &&
                 resources.lookup(branch(2'000'000), {}).resumeBoundary() == shared,
             "the sibling did not resume from the producer's junction after one command");
@@ -567,7 +572,8 @@ void testLateSiblingJunctionAtOrPastAPlannedCheckpoint() {
 
 // A sibling's shared boundary on one of the producer's checkpoints makes that
 // checkpoint a state the sibling resumes from: it is published as a junction
-// and outlives the producer's later progress instead of rolling with it.
+// and outlives the producer's later progress instead of rolling with it. The
+// producer's one rolling checkpoint is its tail's, at 7936.
 void testSharedJunctionAtACheckpointIsReusable() {
   test::EngineHarness h({.pages = 512});
   engine::Cache &resources = h.cache;
@@ -590,9 +596,9 @@ void testSharedJunctionAtACheckpointIsReusable() {
   require(events.starts.at(1) == 4096 &&
               executor.restored == 4096,
           "the sibling did not resume from the producer's shared boundary");
-  require(counters.junctionMaterializations == 1 && counters.checkpointPublications == 0 &&
+  require(counters.junctionMaterializations == 1 && counters.checkpointPublications == 1 &&
               counters.resources.stateCache.checkpointRetirements == 0 &&
-              counters.resources.stateCache.checkpointEntries == 0,
+              counters.resources.stateCache.checkpointEntries == 1,
           "the shared boundary was published as a rolling checkpoint");
   std::vector<uint32_t> next(prompt.begin(), prompt.begin() + 4100);
   next.resize(4140, 1);
@@ -883,10 +889,12 @@ void testReplyStatesFollowSpeculativeCycles() {
   require(events.starts.at(1) == 192, "the next turn did not resume at the reply's last page");
 }
 
-// Three longer lanes fill the others, so a Foreground arrival takes the
-// fourth's.
+// Longer lanes fill every lane but one, so a Foreground arrival takes the
+// last's. Their ids are 11 on.
+constexpr uint64_t kFillers = model::ExecutionLimits::maximumBatchWidth - 1;
+
 void fillOtherLanes(engine::Engine &engine) {
-  for (uint64_t id = 11; id <= 13; ++id) {
+  for (uint64_t id = 11; id < 11 + kFillers; ++id) {
     EngineRequest filler = request(id, std::vector<uint32_t>(300, static_cast<uint32_t>(id)));
     filler.maxNewTokens = 3000;
     engine.submit(std::move(filler));
@@ -902,7 +910,7 @@ bool capturedAt(const Executor &executor, uint64_t id, uint32_t tokens) {
 }
 
 // Request 1 replies to the 60 tokens of `prompt`, whose replay point is at
-// 32, with 80 tokens, one a cycle, beside three longer lanes: once the cycle
+// 32, with 80 tokens, one a cycle, beside a longer lane in every other lane: once the cycle
 // that captures 128 has stored exactly 128 tokens, request 5 arrives at
 // Foreground priority to take its lane.
 void preemptReplyAtItsPage(test::EngineHarness &h, double &now, const std::vector<uint32_t> &prompt) {
@@ -934,7 +942,7 @@ void testPreemptedReplyKeepsItsDeepestState() {
           "the lane did not resume from below the page its KV ended at");
   engine.submit(conversationTurn(2, nextTurn(prompt, 80), 1));
   tickUntil(h, now, [&] { return events.usage.contains(2); }, "the next turn did not complete");
-  for (uint64_t id = 11; id <= 13; ++id)
+  for (uint64_t id = 11; id < 11 + kFillers; ++id)
     engine.cancel(id);
   tickUntil(h, now, [&] { return idle(engine); }, "the fillers did not end");
   require(events.starts.back() == 128, "the next turn did not resume at the reply's deepest state");
@@ -961,7 +969,9 @@ void testPreemptedReplyCheckpointIsDropped() {
   const StateCacheSnapshot cached = h.cache.snapshot().stateCache;
   require(cached.offloads == 0 && cached.checkpointEntries == 0,
           "reclaim wrote a preempted reply's checkpoint rather than dropping it");
-  for (const uint64_t id : {1, 5, 11, 12, 13})
+  engine.cancel(1);
+  engine.cancel(5);
+  for (uint64_t id = 11; id < 11 + kFillers; ++id)
     engine.cancel(id);
   tickUntil(h, now, [&] { return idle(engine); }, "the requests did not end");
 }
@@ -1064,10 +1074,11 @@ void testFourConversationsKeepEachOthersPoints() {
 
 // A conversation that renders its replies back, three turns with an SSD tier: a reclaim of every state not in use
 // writes only the conversation's newest point, its last reply's state, and the point before it, the last prompt's
-// replay point that a regenerate resumes from (StateCache::kKeptBehind); the fourth turn resumes at the newest from
-// the disk. Its earlier points go unwritten: before, a reclaim wrote the three prompts' replay points and dropped
-// the replies' states, so the fourth turn resumed at its prompt's last replay point and read the third reply
-// again.
+// replay point that a regenerate resumes from (StateCache::kKeptBehind). A regenerate of the last answer resumes
+// there from the disk, and the fourth turn at the newest. Its earlier points go unwritten: before, a reclaim wrote
+// the three prompts' replay points and dropped the replies' states, so the fourth turn resumed at its prompt's last
+// replay point and read the third reply again; keeping the newest point alone, the regenerate resumed at the reply
+// before and read the last prompt's own text again.
 void testAReclaimWritesNoSupersededPoint() {
   test::EngineHarness h({.pages = 64, .tier = test::TierOptions{.capacity = 64, .transferLimit = 8}});
   h.model.offloadTier = std::make_shared<OffloadControl>();
@@ -1078,9 +1089,11 @@ void testAReclaimWritesNoSupersededPoint() {
   double now = 1;
   std::vector<uint32_t> prompt(97);
   std::iota(prompt.begin(), prompt.end(), 1);
+  std::vector<uint32_t> last;
   for (uint64_t turn = 1; turn <= 3; ++turn) {
     engine.submit(conversationTurn(turn, prompt, 70));
     tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+    last = prompt;
     prompt = nextTurn(prompt, 70);
   }
   const StateCacheSnapshot before = h.cache.snapshot().stateCache;
@@ -1093,8 +1106,14 @@ void testAReclaimWritesNoSupersededPoint() {
   require(after.offloads - before.offloads == 1 + StateCache::kKeptBehind,
           "a reclaim wrote " + std::to_string(after.offloads - before.offloads) +
               " states, not the newest and the points it keeps behind it");
+  require(!after.bytes, "a state stayed in RAM past the reclaim");
   h.model.restoreControl->ready = true;
-  engine.submit(conversationTurn(4, prompt, 1));
+  engine.submit(conversationTurn(4, last, 1));
+  tickUntil(h, now, [&] { return idle(engine); }, "the regenerate did not complete");
+  const uint32_t replay = static_cast<uint32_t>(last.size() - 7) / KvCache::pageTokens * KvCache::pageTokens;
+  require(events.starts.back() == replay, "the regenerate after the reclaim resumed from " +
+                                              std::to_string(events.starts.back()) + ", not " + std::to_string(replay));
+  engine.submit(conversationTurn(5, prompt, 1));
   tickUntil(h, now, [&] { return idle(engine); }, "the fourth turn did not complete");
   const uint32_t replyEnd = static_cast<uint32_t>(prompt.size() - 41) / KvCache::pageTokens * KvCache::pageTokens;
   require(events.starts.back() == replyEnd,
@@ -1187,40 +1206,6 @@ void testASecondConversationResumesAtASharedHead() {
                                               ": the second conversation resumed from " +
                                               std::to_string(events.starts.back()) + ", not " + std::to_string(head));
   }
-}
-
-// A conversation that renders its replies back, three turns with an SSD tier: a reclaim of every state not in use
-// drops the points two turns behind and writes the last turn's prompt-end, the point behind the newest
-// (StateCache::kKeptBehind), so a regenerate of the last answer resumes there, from the SSD. Keeping the newest point
-// alone, the regenerate resumed at the reply before and read the last prompt's own text again.
-void testARegenerateAfterAReclaimResumesAtItsPromptEnd() {
-  test::EngineHarness h({.pages = 64, .tier = test::TierOptions{.capacity = 64, .transferLimit = 8}});
-  h.model.offloadTier = std::make_shared<OffloadControl>();
-  h.model.offloadTier->ready = true;
-  h.model.decodeFinishes = false;
-  Events &events = h.events;
-  engine::Engine &engine = h.engine;
-  double now = 1;
-  std::vector<uint32_t> prompt(97);
-  std::iota(prompt.begin(), prompt.end(), 1);
-  std::vector<uint32_t> last;
-  for (uint64_t turn = 1; turn <= 3; ++turn) {
-    engine.submit(conversationTurn(turn, prompt, 70));
-    tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
-    last = prompt;
-    prompt = nextTurn(prompt, 70);
-  }
-  for (uint32_t step = 0; step < 8; ++step) {
-    reclaimUpToInUse(h.cache);
-    static_cast<void>(h.cache.pollTransfers());
-  }
-  require(!h.cache.snapshot().stateCache.bytes, "a state stayed in RAM past the reclaim");
-  h.model.restoreControl->ready = true;
-  engine.submit(conversationTurn(4, last, 1));
-  tickUntil(h, now, [&] { return idle(engine); }, "the regenerate did not complete");
-  const uint32_t replay = static_cast<uint32_t>(last.size() - 7) / KvCache::pageTokens * KvCache::pageTokens;
-  require(events.starts.back() == replay, "the regenerate after the reclaim resumed from " +
-                                              std::to_string(events.starts.back()) + ", not " + std::to_string(replay));
 }
 
 // A finished request's KV holds part of the budget, so a later request's KV
@@ -2729,7 +2714,6 @@ std::span<const test::TestCase> requestsTests() {
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
       {"testAReclaimWritesNoSupersededPoint", testAReclaimWritesNoSupersededPoint},
       {"testATypedOnMessageResumesFromAOneTokenRead", testATypedOnMessageResumesFromAOneTokenRead},
-      {"testARegenerateAfterAReclaimResumesAtItsPromptEnd", testARegenerateAfterAReclaimResumesAtItsPromptEnd},
       {"testATurnsKeptPointsAreCopiedTheDelayAfterItEnds", testATurnsKeptPointsAreCopiedTheDelayAfterItEnds},
       {"testFourConversationsKeepEachOthersPoints", testFourConversationsKeepEachOthersPoints},
       {"testASecondConversationResumesAtASharedHead", testASecondConversationResumesAtASharedHead},

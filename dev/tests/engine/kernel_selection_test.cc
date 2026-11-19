@@ -967,7 +967,7 @@ void warmupCovers(const std::string &name, const ExecutionPlans &plans, std::vec
 // MoE target's expert and router tiles. Adds each class that holds a change
 // to `misses`.
 void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std::vector<std::string> &misses) {
-  constexpr uint32_t most = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+  constexpr uint32_t most = SPLASH_DECODE_STEP_ROWS;
   const auto check = [&](const std::string &what, std::span<const uint32_t> classes, const auto &select) {
     for (size_t i = 0; i < classes.size(); ++i) {
       const uint32_t last = i + 1 < classes.size() ? classes[i + 1] - 1 : most;

@@ -94,8 +94,11 @@ void testCommandsWithinTheLimitsBreakNoRule() {
 }
 
 void testAWideCommandBreaksTheWidth() {
-  requireBreaks(command(WorkKind::Decode, {0, 0, 0, 0, 0}), "batch width", "a decode of five lanes broke no rule");
-  requireBreaks(prefill({1, 1, 1, 1, 1}), "batch width", "a prefill of five lanes broke no rule");
+  constexpr uint32_t kPast = model::ExecutionLimits::maximumBatchWidth + 1;
+  requireBreaks(command(WorkKind::Decode, std::vector<uint32_t>(kPast, 0)), "batch width",
+                "a decode of a lane more than a step holds broke no rule");
+  requireBreaks(prefill(std::vector<uint32_t>(kPast, 1)), "batch width",
+                "a prefill of a lane more than a step holds broke no rule");
 }
 
 void testPassesTheModelDoesNotRunBreakThePassRule() {
@@ -158,7 +161,7 @@ void testStreamingLanesPastTheModelsBreakTheIndexRule() {
 }
 
 void testTheFirstRuleBrokenIsNamed() {
-  requireBreaks(prefill({kChunk, kChunk, kChunk, kChunk, kChunk}), "batch width",
+  requireBreaks(prefill(std::vector<uint32_t>(model::ExecutionLimits::maximumBatchWidth + 1, kChunk)), "batch width",
                 "a wide command of too many rows did not break the width first");
   Command rows = prefill({3000, 6000});
   rows.plan.passes = 49;

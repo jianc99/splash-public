@@ -101,6 +101,11 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   return actual;
 }
 
+// The executor's record of its warmups: 0 a prefill, 1 to kWidths a decode
+// of that many lanes, then the state restore and the warmups' end.
+constexpr int kWidths = static_cast<int>(model::ExecutionLimits::maximumBatchWidth);
+constexpr int kRestore = kWidths + 1, kEnd = kWidths + 2;
+
 class Executor final : public model::RuntimeModel {
 public:
   explicit Executor(int throwingStep = -1) : throwingStep_(throwingStep) {}
@@ -160,9 +165,9 @@ public:
     return warmup(static_cast<int>(width));
   }
   model::WarmupStepResult warmupCompositeStateRestore() override {
-    return warmup(5);
+    return warmup(kRestore);
   }
-  void endWarmups() override { calls.push_back(6); }
+  void endWarmups() override { calls.push_back(kEnd); }
   model::ModelMemoryActual actualRuntimeMemory() const override {
     return {1, 1};
   }
@@ -238,17 +243,20 @@ void testAllNativeWarmupsPrecedeReady() {
   auto report = warmup(harness, plan, rowClasses);
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid,
           "successful native bootstrap was incomplete");
-  require(harness.executor().calls == std::vector<int>({0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6}),
-          "bootstrap did not warm its prefills and B1/B2/B3/B4 in order, then end its warmups");
+  std::vector<int> expected{0, 0, 0, 0, 0};
+  for (int width = 1; width <= kWidths; ++width) expected.push_back(width);
+  expected.insert(expected.end(), {kRestore, kEnd});
+  require(harness.executor().calls == expected,
+          "bootstrap did not warm its prefills and each width in order, then end its warmups");
   require(harness.executor().prefillRows ==
               std::vector<uint32_t>({model::ExecutionLimits::prefillTokenBudget, 1, 9, 17, 33}),
           "bootstrap did not warm a prefill of maximum rows and one of each row class");
   require(report.warmup.prefillRowClasses == WarmupStepStatus::Complete &&
               report.warmup.decodeBatches[2] == WarmupStepStatus::Complete,
           "bootstrap report omitted the row classes' prefills or the real B3 graph");
-  // The prefill of the most rows, four row classes, four widths and the
+  // The prefill of the most rows, four row classes, each width and the
   // restore.
-  require(harness.progress == counted(10, 10),
+  require(harness.progress == counted(6 + kWidths, 6 + kWidths),
           "bootstrap did not count each warmup step done as it ended");
 }
 
@@ -276,7 +284,7 @@ void testPrefillRowClassesAreRequired() {
                       std::vector<uint32_t>({model::ExecutionLimits::prefillTokenBudget, 1, 9}) &&
                   harness.pool().snapshot().pagesActive == 0,
               "a row class's failed prefill did not fail the start at its stage, or kept the runway held");
-      require(harness.progress == counted(2, 9), "a failed warmup step was counted done");
+      require(harness.progress == counted(2, 5 + kWidths), "a failed warmup step was counted done");
     }
   }
 }
@@ -294,7 +302,7 @@ void testWarmupHoldsTheRunway() {
       require(harness.pool().pageActive(page), "a warmup ran on a runway page no request held");
   };
   const auto report = warmup(harness, plan);
-  require(report.stage == RuntimeBootstrapStage::Ready && warmups == 6 &&
+  require(report.stage == RuntimeBootstrapStage::Ready && warmups == kWidths + 2 &&
               harness.pool().snapshot().pagesActive == 0,
           "warmup held the runway past Ready");
 }
@@ -316,8 +324,8 @@ void testBudgetLimitedWarmupTriesOnlyWidthsThatFit() {
     std::vector<int> expected{0};
     for (uint32_t lane = 1; lane <= width; ++lane)
       expected.push_back(static_cast<int>(lane));
-    expected.push_back(5);
-    expected.push_back(6);
+    expected.push_back(kRestore);
+    expected.push_back(kEnd);
     require(harness.executor().calls == expected,
             "warmup attempted a decode width that cannot fit the plan");
     for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
@@ -326,7 +334,7 @@ void testBudgetLimitedWarmupTriesOnlyWidthsThatFit() {
                                 : WarmupStepStatus::MemoryLimited),
               "budget-skipped decode was reported as measured or pending");
     }
-    require(harness.progress == counted(6, 6), "a budget-skipped decode was not counted done");
+    require(harness.progress == counted(kWidths + 2, kWidths + 2), "a budget-skipped decode was not counted done");
   }
 }
 
@@ -336,19 +344,19 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
     for (bool denyRestore : {false, true}) {
       Harness harness;
       harness.executor().warmupHook = [&](int step, model::WarmupStepResult &) {
-        if (step == deniedWidth || (step == 5 && denyRestore))
+        if (step == deniedWidth || (step == kRestore && denyRestore))
           throw metal::MetalAllocationError("injected allocation denial");
       };
       const auto report = warmup(harness, plan);
       requireReady(report);
-      const uint32_t completedWidth = deniedWidth < 0 ? 4 : deniedWidth - 1;
+      const uint32_t completedWidth = deniedWidth < 0 ? kWidths : deniedWidth - 1;
       std::vector<int> expected{0};
       for (uint32_t width = 1; width <= completedWidth; ++width)
         expected.push_back(static_cast<int>(width));
       if (deniedWidth >= 0)
         expected.push_back(deniedWidth);
-      expected.push_back(5);
-      expected.push_back(6);
+      expected.push_back(kRestore);
+      expected.push_back(kEnd);
       require(harness.executor().calls == expected,
               "bootstrap retried wider batches after allocation denial");
       for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
@@ -361,7 +369,7 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
                   (denyRestore ? WarmupStepStatus::MemoryLimited
                                : WarmupStepStatus::Complete),
               "restore allocation denial was reported as a measured success");
-      require(harness.progress == counted(6, 6), "an allocation-limited step was not counted done");
+      require(harness.progress == counted(kWidths + 2, kWidths + 2), "an allocation-limited step was not counted done");
     }
   }
 }
@@ -444,21 +452,18 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
   enum class Failure {
     Allocation, Backend, General, ZeroTime, InfiniteTime, NanTime
   };
-  constexpr RuntimeBootstrapStage stages[] = {
-      RuntimeBootstrapStage::MaximumPrefill,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::DecodeWarmup,
-      RuntimeBootstrapStage::CompositeStateRestore,
+  const auto stageOf = [](int step) {
+    return step == 0          ? RuntimeBootstrapStage::MaximumPrefill
+           : step == kRestore ? RuntimeBootstrapStage::CompositeStateRestore
+                              : RuntimeBootstrapStage::DecodeWarmup;
   };
   const EngineMemoryPlan plan = memoryPlan();
-  for (int step = 0; step < 6; ++step) {
+  for (int step = 0; step <= kRestore; ++step) {
     for (Failure failure : {Failure::Allocation, Failure::Backend,
                             Failure::General, Failure::ZeroTime,
                             Failure::InfiniteTime, Failure::NanTime}) {
       if (failure == Failure::Allocation &&
-          (step == 2 || step == 3 || step == 4 || step == 5))
+          step >= 2)
         continue; // Only these paths may skip a real allocation refusal.
       Harness harness;
       harness.executor().warmupHook =
@@ -487,7 +492,7 @@ void testWarmupErrorsCannotMasqueradeAsMemoryLimits() {
         static_cast<void>(warmup(harness, plan));
         throw std::runtime_error("invalid warmup passed");
       } catch (const RuntimeBootstrapError &error) {
-        require(error.report().stage == stages[step] &&
+        require(error.report().stage == stageOf(step) &&
                     (failure == Failure::Allocation ||
                      error.report().resourceFailure == RuntimeResourceFailure::Other) &&
                     harness.executor().calls.back() == step,
@@ -598,8 +603,8 @@ void testReadyEventForTheServedModel() {
   engine.maxContext = 73721;
   engine.maxImagePatches = 16384;
   const protocol::ReadyEvent vision =
-      readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext));
-  require(vision == protocol::ReadyEvent{4, 73721, true, 150144, {150001, 150003, 150005, 150018}, 17},
+      readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext), 8);
+  require(vision == protocol::ReadyEvent{8, 73721, true, 150144, {150001, 150003, 150005, 150018}, 17},
           "Ready did not announce what a start serving Flint with images serves");
   model::ModelDescriptor dense;
   dense.target = model::Qwen3_8Layout{};
@@ -607,7 +612,7 @@ void testReadyEventForTheServedModel() {
   engine.maxContext = 262144;
   engine.maxImagePatches = 0;
   const protocol::ReadyEvent text =
-      readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext));
+      readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext), 4);
   require(text == protocol::ReadyEvent{4, 262144, false, 248320, {248044, 248046}, 17},
           "Ready did not announce what a start serving a model without images serves");
 }

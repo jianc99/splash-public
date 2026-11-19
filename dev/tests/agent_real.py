@@ -536,14 +536,6 @@ BUGFIX_ORACLE = {
     "123.45": 12345,
     "0.07": 7,
 }
-# The recorded runs of the bug fix per model and client (--calibrate-bugfix):
-# their requests bound a gate run's; their wall times are kept for the record,
-# not bounded, since they follow the Mac's speed, which the timing gates judge.
-BUGFIX_BOUNDS = BUGFIX_FIXTURE / "bounds.json"
-# A minute in which the engine holds work and neither prefills a row nor
-# decodes a batch is no model's doing: a decode cycle takes tens of
-# milliseconds and a prefill chunk at most seconds on the Macs the gate runs.
-ENGINE_STALL_SECONDS = 60
 
 
 def bugfix_fixture(workspace):
@@ -614,71 +606,6 @@ for text, cents in json.load(sys.stdin).items():
     if result.returncode:
         raise AgentFailure("the fixture's tests fail: " + result.stderr[-2000:])
     return {"changes": changes, "oracle": "pass", "unit_tests": "pass"}
-
-
-def longest_stall(samples):
-    """The longest stretch, in seconds, of a phase's monitor samples in which
-    the engine held work and its prefill rows and decode batches stood
-    still."""
-    longest, since, progress = 0.0, None, None
-    for sample in samples:
-        engine = sample.get("engine")
-        if not engine or not engine.get("active"):
-            since = None
-            continue
-        counters = (engine.get("prefill_rows"), engine.get("decode_batches"))
-        if since is None or counters != progress:
-            since, progress = sample["elapsed"], counters
-        longest = max(longest, sample["elapsed"] - since)
-    return longest
-
-
-def engine_fault(row):
-    """What the engine's own record says failed a phase, or None: a failed
-    native request, a server restart, a lost replay point, a phase of two or
-    more requests that reused no cached token, a stall, or an engine that did
-    not come back. A failure none of these explain is the model's answer."""
-    after, before = row.get("after"), row.get("before")
-    if after is None:
-        return row.get("error") or "no final engine status"
-    if (row.get("error") or "").startswith(("engine memory pressure", "monitor")):
-        return row["error"]
-    reuse = prefix_reuse(before, after)
-    if reuse["lost_state_misses"]:
-        return f"{reuse['lost_state_misses']} lost replay points"
-    if after["requests"]["failed"] > before["requests"]["failed"]:
-        return "native request failed"
-    restarts = after["transport"]["restarts"] - before["transport"]["restarts"]
-    if restarts:
-        return f"the engine restarted {restarts} times"
-    if reuse["completed"] >= 2 and not reuse["reused_tokens"]:
-        return f"no cached prompt token reused across {reuse['completed']} requests"
-    stall = longest_stall(row.get("memory_samples", ()))
-    if stall >= ENGINE_STALL_SECONDS:
-        return f"the engine held work without progress for {stall:.0f} s"
-    return None
-
-
-def version_line(version):
-    """A client's version as its first line: Hermes adds lines to it, such as
-    a notice that an update is available, that come and go."""
-    return version.splitlines()[0] if version else version
-
-
-def bugfix_bound(recorded, name, version):
-    """A client's recorded bound on the served model (recorded: the bounds
-    file's entries for it), and why it is not enforced, if it is not: it is
-    only for the client version it was recorded with."""
-    entry = recorded.get(name)
-    if entry is None:
-        return None, f"no bound recorded for {name} on this model"
-    version = version_line(version)
-    if entry["version"] != version:
-        return entry, (
-            f"bound recorded with {name} {entry['version']!r}, running "
-            f"{version!r}: reported, not enforced"
-        )
-    return entry, None
 
 
 class ClientRun:
@@ -861,16 +788,6 @@ class ClientRun:
                         scheduler = current.get("scheduler", {})
                         sample["engine"] = {
                             "ready": current.get("ready"),
-                            "active": any(
-                                scheduler.get(k)
-                                for k in (
-                                    "queued",
-                                    "waiting_resources",
-                                    "prefilling",
-                                    "decoding",
-                                    "waiting_mask",
-                                )
-                            ),
                             "pressure": current.get("memory_pressure"),
                             "host_available_gib": round(
                                 governor.get("host_available_bytes", 0) / 2**30, 2
@@ -1206,9 +1123,28 @@ class ClientRun:
         return {"artifact_checks": checks, "automatic_compaction": compact}
 
 
-def bugfix_try(name, client, folder, model, context, timeout, modalities):
-    """One bug fix in a fresh project and session: the phase's row, its
-    failure if any and, as engine_fault reads the row, its kind."""
+def engine_deltas(row):
+    """What the engine's /status says changed over a phase, as a failure
+    reports it: requests completed and failed, restarts, cached prompt
+    tokens reused and replay points lost."""
+    before, after = row.get("before"), row.get("after")
+    if before is None or after is None:
+        return {"status": row.get("error") or "no engine status"}
+    reuse = prefix_reuse(before, after)
+    return {
+        "requests_completed": reuse["completed"],
+        "requests_failed": after["requests"]["failed"] - before["requests"]["failed"],
+        "restarts": after["transport"]["restarts"] - before["transport"]["restarts"],
+        "reused_tokens": reuse["reused_tokens"],
+        "lost_state_misses": reuse["lost_state_misses"],
+    }
+
+
+def run_bugfix(name, client, folder, model, context, timeout, modalities):
+    """One bug fix in a fresh project and session: it passes when
+    check_bugfix does. A failure prints what the engine's /status says
+    changed over the phase, which tells an engine fault from the model's
+    answer."""
     runner = ClientRun(
         name,
         client["path"],
@@ -1227,125 +1163,27 @@ def bugfix_try(name, client, folder, model, context, timeout, modalities):
         except AgentFailure as error:
             failure = str(error)
         row = runner.phases[-1] if runner.phases else {"error": failure}
-        fault = engine_fault(row)
-        if fault is None and failure is None:
+        if failure is None:
             try:
                 check_bugfix(runner.workspace, row["executed_commands"])
             except AgentFailure as error:
                 failure = str(error)
     finally:
         runner.finish_hermes()
-    reuse = row.get("reuse") or {}
+    engine = engine_deltas(row)
+    print(
+        f"{name}/bugfix: "
+        + (f"FAIL: {failure}; engine: {engine}" if failure else "pass"),
+        flush=True,
+    )
     return {
         "folder": str(folder),
-        "kind": "engine" if fault else "model" if failure else None,
-        "error": fault or failure,
+        "result": "fail" if failure else "pass",
+        "error": failure,
+        "engine": engine,
         "wall_seconds": row.get("wall_seconds"),
-        "requests": reuse.get("completed"),
         "changes": bugfix_changes(runner.workspace),
     }
-
-
-def run_bugfix(name, client, folder, model, context, timeout, modalities, recorded):
-    """The gate's bug fix of one client, its tries and result: a failure the
-    engine's record explains fails at once; any other, the model's answer, is
-    tried once more in a fresh session and fails the second time. A passing
-    try of more requests than the recorded bound of its client version
-    (recorded: the bounds file's entries for the served model) fails as the
-    model's."""
-    tries = []
-    for attempt in (1, 2):
-        result = bugfix_try(
-            name,
-            client,
-            folder / f"try-{attempt}",
-            model,
-            context,
-            timeout,
-            modalities,
-        )
-        tries.append(result)
-        entry, note = bugfix_bound(recorded, name, client["version"])
-        result["bound"] = {"recorded": entry, "note": note}
-        if result["kind"] is None and entry is not None and note is None:
-            if result["requests"] > entry["requests"]:
-                result.update(
-                    kind="model",
-                    error=f"{result['requests']} requests, over its bound of "
-                    f"{entry['requests']}",
-                )
-        print(
-            f"{name}/bugfix try {attempt}: "
-            + (
-                f"FAIL ({result['kind']}): {result['error']}"
-                if result["kind"]
-                else "pass"
-            )
-            + (f" [{note}]" if note else ""),
-            flush=True,
-        )
-        if result["kind"] != "model":
-            break
-    return {"tries": tries, "result": "pass" if tries[-1]["kind"] is None else "fail"}
-
-
-def calibrate_bugfix(
-    selected,
-    versions,
-    directory,
-    key,
-    model,
-    context,
-    timeout,
-    modalities,
-    runs,
-    build_id,
-    command,
-):
-    """Records `runs` bug fixes per client on the served model, unbounded and
-    without retries, and their bound in BUGFIX_BOUNDS under `key` (the model
-    ID the run serves, as --model gives it): twice the largest
-    requests of the passing runs, each run's wall time kept, for the client version they
-    ran with. A client with a failing run gets no bound."""
-    bounds = json.loads(BUGFIX_BOUNDS.read_text()) if BUGFIX_BOUNDS.exists() else {}
-    bounds.setdefault("commands", {})[key] = command
-    recorded = bounds.setdefault("models", {}).setdefault(key, {})
-    for name in selected:
-        trials = [
-            bugfix_try(
-                name,
-                versions[name],
-                directory / f"{name}-calibrate" / f"run-{index}",
-                model,
-                context,
-                timeout,
-                modalities,
-            )
-            for index in range(1, runs + 1)
-        ]
-        for trial in trials:
-            print(
-                f"{name}/bugfix calibration: {trial['kind'] or 'pass'} "
-                f"{trial['requests']} requests {trial['wall_seconds'] or 0:.1f} s",
-                flush=True,
-            )
-        passed = [t for t in trials if t["kind"] is None]
-        recorded.pop(name, None)
-        if len(passed) == runs:
-            recorded[name] = {
-                "version": version_line(versions[name]["version"]),
-                "build_id": build_id,
-                "runs": [
-                    {
-                        "requests": t["requests"],
-                        "wall_seconds": round(t["wall_seconds"], 1),
-                    }
-                    for t in passed
-                ],
-                "requests": 2 * max(t["requests"] for t in passed),
-            }
-        atomic_json(BUGFIX_BOUNDS, bounds)
-    return bounds
 
 
 def reference_fixture(tokenizer_path, context):
@@ -1402,9 +1240,6 @@ def parse_args(argv=None):
     parser.add_argument("--client-timeout", type=float, default=900)
     parser.add_argument("--scenario", choices=("smoke", "complete"), default="complete")
     parser.add_argument("--preflight-only", action="store_true")
-    # Records the bug fix's bounds on the served model (calibrate_bugfix)
-    # from this many runs a client, instead of the scenario.
-    parser.add_argument("--calibrate-bugfix", type=int, metavar="RUNS")
     parser.add_argument("--http-smoke", action="store_true")
     parser.add_argument(
         "--output", type=Path, default=ROOT / "build/release/agent-real.json"
@@ -1518,30 +1353,6 @@ def main(argv=None):
         document["validation_script_sha256"] = hashlib.sha256(
             Path(__file__).read_bytes()
         ).hexdigest()
-        if args.calibrate_bugfix:
-            # The command that records them again, without this checkout's
-            # paths: the installation and the report's place.
-            given = argv if argv is not None else sys.argv[1:]
-            command = ["dev/tests/agent_real.py"]
-            for index, argument in enumerate(given):
-                skipped = index and given[index - 1] in ("--model-root", "--output")
-                if argument not in ("--model-root", "--output") and not skipped:
-                    command.append(argument)
-            document["bugfix_bounds"] = calibrate_bugfix(
-                selected,
-                versions,
-                directory,
-                args.model,
-                model,
-                context,
-                args.client_timeout,
-                served["input_modalities"],
-                args.calibrate_bugfix,
-                identity,
-                command,
-            )
-            document["result"] = "calibrated"
-            return 0
         port = serve_options.DEFAULT_PORT
         if args.http_smoke:
             smoke_real.run(port, model)
@@ -1549,12 +1360,6 @@ def main(argv=None):
             reference_fixture(args.model_root / "tokenizer", context)
             if args.scenario == "complete"
             else ""
-        )
-        # The bug fix's recorded bounds for the served model (--model).
-        recorded = (
-            json.loads(BUGFIX_BOUNDS.read_text()).get("models", {}).get(args.model, {})
-            if BUGFIX_BOUNDS.exists()
-            else {}
         )
         for name in selected:
             runner = ClientRun(
@@ -1584,13 +1389,10 @@ def main(argv=None):
                 context,
                 args.client_timeout,
                 served["input_modalities"],
-                recorded,
             )
             if entry["bugfix"]["result"] == "fail":
-                last = entry["bugfix"]["tries"][-1]
-                failure = f"bugfix failed ({last['kind']}): {last['error']}"
+                failure = f"bugfix failed: {entry['bugfix']['error']}"
                 entry.update(result="fail", error=entry.get("error") or failure)
-                print(f"{name}: FAIL: {failure}", flush=True)
             atomic_json(args.output, document)
             remaining = selected[selected.index(name) + 1 :]
             if remaining and memory_sample()["pressure"] >= pressure_stop_level():

@@ -1,13 +1,11 @@
 #include "engine/WriteBehind.hpp"
 
-#include <algorithm>
-
 namespace splash::engine {
 
 WriteBehind::WriteBehind(Cache &cache) : cache_(cache), copying_(cache.persistent()) {}
 
 void WriteBehind::published(uint64_t block, uint32_t tokens, double now) {
-  now_ = std::max(now_, now);
+  now_ = now;
   if (!cache_.kvTierWritable() || tokens < kMinimumTokens || queued_.contains(block))
     return;
   queued_.insert(block);
@@ -65,7 +63,7 @@ bool WriteBehind::demanded(uint64_t demandBytes) const {
 bool WriteBehind::inUse(uint64_t block) const noexcept { return cache_.stateInUse(block); }
 
 bool WriteBehind::run(double now, uint64_t demandBytes, bool claimWaiting) {
-  now_ = std::max(now_, now);
+  now_ = now;
   demandBytes_ = demandBytes;
   copying_ = copying();
   return step(now, claimWaiting, [&] { return cache_.persistent() || demanded(demandBytes); });

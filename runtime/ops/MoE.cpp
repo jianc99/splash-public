@@ -68,8 +68,9 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, bool
   if (!shape.valid())
     throw std::invalid_argument("invalid MoE workspace shape");
   // The int8 passes write the gate's rows into the expert output, sized for
-  // the routes' rows of the hidden size (addInt8Experts).
-  if (int8Passes && shape.expertIntermediateSize > shape.hiddenSize)
+  // the routes' rows of the hidden size (addInt8Experts): the plans select
+  // them only where the shape holds them (MoeShape::int8Fits).
+  if (int8Passes && !shape.int8Fits())
     throw std::invalid_argument("MoE int8 passes need an expert intermediate no wider than the hidden size");
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
   const uint32_t tiles = moeMaximumTiles(rows, shape, tileRows);
@@ -328,8 +329,9 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeGroupParams group = groupParams(plan, weights);
   if (weights.stream) {
     addExperts(graph, buffers.scratch, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED);
-  } else if (plan.configuration().int8Passes && !buffers.lanes && !int8Format(weights.gate).empty() &&
-             !int8Format(weights.up).empty() && !int8Format(weights.down).empty()) {
+  } else if (plan.configuration().int8Passes && !buffers.lanes) {
+    // A decode step's lanes keep the staged passes, which read their verified
+    // grouping, also in a step of more than the decode tiles' 64 rows.
     addInt8Experts(graph, buffers, weights, plan);
   } else {
     addGather(graph, buffers, plan);
@@ -358,9 +360,10 @@ void MoE::addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input,
 
 uint32_t MoE::expertLoadGroups(const MoeExpertLoadParams &params) noexcept {
   uint64_t groups = 0;
+  // A row tile's spans of groups each (moe_expert_load).
   for (const MoeExpertLoadProjection &projection : params.projections)
-    groups = std::max(groups, (uint64_t{projection.rows} * (projection.columns / 32) + MOE_EXPERT_LOAD_THREADS - 1) /
-                                  MOE_EXPERT_LOAD_THREADS);
+    groups = std::max(groups, (uint64_t{projection.rows} + QUANT_TILE_ROWS - 1) / QUANT_TILE_ROWS *
+                                  ((projection.columns / 32 + MOE_EXPERT_LOAD_SPAN - 1) / MOE_EXPERT_LOAD_SPAN));
   return static_cast<uint32_t>(groups);
 }
 
@@ -369,6 +372,8 @@ void MoE::addExpertLoad(metal::CommandGraph &graph, const metal::MetalBuffer &st
                         const metal::MetalBuffer &sources, const MoeExpertLoadParams &params, uint32_t jobs,
                         const metal::IndirectGrid &grid) {
   if (chunks.empty()) throw std::invalid_argument("MoE expert chunks have no slots");
+  if (params.source_planes != 1 && params.source_planes != 3)
+    throw std::invalid_argument("a MoE expert load's jobs name 1 or 3 staged planes a projection");
   MoeExpertLoadParams load = params;
   load.floor_slots = chunks.floorSlots();
   load.chunk_slots = chunks.chunkSlots();

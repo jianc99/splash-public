@@ -469,7 +469,7 @@ uint64_t minimumBytes(const RuntimeResourcesConfig &config) {
   const ops::ExecutionPlans operators(backend.capabilities(), config.int8Activations);
   const model::ModelMemoryPlan arenas = model::plannedRuntimeMemory(
       config.model, model::plannedTargetGeometry(backend, config.modelRoot, config.model, 0, nullptr), operators,
-      config.kvFormat, config.stateFormat, {});
+      config.kvFormat, config.stateFormat, {}, model::ExecutionLimits::plannedLanes);
   return minimumRequiredBytes(model::streamableWeights(config.modelRoot, config.model, {}).loadedBytes +
                                   arenas.sharedPrefillPlannedAllocatedBytes +
                                   arenas.sharedDecodePlannedAllocatedBytes + model::kPipelineReserveBytes +
@@ -1809,7 +1809,7 @@ void testDecodeArenaHoldsAStepsPackedRows(const char *metallibPath) {
   const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
   const ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
   const model::DecodeArena arena(backend, geometry, operators);
-  constexpr uint32_t kStepRows = model::kLaneCount * model::ExecutionLimits::targetVerifyRows;
+  constexpr uint32_t kStepRows = model::kDecodeStepRows;
   const auto at = [](const metal::MetalBuffer &buffer) { return static_cast<const std::byte *>(buffer.contents()); };
   // A lane's rows after lanes of 16 and 5.
   constexpr ops::LaneRows lane{21, 11};
@@ -2061,6 +2061,8 @@ void testDenseRuntimeBoundary(const char *metallibPath) {
                                                            .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 0,
                                                            .attentionPairs = kLayerPairs},
           "a resident dense runtime's command limits are not a chunk in a pass a layer, with the per-layer bound");
@@ -2093,6 +2095,8 @@ void testStreamedRuntimeBoundary(RuntimeResourcesConfig moe) {
                                                            .layers = kMoeLayers,
                                                            .maximumPasses = kMoeLayers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 0,
                                                            .streamsWeights = true,
                                                            .attentionPairs = kLayerPairs},
@@ -2156,6 +2160,8 @@ void testSpilledRuntimeBoundary(const char *metallibPath) {
                                                            .layers = layers,
                                                            .maximumPasses = layers,
                                                            .lanesPastChunk = 1,
+                                                           .lanes =
+                                                               resources->memoryPlan().breakdown().maximumBatchWidth,
                                                            .indexPageLanes = 1,
                                                            .streamsWeights = streamsExperts,
                                                            .attentionPairs = kLayerPairs},

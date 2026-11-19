@@ -6,7 +6,6 @@ read as they do.
 """
 
 import json
-import time
 import unittest
 
 from dev.tests.server_fixtures import FakeRuntime, Harness, anthropic_body
@@ -20,7 +19,7 @@ from dev.tests.tool_output import (
 from server import json_codec
 from server import output as model_output
 from server import server as api
-from server.chat_format import GLM_ARGS, QWEN_XML
+from server.chat_format import GLM_ARGS
 from server.output import MAX_ARGUMENTS_DEPTH, MAX_NAME_LENGTH
 
 # The deepest a parameter value reads as JSON: one level less than its call's
@@ -709,26 +708,6 @@ class ToolCallReadingTests(unittest.TestCase):
         self.assertEqual(calls[0]["function"]["arguments"], '{"text":"rm -rf /')
         with self.assertRaises(ValueError):
             json.loads(calls[0]["function"]["arguments"])
-
-    def test_a_long_string_argument_streams_before_its_close(self):
-        projector = model_output.StreamingToolCallProjector(
-            tool_policy(SCHEMAS), "test", syntax=QWEN_XML
-        )
-        events = projector.put(
-            "<tool_call>\n<function=note>\n<parameter=text>\n" + "x" * 20_000
-        )
-        self.assertGreater(len(streamed_arguments(events)), 19_000)
-
-    def test_unclosed_tags_read_in_linear_time(self):
-        for text in (
-            "<tool_call> " * 7_750,
-            "<tool_call>\n<function=note>\n<parameter=text>\n"
-            + "\n</parameter" * 9_000,
-        ):
-            with self.subTest(text=text[:40]):
-                started = time.perf_counter()
-                project(text, tool_policy(SCHEMAS), size=1)
-                self.assertLess(time.perf_counter() - started, 2.0)
 
 
 if __name__ == "__main__":

@@ -47,7 +47,7 @@ uint64_t budgetPages(const EngineMemoryBreakdown &budget) {
 void testUnifiedElasticBudget() {
   EngineMemoryPlan plan = test::requireMemoryPlan(device(), model());
   const auto &budget = plan.breakdown();
-  require(budget.kvPageTokens == 32 && budget.maximumBatchWidth == 4 &&
+  require(budget.kvPageTokens == 32 && budget.maximumBatchWidth == 8 &&
               budget.kvExtentPages == 128,
           "execution geometry did not reach memory planning");
   require(budget.fixedRuntimeBytes == model().fixedRuntimeBytes(),
@@ -685,6 +685,69 @@ void testDense35BKeepsMainsPlan() {
   }
 }
 
+// A start runs eight lanes only where their arenas cost none of the context
+// four lanes' plan, main's, offers (eightLanesHold): the 35B's and
+// Flash-Next's on the M6, whose memory bounds the 35B's context and Flash-
+// Next's resident KV, keep four lanes and main's plan to the byte; the M5
+// Max and the M5 Pro hold the 35B's window and Flash-Next's beside eight,
+// beside the stores four lanes' plan sized, where the plan differs from
+// main's in the arenas alone: its minimum, which four lanes' arenas set, is
+// main's. Eight lanes' arenas hold
+// 191.6 MB more decode and 1.0 MB more prefill than four on the 35B, 287.8
+// and 1.6 MB on Flash-Next (model::plannedDecodeBytes, Apple10).
+void testEightLanesOnlyWhereTheyCostNoContext() {
+  const auto wider = [](model::ModelMemoryPlan plan, uint64_t decode, uint64_t prefill) {
+    plan.minimumArenaBytes = plan.sharedPrefillPlannedAllocatedBytes + plan.sharedDecodePlannedAllocatedBytes;
+    plan.sharedDecodePlannedAllocatedBytes += decode;
+    plan.sharedPrefillPlannedAllocatedBytes += prefill;
+    plan.lanes = 8;
+    return plan;
+  };
+  const std::tuple<Mac, Target, bool> dense[] = {{kM6, k35BQ2, false}, {kStudio, k35BQ4, true}, {kM5Pro, k35BQ4, true}};
+  for (const auto &[mac, target, eight] : dense) {
+    Target four = target;
+    four.chunk.lanes = four.group.lanes = 4;
+    const EngineMemoryPlan mains = test::requireMemoryPlan(deviceOf(mac), four.profile());
+    Target wide = four;
+    wide.chunk = wider(four.chunk, 191'643'648, 1'015'808);
+    const EngineMemoryPlanResult planned = evaluateEngineMemoryPlan(deviceOf(mac), wide.profile(), 0);
+    require(eightLanesHold(mains, planned) == eight && mains.breakdown().maximumBatchWidth == 4,
+            std::string("the 35B on the ") + mac.name + (eight ? " keeps four lanes" : " runs eight lanes"));
+    if (eight)
+      require(planned.plan->maximumContextTokens() == mains.maximumContextTokens() &&
+                  planned.plan->breakdown().maximumBatchWidth == 8 &&
+                  planned.plan->breakdown().fixedRuntimeBytes ==
+                      mains.breakdown().fixedRuntimeBytes + 191'643'648 + 1'015'808 &&
+                  planned.plan->breakdown().minimumRequiredBytes == mains.breakdown().minimumRequiredBytes,
+              std::string("the 35B's eight lanes on the ") + mac.name + " differ from main's plan past their arenas");
+  }
+  for (const Mac &mac : kMacs) {
+    Target four = kFlashNext;
+    four.chunk.lanes = four.group.lanes = 4;
+    const StreamedMemoryPlan stores = requirePlan(four.inputs(mac));
+    const EngineMemoryPlan mains =
+        test::requireMemoryPlan(deviceOf(mac), four.profile(stores.expertBytes, stores.tableBytes, stores.spill));
+    // The stores as they loaded beside four lanes' arenas.
+    Target wide = four;
+    wide.chunk = wider(four.chunk, 287'801'344, 1'589'248);
+    wide.group = wider(four.group, 287'801'344, 1'589'248);
+    StreamedMemoryInputs inputs = wide.inputs(mac);
+    inputs.experts.setting = stores.expertBytes ? StreamedSetting{StreamedSetting::Mode::Loaded, stores.expertBytes}
+                                                : StreamedSetting{StreamedSetting::Mode::Off, 0};
+    inputs.table.setting = {StreamedSetting::Mode::Loaded, stores.tableBytes};
+    const StreamedMemoryResult streamed = planStreamedMemory(inputs);
+    const bool eight = mac.workingSet != kM6.workingSet;
+    const EngineMemoryPlanResult planned =
+        streamed.plan ? evaluateEngineMemoryPlan(deviceOf(mac),
+                                                 wide.profile(streamed.plan->expertBytes, streamed.plan->tableBytes,
+                                                              streamed.plan->spill),
+                                                 0)
+                      : EngineMemoryPlanResult{};
+    require(eightLanesHold(mains, planned) == eight,
+            std::string("Flash-Next on the ") + mac.name + (eight ? " keeps four lanes" : " runs eight lanes"));
+  }
+}
+
 // An explicit context loads every expert of the 35B where main holds it so
 // on the M6, beside the SSD cache's state staging up to main's 229,361
 // tokens, and without it up to main's context then (the automatic SSD cache
@@ -1257,6 +1320,7 @@ int main() {
     testAutoStreamsTheTableWhereMemoryHoldsIt();
     testSpillAllowanceFollowsASmallerRequestedContext();
     testDense35BKeepsMainsPlan();
+    testEightLanesOnlyWhereTheyCostNoContext();
     testDenseExplicitContextKeepsMainsExperts();
     testDenseExplicitContextStreamsExperts();
     testDense35BContextGrowsWithTheBudget();

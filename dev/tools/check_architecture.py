@@ -248,10 +248,16 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 10, Cache.hpp 5, StateCache.hpp 4, Cache.cpp 1).
 # 30,809: +17 for a state at the end of a prompt's head (Engine.cpp 5,
 # Protocol.hpp 4, Protocol.cpp 4, Types.hpp 3, NativeRuntime.cpp 1).
-# 30,900: +91 for rolling checkpoints written only where their lane stops
-# (Engine.cpp 55, Cache.hpp 10, StateCache.cpp 15, Engine.hpp 6,
-# StateCache.hpp 5).
-ENGINE_LINE_BUDGET = 30_900
+# 30,808: -1 for write-behind's clock clamps (WriteBehind.cpp -1).
+# 30,844: +36 for eight lanes only where their arenas cost no context
+# (RuntimeResources.mm 25, MemoryPlan.cpp 9, MemoryPlan.hpp 3,
+# StreamedMemoryPlan.hpp 2, StreamedMemoryPlan.cpp 1, Bootstrap.mm 1;
+# Scheduler.cpp -4, Bootstrap.hpp -1).
+# 30,918: +74 for a tail checkpoint before a prompt's replay boundary
+# (Engine.cpp 43, Engine.hpp 18, EngineMemory.cpp 13).
+# 30,942: +24 for the rolling checkpoint a tail keeps, superseded (Engine.cpp
+# 10, StateCache.cpp 8, StateCache.hpp 4, Cache.hpp 2).
+ENGINE_LINE_BUDGET = 30_942
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
