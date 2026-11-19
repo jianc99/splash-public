@@ -109,6 +109,88 @@ struct ChatContextFlowTests {
     /// Deleting a chat forgets its draft, and an image still being encoded for it joins no draft
     /// once kept. Kept, the deleted chat's draft held its text until the app quit, and the late
     /// image made it a draft again.
+    /// A long message is read ahead once typing pauses for 1 s, the whole draft so far, and not
+    /// while it is typed; a short one never.
+    @Test func aLongDraftIsReadAheadOnceTypingPauses() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            // A new chat, whose prompt the fake's 1,024-token context holds.
+            state.newChat()
+            try await type("Short question?", in: state)
+            try await Task.sleep(for: .seconds(1.3))
+            #expect(try fixture.readAhead().isEmpty, "a short draft was read ahead")
+            let paragraph = "The parser walks the tokens once and keeps a stack of the open blocks. "
+            try await type(String(repeating: paragraph, count: 8), in: state)
+            #expect(try fixture.readAhead().isEmpty, "read ahead while typing")
+            try? await waitFor((try? fixture.readAhead().isEmpty) == false, "the read")
+            #expect(try fixture.readAhead() == [state.draft.text.trimmingCharacters(in: .whitespacesAndNewlines)])
+            // Nothing new to read: no second read.
+            state.readAhead.refresh(state.contextRequest)
+            try await Task.sleep(for: .seconds(1.3))
+            #expect(try fixture.readAhead().count == 1)
+            state.sendDraft()
+            try await waitFor(state.chats.streaming == nil)
+            #expect(try fixture.sent().count == 1)
+        }
+    }
+
+    /// A read in flight goes on as the draft grows past it and as it is sent, and stops at an edit
+    /// inside the text it read.
+    @Test func aReadAheadStopsOnlyAtAnEditInsideWhatItRead() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.newChat()
+            try fixture.holdAhead()
+            let paragraph = "The parser walks the tokens once and keeps a stack of the open blocks. "
+            try await type(String(repeating: paragraph, count: 4), in: state)
+            try await fixture.aheadHeld()
+            // Typing on after it: the read goes on.
+            try await type(" And a fence closes on its own marker.", in: state)
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(!fixture.aheadCancelled, "typing on stopped the read")
+            // An edit inside it: the read stops.
+            state.draft.text = "A" + state.draft.text.dropFirst()
+            state.readAhead.refresh(state.contextRequest)
+            try await waitFor(fixture.aheadCancelled, "the read stopped")
+            try fixture.releaseAhead()
+        }
+    }
+
+    /// What was typed while a read was in flight is read once it ends, without waiting for the
+    /// next keystroke.
+    @Test func whatWasTypedDuringAReadIsReadWhenItEnds() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.newChat()
+            try fixture.holdAhead()
+            let paragraph = "The parser walks the tokens once and keeps a stack of the open blocks. "
+            try await type(String(repeating: paragraph, count: 3), in: state)
+            try await fixture.aheadHeld()
+            try await type(String(repeating: paragraph, count: 3), in: state)
+            try fixture.releaseAhead()
+            try? await waitFor((try? fixture.readAhead().count) == 2, "the second read")
+            #expect(try fixture.readAhead().last == state.draft.text.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    @Test func sendingLeavesTheReadAheadToFinish() async throws {
+        try await withServer { fixture in
+            let state = fixture.state
+            state.newChat()
+            try fixture.holdAhead()
+            let paragraph = "The parser walks the tokens once and keeps a stack of the open blocks. "
+            try await type(String(repeating: paragraph, count: 4), in: state)
+            try await fixture.aheadHeld()
+            state.sendDraft()
+            state.readAhead.refresh(state.contextRequest)
+            try await Task.sleep(for: .milliseconds(300))
+            #expect(!fixture.aheadCancelled, "sending stopped the read")
+            try fixture.releaseAhead()
+            try await waitFor(state.chats.streaming == nil)
+            #expect(try fixture.sent().count == 1)
+        }
+    }
+
     @Test func deletingAChatForgetsItsDraft() async throws {
         try await withServer { fixture in
             let state = fixture.state
@@ -525,6 +607,18 @@ struct ChatContextFlowTests {
     }
 
     /// The draft's prompt, counted as the composer counts it.
+    /// Types `text` onto the draft 40 characters at a time, 30 ms apart, as the composer tells the
+    /// read ahead at each change.
+    private func type(_ text: String, in state: AppState) async throws {
+        var rest = Substring(text)
+        while !rest.isEmpty {
+            state.draft.text += rest.prefix(40)
+            rest = rest.dropFirst(40)
+            state.readAhead.refresh(state.contextRequest)
+            try await Task.sleep(for: .milliseconds(30))
+        }
+    }
+
     private func count(_ state: AppState) async throws -> ContextUsage {
         let request = try #require(state.contextRequest)
         state.chatContext.refresh(request)
@@ -606,6 +700,27 @@ private final class ContextFixture {
             try #require(JSONSerialization.jsonObject(with: Data($0.utf8)) as? [[String: Any]])
         }
     }
+
+    /// The texts the server was asked to read ahead of their sending (`ReadAhead`).
+    func readAhead() throws -> [String] {
+        try lines("ahead.jsonl").map { try #require(JSONSerialization.jsonObject(with: Data($0.utf8), options: .fragmentsAllowed) as? String) }
+    }
+
+    /// Has the server hold the next prompt read ahead until `releaseAhead`, or until the app
+    /// closes it, which `aheadCancelled` then says.
+    func holdAhead() throws {
+        try Data().write(to: root.appending(path: "hold-ahead"))
+    }
+
+    func aheadHeld() async throws {
+        try await waitFor(FileManager.default.fileExists(atPath: root.appending(path: "ahead-held").path), "the server to hold the read")
+    }
+
+    func releaseAhead() throws {
+        try FileManager.default.removeItem(at: root.appending(path: "hold-ahead"))
+    }
+
+    var aheadCancelled: Bool { FileManager.default.fileExists(atPath: root.appending(path: "ahead-cancelled").path) }
 
     /// The prompts the server was asked to count.
     func counts() throws -> Int {

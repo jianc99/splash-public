@@ -65,11 +65,16 @@ final class Server {
     }
 
     /// What a ready server does: runs the model, sleeps with its weights given back, or recovers
-    /// while the engine, having failed, starts again.
+    /// while the engine, having failed, starts again; started with `--lazy-load`, waits with the
+    /// model not loaded yet, loads it for the first request that needs it, or failed that load and
+    /// loads again with the next.
     enum Serving: String {
         case running = "Running"
         case sleeping = "Sleeping"
         case recovering = "Recovering…"
+        case notLoaded = "Not loaded"
+        case loading = "Loading…"
+        case loadFailed = "Couldn’t load"
     }
 
     private(set) var phase = Phase.stopped {
@@ -100,6 +105,12 @@ final class Server {
     private(set) var asleep = false
     /// Once ready: whether the engine failed and the server is starting it again.
     private(set) var recovering = false
+    /// Once ready: whether the model has not been loaded yet, as a server started with
+    /// `--lazy-load` leaves it until the first request that needs it; whether that load runs; and
+    /// why the last one failed, in the server's words.
+    private(set) var unloaded = false
+    private(set) var loading = false
+    private(set) var loadError: String?
     /// Once ready: the tokens the model's context holds, as the option set it or Auto fitted it.
     private(set) var context: Int?
     /// Once ready: why the SSD cache the options asked for is off, in the engine's words, as on a
@@ -126,7 +137,11 @@ final class Server {
     /// Once ready: the work the server reports, as its status gives it.
     private(set) var activity = Activity()
     /// Once ready: what the server does.
-    var serving: Serving { recovering ? .recovering : asleep ? .sleeping : .running }
+    var serving: Serving {
+        if recovering { return .recovering }
+        if unloaded { return loading ? .loading : loadError != nil ? .loadFailed : .notLoaded }
+        return asleep ? .sleeping : .running
+    }
     /// Whether the model answers a request now: ready, and not recovering.
     var answers: Bool { phase == .ready && !recovering }
 
@@ -263,6 +278,9 @@ final class Server {
         self.settings = settings
         asleep = false
         recovering = false
+        unloaded = false
+        loading = false
+        loadError = nil
         context = nil
         cacheOff = nil
         activity = Activity()
@@ -431,10 +449,7 @@ final class Server {
                     // What the model takes and holds, known as it shows as ready.
                     let served = await servedModel()
                     guard !Task.isCancelled, phase == .starting else { break }
-                    acceptsImages = served?.input_modalities?.contains("image") ?? false
-                    limits = served?.limits
-                    reasoning = served?.reasoning
-                    context = served?.context_length
+                    take(served)
                     // An engine that failed as the start ended is being started again already:
                     // the record says so before the first status does.
                     recovering = record.phase == .recovering
@@ -456,11 +471,29 @@ final class Server {
         }
     }
 
+    /// What the served model takes and holds, as `/v1/models` says; what it doesn't say yet, as a
+    /// model not loaded leaves its context, is none: no images, no context ring.
+    private func take(_ served: ServedModel?) {
+        acceptsImages = served?.input_modalities?.contains("image") ?? false
+        limits = served?.limits
+        reasoning = served?.reasoning
+        context = served?.context_length
+    }
+
     /// Asks the server's status and takes what it reports.
     private func askStatus() async {
         guard let report = await status(), phase == .ready else { return }
         asleep = report.asleep
         recovering = report.recovering
+        loading = report.loading
+        loadError = report.loadError
+        if unloaded, !report.unloaded {
+            // Loaded: what the model takes and holds, which `/v1/models` gave none of before.
+            let served = await servedModel()
+            guard phase == .ready else { return }
+            take(served)
+        }
+        unloaded = report.unloaded
         activity = report.activity
         requests = ServedRequest.taking(report.live, taken: report.taken, into: requests)
         // A relaunched engine may serve less context than the first did.
@@ -474,6 +507,11 @@ final class Server {
         var activity: Activity
         var asleep: Bool
         var recovering = false
+        /// Whether the model has not been loaded yet (`--lazy-load`), its load runs, and why the
+        /// last one failed.
+        var unloaded = false
+        var loading = false
+        var loadError: String?
         /// The tokens of context the server serves now.
         var context: Int?
         /// Why the SSD cache asked for is off.
@@ -505,6 +543,9 @@ final class Server {
             ),
             asleep: status.weights?.released ?? false,
             recovering: status.transport?.recovering ?? false,
+            unloaded: status.transport?.unloaded ?? false,
+            loading: status.transport?.unloaded == true && status.weights?.restoring == true,
+            loadError: status.transport?.unloaded == true ? status.transport?.error?.text.map(sentence) : nil,
             context: status.capabilities?.max_context_tokens,
             cacheOff: status.disk?.off_reason,
             // A request without the engine's id has none: no line or later status could be told
@@ -521,11 +562,31 @@ final class Server {
         )
     }
 
+    /// The server's words as a sentence the window shows: its first letter upper-case, ending in a
+    /// stop; its words as they are.
+    nonisolated static func sentence(_ words: String) -> String {
+        let words = words.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let first = words.first else { return words }
+        let sentence = first.uppercased() + words.dropFirst()
+        return ".!?".contains(sentence.last!) ? sentence : sentence + "."
+    }
+
     private struct Status: Decodable {
+        /// A text where the status has one, and nothing, rather than no status, where it has
+        /// something else.
+        struct Text: Decodable {
+            let text: String?
+            init(from decoder: Decoder) throws { text = try? decoder.singleValueContainer().decode(String.self) }
+        }
         struct Capabilities: Decodable { let max_context_tokens: Int? }
-        struct Weights: Decodable { let released: Bool? }
+        struct Weights: Decodable {
+            let released: Bool?
+            let restoring: Bool?
+        }
         struct Transport: Decodable {
             let recovering: Bool?
+            let unloaded: Bool?
+            let error: Text?
             /// How long before it answered the server took the snapshot it answered from: none
             /// where the engine answered then.
             let status_age_ms: Double?

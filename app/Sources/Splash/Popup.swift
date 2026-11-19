@@ -290,58 +290,66 @@ struct ViewAnchor: NSViewRepresentable {
     }
 }
 
-/// A view to scroll the scroll view it lies in to, brought to the top while the content under it
-/// unfolds: on `glide`'s curve from rest, from where its first frame found it, toward the top, as
-/// far as the content reaches by then, so that it rises as the content grows rather than after.
-/// The curve is followed by the time each frame shows, not by the frames run: a busy main thread
-/// skips frames, never the distance, and the first frame moves a fraction of a point, not a tenth
-/// of the way (with a step of a tenth a frame, the first drew the section under the opened options
-/// 14.5 points up before their growth pushed it down, and a busy main thread left a scroll of 258
-/// points at 48.5 to 69 when it stopped after 1 s, on the 48 GB M5 Pro). The reader's own
-/// scrolling takes over.
+/// A view to scroll the scroll view it lies in to, brought to the top while what is under it
+/// unfolds, as far as SwiftUI has drawn the unfolding: at each frame the scroll has gone the share
+/// of its way that `pushed`, a view SwiftUI moves down with the unfolding's end, has gone of its way
+/// to where the layout puts that end: `top`, a view that stays, and `height` under it. What is under
+/// the unfolded rows moves down with
+/// `pushed`, by their whole height, more than the way to the top from the page's end, so it is
+/// never drawn above where it was, whenever a frame comes. On a curve of its own clock, the scroll
+/// ran ahead of SwiftUI's first frame of the unfolding in 5 of 30 openings on an idle Mac mini M6,
+/// drawing the section under the options 14 points up for a frame. The reader's own scrolling takes
+/// over.
 @MainActor
 final class ScrollTarget: NSObject {
     weak var view: NSView?
+    weak var pushed: NSView?
+    weak var top: NSView?
+    /// How tall the layout makes what unfolds, from `top` to `pushed`, which SwiftUI's geometry gives
+    /// at once while the views move toward it frame by frame. The document takes its new height at
+    /// once too, before the change's `onChange` runs: its growth can't tell how far it has got.
+    var height: CGFloat = 0
     private var link: CADisplayLink?
-    /// Where it is to end up, and where it put the content last, to tell the reader's scrolling.
-    private var top: CGFloat = 0
-    private var placed: CGFloat?
-    /// Where its first frame found the content, and when.
-    private var start: (y: CGFloat, time: CFTimeInterval)?
+    /// Where the content and `pushed` were as the unfolding began.
+    private var start: (y: CGFloat, pushed: CGFloat)?
+    /// Where it put the content last, to tell the reader's scrolling, and where `pushed` was then.
+    private var placed: (y: CGFloat, pushed: CGFloat)?
 
-    /// Puts the view at the top of its scroll view, as far as the content goes.
-    func scrollToTop(margin: CGFloat = 12) {
-        guard let view, let scrollView = view.enclosingScrollView, let document = scrollView.documentView else { return }
-        // Below the toolbar the content scrolls under, as far as its inset goes.
-        let frame = view.convert(view.bounds, to: document), inset = scrollView.contentInsets.top
-        top = document.isFlipped ? frame.minY - margin - inset : frame.maxY + margin - scrollView.contentView.bounds.height + inset
-        placed = nil
-        start = nil
+    /// Puts the view at the top of its scroll view, as far as the content goes, as what is under it
+    /// unfolds.
+    func scrollToTop() {
+        guard let pushed, let scrollView = pushed.enclosingScrollView, let document = scrollView.documentView else { return }
+        let at = pushed.convert(pushed.bounds, to: document).maxY
+        start = (scrollView.contentView.bounds.minY, at)
+        // As if placed there: the reader's scrolling from the click on, as momentum still running,
+        // takes over before the scroll's first frame too.
+        placed = start
         link?.invalidate()
-        link = scrollView.displayLink(target: self, selector: #selector(step))
+        link = pushed.displayLink(target: self, selector: #selector(step))
         link?.add(to: .main, forMode: .common)
     }
 
     @objc private func step(_ link: CADisplayLink) {
-        guard let scrollView = view?.enclosingScrollView, let document = scrollView.documentView else { return stop() }
+        guard let view, let pushed, let top, let start, let scrollView = view.enclosingScrollView, let document = scrollView.documentView
+        else { return stop() }
         let clip = scrollView.contentView
         let y = clip.bounds.minY
         // Moved by someone else since: the reader scrolls.
-        if let placed, abs(y - placed) > 0.5 { return stop() }
-        let lowest = -scrollView.contentInsets.top
-        let reach = min(max(top, lowest), max(document.frame.height - clip.bounds.height + scrollView.contentInsets.bottom, lowest))
-        // Motion.glide's travel, at the time this frame shows; at once with Reduce Motion.
-        let start = start ?? (y, link.timestamp)
-        self.start = start
-        let elapsed = link.targetTimestamp - start.time
-        let next = Motion.reduced ? reach : start.y + (reach - start.y) * Motion.glideSpring.value(target: 1.0, time: elapsed)
-        clip.setBoundsOrigin(NSPoint(x: clip.bounds.minX, y: abs(reach - next) < 0.5 ? reach : next))
+        if let placed, abs(y - placed.y) > 0.5 { return stop() }
+        let at = pushed.convert(pushed.bounds, to: document).maxY, foot = top.convert(top.bounds, to: document).minY + height
+        // Not moved yet, or not since the last frame: SwiftUI draws the unfolding's frames on its
+        // own, the first some frames after the click on a busy main thread.
+        guard at != start.pushed, at != placed?.pushed, foot > start.pushed else { return }
+        // 12 points below the toolbar the content scrolls under, as far as its inset goes.
+        let frame = view.convert(view.bounds, to: document), inset = scrollView.contentInsets.top
+        let goal = document.isFlipped ? frame.minY - 12 - inset : frame.maxY + 12 - clip.bounds.height + inset
+        let lowest = -inset
+        let reach = min(max(goal, lowest), max(document.frame.height - clip.bounds.height + scrollView.contentInsets.bottom, lowest))
+        let share = min(max((at - start.pushed) / (foot - start.pushed), 0), 1)
+        clip.setBoundsOrigin(NSPoint(x: clip.bounds.minX, y: start.y + (reach - start.y) * share))
         scrollView.reflectScrolledClipView(clip)
-        let now = clip.bounds.minY
-        placed = now
-        // There, or as far as the content goes once the curve has settled, the content's growth
-        // (`settle`) done well before.
-        if abs(top - now) < 0.5 || Motion.reduced || elapsed >= Motion.glideSpring.settlingDuration { stop() }
+        placed = (clip.bounds.minY, at)
+        if share == 1 { stop() }
     }
 
     private func stop() {

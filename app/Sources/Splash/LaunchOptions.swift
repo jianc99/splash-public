@@ -59,6 +59,12 @@ struct LaunchOptions: View {
                     .accessibilityHidden(!changed)
             }
         }
+        // Two points SwiftUI moves frame by frame, at the card's top and its foot, which the options
+        // Advanced opens push down, and the card's height as laid out: the scroll to the options
+        // goes as far as the foot has gone toward where the layout puts it.
+        .background(alignment: .top) { ViewAnchor { row.top = $0 }.frame(width: 1, height: 1) }
+        .background(alignment: .bottom) { ViewAnchor { row.pushed = $0 }.frame(width: 1, height: 1) }
+        .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { row.height = $0 }
     }
 
     /// The options of `section` the models of `family` can use.

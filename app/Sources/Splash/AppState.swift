@@ -38,6 +38,7 @@ final class AppState {
     let chats: ChatStore
     /// The count of the next prompt, which the composer's ring shows.
     let chatContext = ChatContext()
+    let readAhead = ReadAhead()
     /// The message being written in each chat, kept while the window shows something else.
     let draft: Draft
     /// The open conversation's page, kept while the window shows something else, so that the Chat
@@ -190,10 +191,11 @@ final class AppState {
         case .ready:
             let look: MarkLook = switch server.serving {
             case .running: .on
-            case .sleeping: .asleep
-            case .recovering: .loading
+            case .sleeping, .notLoaded: .asleep
+            case .recovering, .loading: .loading
+            case .loadFailed: .failed
             }
-            return ServerStatus(look: look, phrase: server.serving.rawValue)
+            return ServerStatus(look: look, phrase: server.serving.rawValue, note: server.serving == .loadFailed ? server.loadError : nil)
         case .failed:
             return ServerStatus(look: .failed, phrase: "Ran into a problem")
         }

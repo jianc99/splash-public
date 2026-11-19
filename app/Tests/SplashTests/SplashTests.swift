@@ -76,14 +76,14 @@ struct ServeSettingsTests {
     @Test func passesTheOptionsSetInTheTablesOrder() {
         let settings = ServeSettings(values: [
             "--port": "8100", "--max-context": "131072", "--max-memory": "48G", "--idle-release": "off",
-            "--language-only": "true", "--kv-format": "bf16", "--cached-states": "exact", "--max-cache-disk": "16G",
+            "--lazy-load": "true", "--language-only": "true", "--kv-format": "bf16", "--cached-states": "exact", "--max-cache-disk": "16G",
             "--persistent-cache": "true",
             "--host": "0.0.0.0", "--allowed-origin": "a.example, b.example", "--no-webui": "true",
             "--thinking-end-text": "Now the answer. </think>", "--disable-ane": "true",
         ], apiKey: "secret")
         #expect(settings.serveArguments(model: "a/b", localName: nil)
             == ["serve", "--model", "a/b", "--port", "8100", "--offline", "--max-context", "131072",
-                "--max-memory", "48G", "--idle-release", "off", "--language-only", "--kv-format", "bf16",
+                "--max-memory", "48G", "--idle-release", "off", "--lazy-load", "--language-only", "--kv-format", "bf16",
                 "--cached-states", "exact", "--max-cache-disk", "16G", "--persistent-cache", "--host", "0.0.0.0",
                 "--allowed-origin", "a.example", "--allowed-origin", "b.example", "--no-webui",
                 "--thinking-end-text", "Now the answer. </think>", "--disable-ane"])
@@ -738,10 +738,62 @@ struct ServerTests {
         // While the server starts a failed engine again.
         #expect(Server.report(Data(#"{"transport": {"ready": false, "recovering": true, "stopped": false}}"#.utf8))?.recovering == true)
         #expect(Server.report(Data("not json".utf8)) == nil)
+        // A server started with --lazy-load, its model not loaded yet: its weights read as given
+        // back, and then as coming back while the first request loads it; a load that failed says
+        // why, in words, and anything else there is no reason.
+        let unloaded = try #require(Server.report(Data(#"{"ready": false, "weights": {"released": true, "restoring": false}, "transport": {"unloaded": true, "recovering": false}}"#.utf8)))
+        #expect(unloaded.unloaded && unloaded.asleep && !unloaded.loading && unloaded.loadError == nil)
+        #expect(Server.report(Data(#"{"weights": {"released": true, "restoring": true}, "transport": {"unloaded": true}}"#.utf8))?.loading == true)
+        #expect(Server.report(Data(#"{"weights": {"released": true, "restoring": true}}"#.utf8))?.loading == false)
+        #expect(Server.report(Data(#"{"weights": {"released": true}, "transport": {"unloaded": true, "error": "out of memory"}}"#.utf8))?.loadError == "Out of memory.")
+        #expect(Server.sentence("it stopped. ") == "It stopped." && Server.sentence("Why?") == "Why?" && Server.sentence("") == "")
+        let odd = Server.report(Data(#"{"weights": {"released": true}, "transport": {"unloaded": true, "error": {"code": 3}}}"#.utf8))
+        #expect(odd?.unloaded == true && odd?.loadError == nil)
         // An SSD cache asked for that the disk left off says why; the golden's is on.
         #expect(report.cacheOff == nil)
         let off = Server.report(Data(#"{"disk": {"capacity_bytes": 0, "off_reason": "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free"}}"#.utf8))
         #expect(off?.cacheOff == "1.3 GiB available on /System/Volumes/Data is too little beyond the 10.0 GiB it keeps free")
+    }
+
+    /// "Load the model on first use", once set, stays set when the app opens again.
+    @Test func loadingOnFirstUseStaysSet() throws {
+        let suite = "splash-lazy-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        ServeSettings(values: ["--lazy-load": "true"]).save(defaults)
+        #expect(ServeSettings.current(defaults)["--lazy-load"] == "true")
+        #expect(ServeSettings.current(defaults).serveArguments(model: "a/b", localName: nil).contains("--lazy-load"))
+    }
+
+    /// A server started with "Load the model on first use" is ready with the model not loaded: it
+    /// says so, then Loading… while the first request loads it, the reason a load failed, and once
+    /// loaded what the model holds, which `/v1/models` gave none of before; what it gave, as
+    /// whether the model sees images, counts from the start.
+    @MainActor @Test func aServerLoadingOnFirstUseSaysWhereItIs() async throws {
+        let fake = try FakeRuntime("splash-lazy", launcher: "lazy_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let state = fake.state()
+        defer { state.quit() }
+        state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(fake.port), "--lazy-load": "true"]))
+        try await waitFor(state.server.phase == .ready)
+        try await waitFor(state.server.unloaded, "the status read")
+        let argv = try JSONDecoder().decode([String].self, from: Data(contentsOf: fake.root.appending(path: "argv")))
+        #expect(argv.contains("--lazy-load"))
+        #expect(state.server.serving == .notLoaded && state.server.asleep && state.server.answers)
+        #expect(state.server.context == nil && state.server.reasoning == nil && state.server.acceptsImages)
+        #expect(state.serverStatus.phrase == "Not loaded" && state.serverStatus.look == .asleep)
+        FileManager.default.createFile(atPath: fake.root.appending(path: "loading").path, contents: nil)
+        try await waitFor(state.server.serving == .loading, "Loading…")
+        #expect(state.serverStatus.look == .loading)
+        try FileManager.default.removeItem(at: fake.root.appending(path: "loading"))
+        FileManager.default.createFile(atPath: fake.root.appending(path: "failed").path, contents: nil)
+        try await waitFor(state.server.serving == .loadFailed, "the failed load")
+        #expect(state.serverStatus.phrase == "Couldn’t load" && state.serverStatus.note == "The engine ran out of memory loading the model.")
+        #expect(state.server.phase == .ready && state.server.answers)
+        FileManager.default.createFile(atPath: fake.root.appending(path: "loaded").path, contents: nil)
+        try await waitFor(state.server.serving == .running, "Running")
+        #expect(state.server.context == 32768 && state.server.reasoning?.efforts == ["low", "high"] && state.server.acceptsImages)
+        #expect(!state.server.asleep && state.server.loadError == nil && state.serverStatus.note == nil)
     }
 
     /// What a running request does, as the engine's phase gives it, and when it came; one without

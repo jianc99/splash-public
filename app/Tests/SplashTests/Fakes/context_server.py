@@ -1,10 +1,14 @@
 # A launcher that serves as a ready `splash serve` does: it counts prompts and answers each,
 # and writes what it was asked to the runtime's folder (ChatContextFlowTests). While a file
 # `hold` is in that folder, it holds a message before it takes or refuses it, and makes `held`
-# there, so that a test can look at the app while the server has yet to answer.
+# there, so that a test can look at the app while the server has yet to answer. A prompt read
+# ahead of its sending (a request for one token) it writes to `ahead.jsonl`; while a file
+# `hold-ahead` is there it holds that request, and writes `ahead-cancelled` when the app closes it.
 import json
 import os
 import runpy
+import select
+import socket
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -79,6 +83,16 @@ class Handler(BaseHTTPRequestHandler):
                 for m in body["messages"]
             )
             return self.reply({"input_tokens": count})
+        if body.get("max_tokens") == 1:
+            with (root / "ahead.jsonl").open("a") as output:
+                output.write(json.dumps(words(body["messages"][-1]["content"])) + "\n")
+            while (root / "hold-ahead").exists():
+                (root / "ahead-held").touch()
+                readable, _, _ = select.select([self.connection], [], [], 0.01)
+                if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                    (root / "ahead-cancelled").touch()
+                    return
+            return self.reply({"choices": [{"message": {"content": "A"}}]})
         # A title, which the app asks for once a first exchange is answered, streams nothing.
         if not body.get("stream"):
             return self.reply({"choices": [{"message": {"content": "A Title"}}]})

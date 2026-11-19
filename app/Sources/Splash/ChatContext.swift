@@ -133,3 +133,75 @@ extension ChatTarget {
             && apiKey == other.apiKey
     }
 }
+
+/// Reads the next prompt into the model's cache while it is written, so that the reply to a long
+/// message starts as soon as it is sent: the prompt so far, once typing pauses for 1 s, as a request
+/// for one token whose reply is dropped. The request is the chat's own, at its priority: the reply
+/// to the message sent meanwhile waits for what it has read and goes on from there, where one of a
+/// lower priority would be preempted and read again (Qwen3.8-27B MLX on an M5 Max, a 5.6K-token
+/// message: its first token 8.39 s cold, 0.17 s once read ahead, 7.62 s sent 0.5 s into the read;
+/// 9.29 s with the read at background priority). A prompt never sent costs what reading it costs,
+/// about 1.5 s of the GPU a thousand tokens on that Mac, the text added since the last read alone
+/// at each later pause, and its KV and one state in the cache, which go first when memory is short.
+@MainActor
+final class ReadAhead {
+    typealias Reader = @Sendable (ChatContext.Request) async -> Void
+
+    /// What a read must add to the last one to be sent: a cache page, 32 tokens, at about four
+    /// characters a token; a smaller step reuses nothing new. Text of Chinese, Japanese or Korean,
+    /// a token a character or two, is read in fewer, larger steps.
+    static let step = 128
+
+    private let reader: Reader
+    private let delay: Duration
+    /// The prompt read last, or being read, and the read in flight or waiting for the pause; and
+    /// the prompt as it is now, which a read that ends looks at again.
+    private var read: ChatContext.Request?
+    private var latest: ChatContext.Request?
+    private var reading = false
+    private var task: Task<Void, Never>?
+
+    init(delay: Duration = .seconds(1), reader: @escaping Reader = { await ChatClient.readAhead($0) }) {
+        self.delay = delay
+        self.reader = reader
+    }
+
+    /// Takes the next prompt as it changes, nil while there is none to read: no model answers, a
+    /// reply streams or nothing is written. A read in flight goes on while the prompt only grows
+    /// past it, is sent, or is none, as in a chat with nothing written; it stops when the prompt is
+    /// another chat's or model's, or its text no longer starts with what was read (an edit inside
+    /// it). The draft grown while a read was in flight is read once that read ends.
+    func refresh(_ request: ChatContext.Request?) {
+        latest = request
+        if reading, let read, let request, !request.continues(read) {
+            task?.cancel()
+            reading = false
+            self.read = nil
+        }
+        guard !reading else { return }
+        task?.cancel()
+        guard let request else { return }
+        let base = read.flatMap { request.continues($0) ? $0.text.count : nil } ?? 0
+        guard request.text.count - base >= Self.step else { return }
+        let reader = reader, delay = delay
+        task = Task { [weak self] in
+            guard (try? await Task.sleep(for: delay)) != nil, let self else { return }
+            read = request
+            reading = true
+            await reader(request)
+            if read == request {
+                reading = false
+                refresh(latest)
+            }
+        }
+    }
+}
+
+extension ChatContext.Request {
+    /// Whether this prompt goes on from `other`: the same chat, model, history and attachments, and
+    /// its text starting with `other`'s.
+    func continues(_ other: Self) -> Bool {
+        conversation == other.conversation && target == other.target && started == other.started
+            && history == other.history && attachments == other.attachments && text.hasPrefix(other.text)
+    }
+}
