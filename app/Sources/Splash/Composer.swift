@@ -8,6 +8,8 @@ import UniformTypeIdentifiers
 /// (`ChatStore.attachments`), which become the message's once it is taken; one taken off goes.
 /// Each chat has its own, so that what one holds, a message the server holds or one that comes
 /// back, never shows in another's composer, to be sent there or mixed with what is written there.
+/// The drafts that hold a message are kept on disk (`ChatStore.drafts`) and come back as the app
+/// opens again: nothing is lost at quit, so nothing is asked.
 @MainActor @Observable
 final class Draft {
     /// What a chat's draft holds.
@@ -25,8 +27,20 @@ final class Draft {
         var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty && attaching == 0 }
     }
 
+    /// What a draft keeps on disk: what was written and attached, not what is still being
+    /// attached or what the composer says of it.
+    private struct Saved: Codable, Equatable {
+        var text: String
+        var attachments: [Attachment]
+    }
+
     /// The drafts, by their chat's conversation, nil for a new chat.
-    private var drafts: [UUID?: Kept] = [:]
+    private var drafts: [UUID?: Kept] = [:] { didSet { saveSoon() } }
+    /// Where the drafts are kept (`ChatStore.drafts`); nil keeps them in memory alone.
+    private let kept: URL?
+    /// The drafts as last written, by chat (`key`), and the write a change has asked for.
+    @ObservationIgnored private var saved: [String: Saved] = [:]
+    @ObservationIgnored private var saving: Task<Void, Never>?
     /// The open chat, whose draft the composer shows.
     private let chat: @MainActor () -> UUID?
 
@@ -56,10 +70,64 @@ final class Draft {
     /// Where attachments are kept.
     let files: URL
 
-    /// `chat` tells the open chat, nil for a new one.
-    init(files: URL, chat: @escaping @MainActor () -> UUID? = { nil }) {
+    /// `chat` tells the open chat, nil for a new one. The drafts `kept` holds come back, the
+    /// images' thumbnails made again from their files.
+    init(files: URL, kept: URL? = nil, chat: @escaping @MainActor () -> UUID? = { nil }) {
         self.files = files
+        self.kept = kept
         self.chat = chat
+        guard let kept, let data = try? Data(contentsOf: kept),
+              let saved = try? PropertyListDecoder().decode([String: Saved].self, from: data)
+        else { return }
+        self.saved = saved
+        for (key, draft) in saved {
+            let chat = UUID(uuidString: key)
+            guard chat != nil || key == Self.key(nil) else { continue }
+            var restored = Kept()
+            restored.text = draft.text
+            restored.attachments = draft.attachments
+            for attachment in draft.attachments where attachment.kind == .image {
+                restored.thumbnails[attachment.id] = NSImage(contentsOf: files.appending(path: attachment.file))
+            }
+            drafts[chat] = restored
+        }
+    }
+
+    /// A chat's name in the file of drafts.
+    private static func key(_ chat: UUID?) -> String { chat?.uuidString ?? "new" }
+
+    /// The chats whose drafts hold something.
+    var chats: Set<UUID> { Set(drafts.keys.compactMap { $0 }) }
+
+    /// The files of what the drafts attached, which the store keeps (`ChatStore.adoptFiles`).
+    var attachmentFiles: Set<String> { Set(drafts.values.flatMap { $0.attachments.map(\.file) }) }
+
+    /// Writes the drafts 1 s after the last change: it bounds what a crash loses to a second, and
+    /// writes once a pause in the typing, never a keystroke.
+    private func saveSoon() {
+        guard kept != nil else { return }
+        saving?.cancel()
+        saving = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(1)) } catch { return }
+            self?.save()
+        }
+    }
+
+    /// Writes the drafts that hold a message now, if they changed: as one is taken, carried or
+    /// forgotten, and as the app quits.
+    func save() {
+        saving?.cancel()
+        saving = nil
+        guard let kept else { return }
+        var now: [String: Saved] = [:]
+        for (chat, draft) in drafts
+        where !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !draft.attachments.isEmpty {
+            now[Self.key(chat)] = Saved(text: draft.text, attachments: draft.attachments)
+        }
+        guard now != saved, let data = try? PropertyListEncoder().encode(now),
+              (try? data.write(to: kept, options: .atomic)) != nil
+        else { return }
+        saved = now
     }
 
     var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && attachments.isEmpty }
@@ -170,6 +238,7 @@ final class Draft {
     /// with it.
     func take(from chat: UUID?) {
         drafts[chat] = nil
+        save()
     }
 
     /// Takes `chat`'s draft into the new chat, without what the composer said of it there, as a
@@ -180,6 +249,7 @@ final class Draft {
         draft.notice = nil
         drafts[chat] = nil
         drafts[nil] = draft
+        save()
     }
 
     /// Forgets the drafts of `chats`, deleted (`AppState.delete`). An attachment of theirs still
@@ -187,6 +257,7 @@ final class Draft {
     /// finds no chat naming it (`ChatStore.adoptFiles`).
     func forget(_ chats: Set<UUID>) {
         for chat in chats { drafts[chat] = nil }
+        save()
     }
 
     /// Takes back `refused`, what a request that came to nothing gives back, in its chat's draft:

@@ -760,6 +760,9 @@ void testDuplicateProbePromotesStateWithoutLookupAccounting() {
   fixture.publish(0, 100);
   fixture.publish(1, 200);
   fixture.publish(3, 300);
+  // Branch points, which recency alone orders: on one chain the deeper states would supersede them.
+  fixture.cache.markBranchPoint(fixture.blocks[0]);
+  fixture.cache.markBranchPoint(fixture.blocks[1]);
   const auto before = fixture.cache.snapshot();
   require(fixture.cache.reuseCompositeState(fixture.blocks[0], false),
           "resident publication probe missed an existing state");
@@ -1493,44 +1496,38 @@ void testPromotionNeverDropsAUniqueState() {
 
 // An opportunistic reply's state frees for nothing: of the oldest
 // checkpoint, the first claim takes its RAM copy with no write, before that
-// of a state the SSD holds. Kept, it is written as any checkpoint, after that
-// RAM copy. No claim takes the newer checkpoint or the resume point.
+// of a state the SSD holds. No claim takes the newer checkpoint or the resume
+// point.
 void testOpportunisticReplyGoesWithoutAWrite() {
-  for (const bool kept : {false, true}) {
-    CacheFixture fixture;
-    auto control = std::make_shared<TransferControl>();
-    control->ready = true;
-    fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
-    require(test::stateStep(fixture.cache).gave() && fixture.cache.pollTransfers(), "the state was not written");
-    fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
-    publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
-    fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), true);
-    fixture.cache.markReply(fixture.cache.checkpointState(fixture.blocks[0]));
-    if (kept)
-      fixture.cache.keepReply(fixture.cache.checkpointState(fixture.blocks[0]));
-    fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), true);
-    const uint64_t offloads = fixture.cache.snapshot().stateCache.offloads;
-    // A pool's growth by one state's buffers, which keeps the resume point.
-    engine::MemoryLedger ledger;
-    ledger.addSource(fixture.cache);
-    ledger.setBufferBytes([&control](uint32_t states, bool, bool) { return control->poolBytes(states); });
-    const auto grow = [&] {
-      const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
-      const FreeResult freed = ledger.free(claim, {.bytes = 100}, 0, MemoryPressure::Normal);
-      ledger.close(claim);
-      return freed.outcome == FreeOutcome::Met;
-    };
-    require(grow() && fixture.cache.stateResident(fixture.blocks[0]) == kept &&
-                fixture.cache.stateResident(fixture.blocks[2]) != kept,
-            kept ? "a kept reply's state went before a state that frees for nothing"
-                 : "an opportunistic reply's state did not go first");
-    require(grow() && !fixture.cache.stateResident(fixture.blocks[0]) &&
-                !fixture.cache.stateResident(fixture.blocks[2]) && fixture.cache.stateResident(fixture.blocks[1]) &&
-                fixture.cache.stateResident(fixture.blocks[3]),
-            "the second claim did not take the other of the two alone");
-    require(fixture.cache.snapshot().stateCache.offloads - offloads == (kept ? 1U : 0U),
-            kept ? "a kept reply's state went without a write" : "an opportunistic reply's state was written");
-  }
+  CacheFixture fixture;
+  auto control = std::make_shared<TransferControl>();
+  control->ready = true;
+  fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
+  require(test::stateStep(fixture.cache).gave() && fixture.cache.pollTransfers(), "the state was not written");
+  fixture.cache.publishCompositeState(fixture.blocks[2], std::make_shared<TieredState>(control), false);
+  publishReusable(fixture, fixture.blocks[3], std::make_shared<TieredState>(control));
+  fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), true);
+  fixture.cache.markReply(fixture.cache.checkpointState(fixture.blocks[0]));
+  fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), true);
+  const uint64_t offloads = fixture.cache.snapshot().stateCache.offloads;
+  // A pool's growth by one state's buffers, which keeps the resume point.
+  engine::MemoryLedger ledger;
+  ledger.addSource(fixture.cache);
+  ledger.setBufferBytes([&control](uint32_t states, bool, bool) { return control->poolBytes(states); });
+  const auto grow = [&] {
+    const engine::ClaimId claim = ledger.open({.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate});
+    const FreeResult freed = ledger.free(claim, {.bytes = 100}, 0, MemoryPressure::Normal);
+    ledger.close(claim);
+    return freed.outcome == FreeOutcome::Met;
+  };
+  require(grow() && !fixture.cache.stateResident(fixture.blocks[0]) &&
+              fixture.cache.stateResident(fixture.blocks[2]),
+          "an opportunistic reply's state did not go first");
+  require(grow() && !fixture.cache.stateResident(fixture.blocks[0]) &&
+              !fixture.cache.stateResident(fixture.blocks[2]) && fixture.cache.stateResident(fixture.blocks[1]) &&
+              fixture.cache.stateResident(fixture.blocks[3]),
+          "the second claim did not take the other of the two alone");
+  require(fixture.cache.snapshot().stateCache.offloads == offloads, "an opportunistic reply's state was written");
 }
 
 // A republication over a disk-only copy gives the state a RAM copy and keeps
@@ -2162,12 +2159,13 @@ void testEvictedCheckpointsAndSupersededPointsStayOnTheSsd() {
   control->ready = true;
   control->capacity = 4;
   // The system prompt ends at the first block, with its last checkpoint; the
-  // conversation's point at the second block is superseded by the one at its
-  // last.
+  // conversation's point at the second block is the one behind its newest, at
+  // its last, which a reclaim keeps and writes and a temporary tier does not
+  // copy ahead.
   fixture.cache.publishCompositeState(fixture.blocks[0], std::make_shared<TieredState>(control), true);
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
   fixture.cache.publishCompositeState(fixture.blocks[3], std::make_shared<TieredState>(control), false);
-  require(!fixture.cache.newestPoint(fixture.blocks[1]) && fixture.cache.newestPoint(fixture.blocks[3]),
+  require(!fixture.cache.copiedAhead(fixture.blocks[1]) && fixture.cache.copiedAhead(fixture.blocks[3]),
           "the conversation's points are not as the test needs");
   // In-service work takes everything, each write landing before its next
   // step.
@@ -2987,6 +2985,9 @@ void testCancelledRestoreKeepsThePageUnderANewState() {
   require(tier.restores == 2 && tier.inFlight() == 0 && cache.snapshot().pool.pagesPrefix == 3,
           "the cancelled restore dropped the page under a state in RAM");
   control->capacity = control->slots;
+  // The deeper point leaves, so the state at the third block is its chain's newest, which a reclaim writes: one
+  // with a point below it on its only branch would be superseded and dropped unwritten.
+  cache.invalidateState(last);
   require(reclaimStateBytes(cache) == 100 &&
               cache.pollTransfers(),
           "the state in RAM was not written");
@@ -6140,6 +6141,9 @@ void testImmediateWalksOfferWhatLandsLaterInItsPlace() {
   // point.
   fixture.publish(2);
   fixture.publish(3);
+  // Branch points, which a reclaim writes: on one chain the deeper states would supersede them.
+  for (const uint32_t block : {0u, 1u, 2u})
+    fixture.cache.markBranchPoint(fixture.blocks[block]);
   const auto unitsOf = [&](ClaimClass cls, NeedTiming timing) {
     const ClaimSpec claim{.cls = cls, .timing = timing};
     const VictimQuery query = test::query(claim, {.stateBuffers = 1});
@@ -6278,6 +6282,9 @@ void testDeviceWalkOffersTheStagedWriteAsAUnit() {
   fixture.cache.publishCompositeState(fixture.blocks[1], std::make_shared<TieredState>(control), false);
   // The resume point, which growth keeps, and with it the chain.
   fixture.publish(3);
+  // Branch points, which a reclaim writes: on one chain the deeper states would supersede them.
+  for (const uint32_t block : {0u, 1u})
+    fixture.cache.markBranchPoint(fixture.blocks[block]);
   const ClaimSpec cannotWait{.cls = ClaimClass::Growth, .timing = NeedTiming::Immediate};
   const VictimQuery query = test::query(cannotWait, {.bytes = 1});
   const auto units = [&] {

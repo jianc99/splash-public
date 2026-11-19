@@ -86,7 +86,7 @@ extension ChatScreenTests {
     @Test func sendMovesWithTheComposer() async throws {
         let fake = try FakeRuntime("splash-chat-send", launcher: "chat_server")
         defer { try? FileManager.default.removeItem(at: fake.root) }
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(fake.port)]))
@@ -461,8 +461,14 @@ extension ChatScreenTests {
         let still = try #require(Self.card(in: opening.still.card), "the card once still")
         #expect(before.height > still.height + 100, "the card before, \(before), and once still, \(still)")
         let frames = opening.drawn.map { (ms: $0.ms, card: Self.card(in: $0.card)) }
+        // A frame with no card found is kept, to tell a card not drawn from one drawn otherwise.
+        let kept = zip(opening.drawn, frames).filter { $1.card == nil }.map { drawn, _ in
+            let file = FileManager.default.temporaryDirectory.appending(path: "composer-card-\(drawn.ms)ms-\(UUID().uuidString).png")
+            try? drawn.card.representation(using: .png, properties: [:])?.write(to: file)
+            return file.path(percentEncoded: false)
+        }
         #expect(frames.allSatisfy { $0.card.map { abs($0.height - still.height) <= 2 } ?? false },
-                "the card per frame, \(frames), once still \(still)")
+                "the card per frame, \(frames), once still \(still); the frames without one in \(kept)")
         let buttons = [before.button] + frames.compactMap(\.card?.button)
         #expect(zip(buttons, buttons.dropFirst()).allSatisfy { $1 >= $0 - 1 }, "its button per frame from before: \(buttons)")
     }
@@ -604,7 +610,7 @@ extension ChatScreenTests {
         }
         // Installed, as a model that runs is, so that its name opens the models' menu.
         try fake.install("example/Model")
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         await state.launch()
         state.server.start("example/Model", settings: ServeSettings(values: ["--port": String(fake.port)]))
         try await waitFor(state.server.phase == .ready, "ready")
@@ -942,7 +948,7 @@ extension ChatScreenTests {
         try JSONEncoder().encode(conversation).write(to: fake.chats.appending(path: "\(conversation.id.uuidString).json"))
         let model = "example/A-Model-Whose-Name-Is-Long-Enough-To-Fill-The-Server-Button-GGUF:Q4"
         try fake.install(model)
-        let state = fake.state(keychain: Keychain(service: "Splash Tests"))
+        let state = fake.state()
         defer { state.quit() }
         await state.launch()
         for step in ["loaded", "warm"] { FileManager.default.createFile(atPath: fake.root.appending(path: step).path, contents: nil) }

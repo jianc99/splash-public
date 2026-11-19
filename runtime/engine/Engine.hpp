@@ -512,11 +512,14 @@ private:
     std::vector<StateBoundary> stateBoundaries;
     size_t stateBoundaryCursor = 0;
     StateCheckpoint latestCheckpoint;
+    // The checkpoint its last command ended at, whose state the lane holds
+    // until it leaves it (storeHeldCheckpoint); 0 for none.
+    uint32_t heldCheckpoint = 0;
     // Its prompt rendered an earlier reply back token for token, its start's
     // match reaching a block that reply's state was captured at
     // (CacheLookup::rendersReply): its conversation's next prompt is likely
     // to render its own reply back, so its end keeps that reply's last state
-    // (Cache::keepReply).
+    // as its conversation's newest point (Cache::keepReplyAsPoint).
     bool rendersReplies = false;
     // The block of the prompt's replay boundary, where the conversation's
     // next turn resumes: its state is in use from the moment the request
@@ -835,11 +838,14 @@ private:
   // cached there: `state`, captured, or without one taken from the lane
   // (fromLane) or written from it to the disk tier; `recycled` when its
   // buffers took room reclaimed from cache. The lane's recovery point
-  // retires as the boundary's kind has it. False when the state was
-  // refused.
+  // retires as the boundary's kind has it; one its command ended at
+  // (atProgress) the lane holds. False when the state was refused.
   bool publishStateBoundary(Request &request, Request::StateBoundary objective,
                             std::shared_ptr<const CompositeState> state, bool recycled,
-                            bool fromLane, double nowMilliseconds);
+                            bool fromLane, bool atProgress, double nowMilliseconds);
+  // Stores the checkpoint the lane holds as it leaves it: a RAM copy a
+  // reclaim writes, or the lane's state written to the disk tier.
+  void storeHeldCheckpoint(Request &request);
   // Takes what the plan's lanes need to run it as planned, and returns
   // Runnable with its items and captures; or, when that changed what the
   // plan was made from, Replan, the lanes refused added to `excluded`, a

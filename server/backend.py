@@ -64,6 +64,14 @@ def thinking_end_tokens(tokenizer, text, chat_format):
     return tokens
 
 
+# A start's state source as usage names it: null for none.
+_STATE_SOURCES = {
+    wire.StateSource.NONE: None,
+    wire.StateSource.MEMORY: "memory",
+    wire.StateSource.DISK: "disk",
+}
+
+
 @dataclass(frozen=True)
 class CacheInfo:
     status: str = "unknown"
@@ -72,6 +80,21 @@ class CacheInfo:
     # Tokens whose KV the request read from cached blocks another request
     # computed, past its cached prefix; known once it is done.
     deduplicated_tokens: int = 0
+    # What its start found beside the cached prefix (wire.StartEvent): how
+    # far the cache matched its prompt's KV, where the state it resumed from
+    # was, and whether a state past it was lost.
+    prefix_tokens: int = 0
+    state_source: str | None = None
+    lost_state: bool = False
+
+    def reuse(self):
+        """The usage fields that say what the request reused, beside each
+        API's cached tokens."""
+        return {
+            "prefix_tokens": self.prefix_tokens,
+            "state_source": self.state_source,
+            "lost_state": self.lost_state,
+        }
 
 
 @dataclass(frozen=True)
@@ -167,9 +190,12 @@ class Job:
     retained_input: list | None = None
     # Option token ids for score-only jobs; empty means ordinary generation.
     score_tokens: tuple = ()
-    # Trailing prompt tokens of the chat template's generation prompt; zero
-    # when unknown.
+    # Trailing prompt tokens after the last message's text (its end of turn
+    # and the generation prompt, frontend._past_last_text); zero when unknown.
     generation_prompt_tokens: int = 0
+    # Where the prompt's head (a system prompt and tools) ends; zero without
+    # one (frontend._head_tokens).
+    head_tokens: int = 0
     flags: wire.RequestFlag = wire.RequestFlag(0)
     # The request asked for more output than the context leaves, and
     # max_new_tokens was lowered to what it leaves.
@@ -186,24 +212,77 @@ class Job:
 
 
 class CallbackStreamer:
-    def __init__(self, tokenizer, callback, stop_sequences=(), on_stop=None):
+    """The output's text as its tokens arrive, and the first of a request's
+    stop sequences in its answer.
+
+    The stop sequences are searched in the answer's text alone: not in the
+    reasoning, nor inside a tool call, where a client's stop text is data
+    the model writes, not the end of its answer. The tokens say where those
+    are, as the chat format has one token for each tag that bounds them
+    (chat_format): the reasoning runs from the start of the output where the
+    generation prompt opened it (thinking), or from the model's own opening
+    of it, to its close or, where a call's opening ends it
+    (may_call_tools and chat_format.calls_end_reasoning), to a call's
+    opening; a call, which the output has where a tool policy reads calls
+    (reads_calls), runs from its opening token to its close token. A
+    call-open token opens a call only where the text from it on spells the
+    format's call opening, as the output projector reads calls. The search
+    starts afresh in each stretch of answer, after the newlines that set the
+    answer apart from the reasoning, so a stop never spans a reasoning or a
+    call. A request without a chat format is all answer."""
+
+    def __init__(
+        self,
+        tokenizer,
+        callback,
+        stop_sequences=(),
+        on_stop=None,
+        *,
+        chat_format=None,
+        thinking=False,
+        may_call_tools=False,
+        reads_calls=False,
+    ):
         self.tokenizer = tokenizer
         self.callback = callback
-        self.stops = StopSearch(stop_sequences) if stop_sequences else None
+        self.stop_sequences = tuple(stop_sequences)
+        self.stops = StopSearch(self.stop_sequences) if self.stop_sequences else None
         self.on_stop = on_stop
         self.backend = tokenizer.backend_tokenizer
         self.decode_stream = DecodeStream(skip_special_tokens=True)
         self.token_ids = []
-        self.emitted = []
+        # Each piece of text the tokens decoded to, in order.
+        self.decoded = []
         self.pending_text = ""
         self.stop_sequence = None
+        self.chat_format = chat_format
+        self.reads_calls = reads_calls and chat_format is not None
+        self.calls_end_reasoning = (
+            may_call_tools
+            and chat_format is not None
+            and chat_format.calls_end_reasoning
+        )
+        # "answer", "reasoning" or "call"; None until the first token shows
+        # whether the model opens its reasoning itself.
+        if chat_format is None or not (
+            thinking or chat_format.think_start_id is not None
+        ):
+            self.region = "answer"
+        else:
+            self.region = "reasoning" if thinking else None
+        # While a call-open token's text may yet spell a call's opening: the
+        # region it came in and the text since.
+        self.opening = None
+        self.opening_text = ""
+        # Whether the newlines after the reasoning's close are still to come.
+        self.after_reasoning = False
 
     def _send(self, text):
         if text:
             self.callback(text)
-            self.emitted.append(text)
 
     def _emit(self, text):
+        """Answer text, searched for the stop sequences."""
         if not text or self.stop_sequence is not None:
             return
         if self.stops is None:
@@ -224,44 +303,135 @@ class CallbackStreamer:
         self.pending_text = self.pending_text[-retained:] if retained else ""
         self._send(ready)
 
+    def _enter_answer(self):
+        """A stretch of answer begins: the search starts afresh."""
+        self.region = "answer"
+        if self.stop_sequences:
+            self.stops = StopSearch(self.stop_sequences)
+
+    def _text(self, text):
+        """Text in the region the output is in."""
+        if self.region != "answer":
+            self._send(text)
+            return
+        if self.after_reasoning:
+            answer = text.lstrip("\n")
+            self._send(text[: len(text) - len(answer)])
+            if not answer:
+                return
+            self.after_reasoning = False
+            text = answer
+        self._emit(text)
+
+    def _decide_opening(self, final=False):
+        """Once a call-open token's text decides it, or the output gives it
+        no more (final): a call's opening, or text of the region it came
+        in."""
+        call_open = self.chat_format.call_syntax.call_open
+        text = self.opening_text
+        if text.startswith(call_open):
+            self.opening, self.opening_text = None, ""
+            # Answer text before the call that began no stop.
+            self._send(self.pending_text)
+            self.pending_text = ""
+            self.region = "call"
+            self._send(text)
+        elif final or not call_open.startswith(text):
+            self.opening, self.opening_text = None, ""
+            self._text(text)
+
+    def _before(self, token_id):
+        """The region the output is in for `token_id`'s text."""
+        chat_format = self.chat_format
+        if chat_format is None:
+            return
+        if self.region is None:
+            self.region = (
+                "reasoning" if token_id == chat_format.think_start_id else "answer"
+            )
+        if self.opening is not None and token_id in (
+            chat_format.call_open_id,
+            chat_format.call_close_id,
+            chat_format.think_end_id,
+        ):
+            self._decide_opening(final=True)
+        if token_id == chat_format.call_open_id and (
+            (self.region == "answer" and self.reads_calls)
+            or (self.region == "reasoning" and self.calls_end_reasoning)
+        ):
+            self.opening = self.region
+
+    def _after(self, token_id):
+        """The region the output is in after `token_id`'s text."""
+        chat_format = self.chat_format
+        if chat_format is None or self.opening is not None:
+            return
+        if self.region == "reasoning" and token_id == chat_format.think_end_id:
+            self._enter_answer()
+            self.after_reasoning = True
+        elif self.region == "call" and token_id == chat_format.call_close_id:
+            self._enter_answer()
+
+    def _put(self, text):
+        if not text:
+            return
+        self.decoded.append(text)
+        if self.opening is None:
+            self._text(text)
+            return
+        self.opening_text += text
+        self._decide_opening()
+
     def put_tokens(self, token_ids):
         if self.stop_sequence is not None:
             return
         for token_id in token_ids:
             token_id = int(token_id)
             self.token_ids.append(token_id)
-            if self.decode_stream is None:
-                continue
+            self._before(token_id)
+            self._put(self._step(token_id))
+            self._after(token_id)
+            if self.stop_sequence is not None:
+                break
+
+    def _step(self, token_id):
+        """The text `token_id` adds to the output. Where tokenizers'
+        DecodeStream cannot continue, which a decoder that rewrites earlier
+        text can make it, each token decodes the whole output instead, so
+        that a stop sequence still ends the request at the token that
+        completes it, and the usage counts no token past it."""
+        if self.decode_stream is not None:
             try:
-                text = self.decode_stream.step(self.backend, token_id)
+                return self.decode_stream.step(self.backend, token_id) or ""
             except Exception as error:
-                # tokenizers raises a plain Exception with this message when an
-                # incremental decode cannot continue; fall back to decoding the
-                # whole sequence at the end.
+                # tokenizers raises a plain Exception with this message when
+                # an incremental decode cannot continue.
                 if not str(error).startswith("Invalid prefix encountered"):
                     raise
                 self.decode_stream = None
-                continue
-            if text:
-                self._emit(text)
-                if self.stop_sequence is not None:
-                    break
+        return self._rest()
 
-    def end(self):
-        if self.stop_sequence is not None:
-            return
+    def _rest(self):
+        """The text of the whole output past the text put so far."""
         decoded = self.tokenizer.decode(
             self.token_ids,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
-        handled = "".join(self.emitted) + self.pending_text
+        handled = "".join(self.decoded)
         if not decoded.startswith(handled):
             raise RuntimeError("incremental tokenizer output diverged")
         # Bytes of a multi-byte character the output ends inside decode to
-        # U+FFFD; DecodeStream held them back for the rest. Drop the trailing
-        # U+FFFD, as vLLM's detokenizer does; one that text follows stays.
-        self._emit(decoded[len(handled) :].rstrip("\ufffd"))
+        # U+FFFD; DecodeStream holds them back for the rest. Drop the
+        # trailing U+FFFD; one that text follows stays.
+        return decoded[len(handled) :].rstrip("\ufffd")
+
+    def end(self):
+        if self.stop_sequence is not None:
+            return
+        self._put(self._rest())
+        if self.opening is not None:
+            self._decide_opening(final=True)
         if self.stop_sequence is None:
             self._send(self.pending_text)
             self.pending_text = ""
@@ -828,6 +998,7 @@ class NativeBackend:
             flags=job.flags,
             cache_salt=job.cache_salt,
             thinking_budget=self._thinking_budget(job),
+            head_tokens=job.head_tokens,
         )
         return engine_runtime.GenerationRequest(
             frame,
@@ -901,7 +1072,14 @@ class NativeBackend:
             job.events.put(("text", text))
 
         streamer = CallbackStreamer(
-            self.tokenizer, emit, job.stop_sequences, stop_matched
+            self.tokenizer,
+            emit,
+            job.stop_sequences,
+            stop_matched,
+            chat_format=job.chat_format,
+            thinking=job.thinking,
+            may_call_tools=job.may_call_tools,
+            reads_calls=job.tool_policy is not None,
         )
         state = _JobState(job, streamer)
         request = self._generation_request(job)
@@ -1004,6 +1182,9 @@ class NativeBackend:
                 "hit" if event.matched_prompt_tokens else "miss",
                 event.matched_prompt_tokens,
                 event.lane,
+                prefix_tokens=event.prefix_tokens,
+                state_source=_STATE_SOURCES[event.state_source],
+                lost_state=event.lost_state,
             )
             with self.lock:
                 job.cache = cache

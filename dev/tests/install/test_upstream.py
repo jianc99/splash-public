@@ -7,6 +7,8 @@ import json
 import re
 import shutil
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,6 +22,8 @@ from dev.tests.installer_fixtures import (
     CONFIGS,
     DENSE,
     DRAFT_COMMIT,
+    FLINT,
+    GGUF_CONFIGS,
     GGUF_ONLY,
     MODEL,
     MOE,
@@ -83,15 +87,14 @@ class UpstreamTest(unittest.TestCase):
                 continue
             config = mlx_target(self.root / family.name, family) / "config.json"
             draft = draft_dir(self.root / family.name / "draft", family)
+            vision = "safetensors" if family.vision else "none"
             for arguments in ({}, {"draft": draft / "config.json"}):
                 self.assertIs(
-                    upstream.check_model(
-                        "mlx-affine", "safetensors", config, **arguments
-                    ),
+                    upstream.check_model("mlx-affine", vision, config, **arguments),
                     family,
                 )
 
-        # Qwen3.8-Flash-Next and Flint load from a GGUF: the config the
+        # Qwen3.8-Flash-Next and Flint load from a GGUF too: the config the
         # installer derives from it and its header name the family, with and
         # without its draft (Flint's flat config, its release's keys, and a
         # test draft naming one of its reserved tokens as its mask), and
@@ -104,7 +107,7 @@ class UpstreamTest(unittest.TestCase):
             )
             return {"gguf_headers": directory}
 
-        for family in GGUF_ONLY:
+        for family in GGUF_CONFIGS:
             configs = CONFIGS / family.name.lower()
             gguf_check = headers(family)
             for arguments in ({}, {"draft": configs / "draft" / "config.json"}):
@@ -819,8 +822,16 @@ class UpstreamTest(unittest.TestCase):
                     in str(refused.exception),
                     missing == "preprocessor_config.json",
                 )
-                self.assertEqual(fake.downloads, [])
+                # Without a processor, the config alone is read: its family
+                # says whether it needs one (family.vision).
+                self.assertEqual(
+                    fake.downloads,
+                    ["user/custom/config.json"]
+                    if missing == "preprocessor_config.json"
+                    else [],
+                )
                 self.assertFalse(chosen.models_root.exists())
+                fake.downloads.clear()
                 shutil.rmtree(fake.remote)
 
     def test_a_draft_that_ships_its_mask_embedding_installs_it(self):
@@ -1111,6 +1122,20 @@ class UpstreamTest(unittest.TestCase):
         self.assertNotIn("someone/text/model.safetensors", fake.downloads)
         self.assertIn("someone/text/model.safetensors", fake.range_reads)
 
+    def test_a_text_only_familys_mlx_target_installs_without_language_only(self):
+        # Flint has no vision tower (family.vision): its MLX repository holds
+        # no processor, and installs to serve text as its GGUF does, without
+        # --language-only.
+        fake_hub(self, self.cache, target=FLINT)
+        chosen = selection(self.root, language_only=False)
+        self.prepare(chosen)
+        record = json.loads((chosen.link / "model.json").read_text())
+        self.assertEqual(
+            (record["family"], record["target_format"], record["vision_format"]),
+            ("Flint", "mlx-affine", "none"),
+        )
+        self.assertFalse((chosen.link / "vision").exists())
+
     def test_a_cached_file_is_read_from_the_cache(self):
         fake = FakeHub(self, self.cache)
         fake.publish(MODEL, "a" * 40, lambda p: mlx_target(p, DENSE))
@@ -1325,6 +1350,48 @@ class UpstreamTest(unittest.TestCase):
             output, _ = self.prepare(selection(self.root))
         self.assertIn("is already installed", output)
         self.assertEqual((fake.requests, fake.downloads), ([], []))
+
+    def test_an_offline_start_of_an_installed_model_imports_no_hub_client(self):
+        # As the launcher runs it for every start: the installer finds the
+        # model installed without httpx or the Hub's API, which only a
+        # request needs.
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        script = (
+            "import json, runpy, sys\n"
+            "try:\n"
+            "    runpy.run_path('install/models.py', run_name='__main__')\n"
+            "except SystemExit as end:\n"
+            "    print(json.dumps({'code': end.code, 'modules': sorted(sys.modules)}))\n"
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                script,
+                "--models",
+                str(self.root / "models"),
+                "--model",
+                MODEL,
+                "--language-only",
+                "prepare",
+            ],
+            cwd=Path(upstream.__file__).resolve().parents[1],
+            env={
+                "HOME": str(self.root),
+                "HF_HUB_OFFLINE": "1",
+                "HF_HUB_CACHE": str(self.cache),
+            },
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertIn("is already installed", result.stdout, result.stderr)
+        ended = json.loads(result.stdout.splitlines()[-1])
+        self.assertEqual(ended["code"], 0, result.stderr)
+        self.assertNotIn("httpx", ended["modules"])
+        self.assertNotIn("huggingface_hub.hf_api", ended["modules"])
 
     def test_new_commit_rejected_before_download_keeps_the_installed_one(self):
         fake = fake_hub(self, self.cache)
@@ -1882,6 +1949,24 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(self.remove(first), 0)
         self.assertEqual(blob_bytes(self.cache, MODEL), size)
 
+    def test_an_installations_vocabulary_is_its_drafts(self):
+        """The server builds its grammars' table of it before the engine is
+        Ready (server.main)."""
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        self.assertEqual(
+            assembly.vocabulary(chosen.link),
+            family_config(DENSE, "draft/config.json")["vocab_size"],
+        )
+        broken = self.root / "broken"
+        (broken / "draft").mkdir(parents=True)
+        for config in ("{", "{}", '{"vocab_size": "248320"}', '{"vocab_size": 0}'):
+            with self.subTest(config=config):
+                (broken / "draft/config.json").write_text(config)
+                with self.assertRaises(models.ModelError):
+                    assembly.vocabulary(broken)
+
     def test_a_recorded_path_that_climbs_out_of_its_snapshot_is_never_freed(self):
         fake = fake_hub(self, self.cache)
         chosen = selection(self.root)
@@ -1919,6 +2004,32 @@ class UpstreamTest(unittest.TestCase):
         self.prepare(plain)
         self.prepare(text_only)
         self.assertEqual(upstream._selections_of(plain), [text_only.link, plain.link])
+
+    def test_a_download_the_disk_has_no_room_for_is_refused_for_the_whole_model(self):
+        # The draft downloads first, and its check counts the target's files
+        # too: freeing what the refusal names is enough, so a second try
+        # does not stop again at the target. The error event says so in
+        # numbers, classed for the app.
+        fake = fake_hub(self, self.cache)
+        with mock.patch.object(hub, "_available_bytes", lambda path: 0):
+            status, events, _ = self.run_installer("prepare")
+        self.assertEqual(status, 1)
+        [event] = events
+        needed = event["needed"]
+        self.assertEqual(
+            {k: event[k] for k in ("event", "kind", "available")},
+            {"event": "error", "kind": "disk", "available": 0},
+        )
+        self.assertFalse([d for d in fake.downloads if d.endswith(".safetensors")])
+        draft = fake.remote / DENSE.draft_repo / DRAFT_COMMIT
+        self.assertGreater(
+            needed, sum(p.stat().st_size for p in draft.glob("*.safetensors"))
+        )
+        with mock.patch.object(hub, "_available_bytes", lambda path: needed - 1):
+            status, events, _ = self.run_installer("prepare")
+        self.assertEqual((status, events[0]["needed"]), (1, needed))
+        with mock.patch.object(hub, "_available_bytes", lambda path: needed):
+            self.assertEqual(self.run_installer("prepare")[0], 0)
 
     def test_the_remove_command_reports_the_bytes_freed(self):
         fake_hub(self, self.cache)

@@ -309,8 +309,9 @@ private:
   };
 
   // The host's one rule at its latest sample. Headroom h is the spare memory
-  // above the spare reserve, less what is being allocated and pool growth
-  // the host's counters do not show yet. The band begins when h falls below
+  // above the spare reserve, less what is being allocated: macOS's counters
+  // show a buffer as it is allocated (MetalBackend's residency set wires it).
+  // The band begins when h falls below
   // the margin M (kHostMarginBytes) or cannot be measured, and ends once h
   // clears M by the largest pool growth unit (or by what host-refused claims
   // wait for, if less: the band never holds them once h has room for them),
@@ -362,11 +363,6 @@ private:
   [[nodiscard]] std::optional<HostMemory> sampleHost() const noexcept;
   [[nodiscard]] uint64_t hostHeadroomBytes(const std::optional<HostMemory> &host,
                                            uint64_t reservedBytes) const noexcept;
-  // Of what pools grew within kHostSettleMilliseconds, what the host's
-  // reading `host` does not show yet: what the headroom has fallen since the
-  // growth does not cover (a store chunk's pages count only once experts load
-  // into it).
-  [[nodiscard]] uint64_t unseenGrowthBytes(const std::optional<HostMemory> &host) const noexcept;
   [[nodiscard]] MemoryGovernorSnapshot
   snapshot(const std::optional<HostMemory> &hostMemory, const HostRule &rule) const noexcept;
   void release(uint64_t bytes) noexcept;
@@ -396,13 +392,6 @@ private:
   // nothing to take (the band's waiver).
   double nextHostPassMilliseconds_ = 0.0;
   bool bandWaived_ = false;
-  // The latest control pass's clock, or the start growth's.
-  double clockMilliseconds_ = 0.0;
-  // Pools' growth the host's counters may not show yet (unseenGrowthBytes):
-  // its bytes, the host's raw headroom before it, and when it lapses.
-  uint64_t unseenGrowthBytes_ = 0;
-  uint64_t unseenGrowthHeadroom_ = 0;
-  double unseenGrowthUntilMilliseconds_ = 0.0;
 };
 
 // Connects an engine to the governor that admits its memory and whose ledger

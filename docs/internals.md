@@ -146,8 +146,8 @@ files they leave. A launcher run without writing bytecode (`-B` or
 `PYTHONDONTWRITEBYTECODE`) sets `PYTHONDONTWRITEBYTECODE=1` in its environment
 before `serve` starts anything, so the installer and the server write none
 either, nor do the server's PDF workers, which start with `-B` and no
-environment, and a packaged runtime inside a signed app never gains
-`__pycache__`.
+environment, and a packaged runtime inside a signed app gains no bytecode
+beside what it ships.
 
 `hub.Repository.resolve` alone decides whether a start asks the Hub
 ([Revisions](server.md#revisions)), each request within `hub.HUB_TIMEOUT`:
@@ -236,9 +236,13 @@ is checked first. A writer writes every byte of its image, zeroing alignment
 and padding, as a new buffer's contents are undefined. Writers read their
 sources uncached (`F_NOCACHE`), so the page cache keeps no second copy of the
 model, on a thread per core (`parallelFor`); a thread stages at most 4 MiB of a
-source at a time, and a GGUF image the rows of one repack, at most 32 MiB
-(`kGgufRepackStagingBytes`), for the `gguf_repack` kernel, which writes the
-planes into the image. Once an image is written, its writer checks that no
+source at a time (1 MiB of a repack's rows, `kChunkReadBytes`, so that a chunk
+keeps enough reads in flight for the disk's rate), and a GGUF image the rows of
+one chunk of a repack, at most 32 MiB (`kGgufRepackStagingBytes`), for the
+`gguf_repack` kernel, which writes
+the planes into the image. An image's writer holds two such stagings and
+stages the next chunk while the GPU writes the last (`pipelineChunks`), so its
+reads do not wait for the GPU. Once an image is written, its writer checks that no
 source file it read was written since it was opened
 (`WeightSource::checkUnchanged`), so a source changed in place fails the load
 instead of mixing two versions. A start logs `Weights loaded in N s.`; loading
@@ -637,7 +641,12 @@ The rules:
    of up to 32 rows of every family) and 32-row tiles beyond. One plan per
    step serves every block, so its router follows rule 3 in the format of
    most blocks' routers (`ops::moeRouterFormat`). Either tile's grouped rows
-   are the step's routes', packed (`ops::MoeScratch`).
+   are the step's routes', packed (`ops::MoeScratch`). With int8 activations
+   on, a prefill chunk whose dense projections run the
+   [int8-activation tile](#int8-activation-prefill) runs its experts there too
+   where every block's experts are resident and each projection's routed and
+   shared experts share a format the tile takes (`ops::moeInt8Experts`,
+   `MoeConfig::int8Passes`).
 5. *Attention.* The kernels follow how a layout reads its pages
    (`kv::Layout::reads`, below). A sequence of one tile, a decode lane's of
    up to 8 rows, takes one history split per 16 pages its rows read, between
@@ -1196,6 +1205,23 @@ rounded within the bf16 tile's error, also with an outlier input per row, and bo
 it adds over the bf16 tile on dense inputs at 1%, that a fused projection quantizes once and runs a
 GEMM per segment, and an up on its gate's codes bitwise its own run; `gguf-projection-benchmark`
 times it as `prefill int8`.
+
+A MoE target's experts run on the same tile in such a chunk where every block's experts are
+resident and each projection's routed and shared experts share af4g64 or af5g64
+(`ops::moeInt8Experts`; Qwen3.6-35B-A3B MLX 4-bit, not Flint's af3g64 nor a set
+with Q8_0 shared experts): `gguf_prefill_int8_quantize` rounds the chunk's MoE input rows once,
+`moe_gather_int8` copies each route's codes and scales into the grouping's tiles, and
+`moe_expert_int8_<format>_<gate|up|down>` (`kernels/shared/moe_int8.metal`) run the tile over them,
+each tile's expert reached as the staged passes reach it, with the SwiGLU intermediate rounded by the
+same rule before down. Decode steps, chunks of 64 rows or fewer (at 64 the int8 passes took the
+35B's chunk 5% longer on a 32-core M5 Max), streamed experts and other formats keep the staged
+tile. On the 35B MLX it takes a 2,048-row chunk 9% less time on a 32-core M5 Max and 11% on a
+20-core M5 Pro, 32K tokens of context 5% and 8%, a 128-row chunk the same. Against 1.7.0, whose dense
+projections already round, the next-token KL over 96 prefixes of six greedy transcripts is 1.3e-3
+(the same prefixes scored four at a time: 6.9e-4), the most likely token unchanged at every prefix;
+at 2K and 32K tokens of real text it is about that of a cache hit against a cold prefill (1.7e-2
+against 1.3e-2 at 2K, 6.7e-2 against 6.2e-2 at 32K), and a second turn does not add to it. The
+prefill arena holds the codes, 47 MB at 2,048 rows on the 35B.
 
 ## Sparse attention
 
@@ -2351,20 +2377,44 @@ Long prefill uses disposable rolling checkpoints every 4096 tokens; none is
 planned within one prefill chunk (2048 tokens) of where the request resumes or
 of its replay boundary. Each retires only once the next one or a junction is
 published, which takes its buffers, when memory refuses others, only after its
-command has completed: a request whose command is cancelled, expires or fails
-keeps it, and a retry resumes there. One only on the SSD retires when that
-state lands.
+command has completed. A checkpoint its command ended at the lane holds, its
+state still the lane's (`Engine::Request::heldCheckpoint`): its RAM copy is one
+a reclaim frees with no write, and refused RAM it has no other. The lane stores
+it only when it leaves it without a later boundary in its next command, the
+replay point aside, or stops at it (suspended, cancelled, refused or ended
+between commands): the RAM copy becomes one a reclaim writes, or the lane's
+state goes to the SSD. A later checkpoint replaces it with no write, so a long
+prompt at the memory wall, whose commands end at its checkpoints where
+streamed weights or spilled history group its chunks, writes only its last one:
+written at once, a 50,842-token prompt of Qwen3.6-35B-A3B at `--max-memory 10.3G`
+on a 16 GB M4 wrote 6 of 19.6 MiB, and their successors retired 5 unread. A
+request that stops between commands resumes, or its retry, from the state it
+stopped at; one whose command fails inside, or whose process dies, from the
+last state stored, which may be more than one command back. A state can be
+stored only at a planned boundary: a cached state needs the whole draft window
+up to it (`QwenStateStorage::validateLengths`), which the draft plan captures
+only before its boundaries (`planDraftContext`). One only on the SSD retires
+when the state after it lands.
 The last stays cached once the replay point is published: a later request that
 shares the prompt up to it, such as another conversation with the same long
 system prompt, resumes there instead of from the start. It stays only if the
 replay state fits beside it; refused memory, the replay state takes its buffers
-rather than another lane's checkpoint. With the SSD cache it costs a write as
+rather than another lane's checkpoint, and writes it to the SSD first when the
+cache has one and its staging buffer is free. With the SSD cache it costs a write as
 well: reclaim takes checkpoints first and writes the states it evicts to the
-SSD, this one too (47 MiB for 27B), and one published straight to the SSD,
-when no RAM slot took it, stays there. These writes draw on the SSD cache's
+SSD, this one too (47 MiB for 27B), and one the lane wrote to the SSD, when
+no RAM slot took it, stays there. These writes draw on the SSD cache's
 write budget when one is set, which drops them while it is spent, a suspended
 request's own too, and a full quota makes room for one by dropping the oldest
 copy, perhaps an older conversation's restore point.
+
+A prompt's head, a system prompt and tools the server finds as the template's
+first message (`head_tokens` in the request frame), gets an ordinary state at
+its end on first prefill when it lies at least a draft window past where the
+request resumes, as a junction must save that much. It is a junction from the
+start, which the keep rule never supersedes, so the next conversation sharing
+the head resumes there, from RAM, from the SSD after an eviction, or after a
+restart from its copy ahead, instead of prefilling the head again.
 
 A cached state holds a cached cell of the target's GDN state and the draft's
 context window, not the draft's rings. The cached cell
@@ -2868,11 +2918,11 @@ the one in flight (`MemoryLedger::copyDemand`), whether it wrote it, waited
 for it or passed over it; what leaves through a copy it has counts for
 nothing, nor does a state the idle staging buffer writes, which frees at
 once, so the copies stop once claims find what they take copied. Without
-that nothing is written ahead. A point that waits for demand keeps its turn
-while it stays its conversation's newest: a publication meanwhile drops the
-queued points their conversations went on from or that are gone
-(`Cache::newestPoint`), so that demand, once it comes, finds no backlog of
-superseded points. There a point also waits while it is in use, as its request
+that nothing is written ahead. A point that waits for demand is copied when
+its turn comes only if it is still what the tier brings back
+(`Cache::copiedAhead`): a conversation's newest point or a junction, and in a
+persistent tier the one behind the newest too, which a restart's regenerate
+resumes from; one the tier no longer copies by then is given up unwritten. There a point also waits while it is in use, as its request
 holds its chain and may go on from it, and its copies take only the room the
 quota has free beside the other copies and the commitments of Spill requests,
 giving up no copy: the redundant copies a full quota gives up first hold what

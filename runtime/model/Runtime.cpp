@@ -745,7 +745,7 @@ struct Runtime::Impl {
     // pricing its rows (CostLine), whose steps end at the classes' last rows.
     std::optional<std::pair<ops::MoeShape, uint32_t>> moe;
     if (geometry.target.ffnKind == QwenFfnKind::SparseMoe)
-      moe.emplace(geometry.target.moeBlockShape(), geometry.target.moeRouterFormat);
+      moe.emplace(geometry.target.moeShape(), geometry.target.moeRouterFormat);
     if (model.expertStore())
       mostStepRows = std::min(kDecodeStepRows, ExpertStore::cycleRows());
     stepClasses = operators.decodeRowClasses(mostStepRows, moe);
@@ -850,7 +850,7 @@ struct Runtime::Impl {
   }
 
   uint64_t embeddingBytes(const ImageSpan &span) const {
-    return uint64_t{ops::Vision::embeddingRows(span.grid())} *
+    return uint64_t{span.grid().mergedTokens()} *
            geometry.target.hiddenSize * sizeof(uint16_t);
   }
 
@@ -4456,6 +4456,11 @@ WarmupStepResult Runtime::warmupDecodeBatch(uint32_t width) {
   }
   return {"real B" + std::to_string(width) + " draft/verify/commit decode",
           wallSeconds, std::move(lanes)};
+}
+
+void Runtime::endWarmups() {
+  if (ExpertStore *store = impl_->model.expertStore())
+    store->forget();
 }
 
 WarmupStepResult Runtime::warmupCompositeStateRestore() {

@@ -226,8 +226,32 @@ NOTE_ALLOWANCE: dict[str, int] = {
     "dev/tests/engine/timing_profile_test.cpp": 1,
 }
 # runtime/engine's production lines: the budget only goes down, unless the
-# owner raises it.
-ENGINE_LINE_BUDGET = 30_594
+# owner raises it. 30,605: +11 for /status disk.off_reason (Cache.hpp 4,
+# RuntimeResources.mm 4, Status.cpp 3), the reason the SSD cache is off.
+# 30,632: +27 for what a request's start found in the cache, in usage
+# (Types.hpp 15: StateSource and StartFound; Protocol.hpp 4, Protocol.cpp 3:
+# the Start frame's three fields; Engine.cpp 4: filling them; NativeRuntime.cpp 1).
+# 30,643: +11 for /status disk.spilled_kv_read_bytes and
+# disk.weights_read_bytes (Status.cpp).
+# 30,691: +48 for a Background request held back 10 s being ordered as Normal
+# (Scheduler.cpp 33, Scheduler.hpp 12, Engine.cpp 3).
+# 30,692: +1 for the start ending its warmups (Bootstrap.mm).
+# 30,664: -28, the governor's term for growth the host does not show yet
+# (MemoryGovernor.cpp, MemoryGovernor.hpp), which counted nothing.
+# 30,676: +12 for the automatic budget's unwired tenth (MemoryPlan.hpp).
+# 30,739: +63 for what a conversation keeps and what a reclaim drops unwritten
+# (StateCache.cpp 83, StateCache.hpp 22; Cache.cpp -27, Cache.hpp -1,
+# WriteBehind.cpp -11, WriteBehind.hpp -1, Engine.cpp -2).
+# 30,772: +33 for copies ahead counted from a request's end (WriteBehind.hpp
+# 12, WriteBehind.cpp 9, Engine.cpp 8, StateCache.hpp 3, StateCache.cpp 1).
+# 30,792: +20 for copies ahead of what each tier brings back (StateCache.cpp
+# 10, Cache.hpp 5, StateCache.hpp 4, Cache.cpp 1).
+# 30,809: +17 for a state at the end of a prompt's head (Engine.cpp 5,
+# Protocol.hpp 4, Protocol.cpp 4, Types.hpp 3, NativeRuntime.cpp 1).
+# 30,900: +91 for rolling checkpoints written only where their lane stops
+# (Engine.cpp 55, Cache.hpp 10, StateCache.cpp 15, Engine.hpp 6,
+# StateCache.hpp 5).
+ENGINE_LINE_BUDGET = 30_900
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

@@ -50,6 +50,38 @@ void tickUntil(test::EngineHarness &h, double &now, const std::function<bool()> 
   now = h.now() + 1;
 }
 
+// A request for one token on a prompt whose last page ends inside its last message's end of turn, then the same
+// message typed on: the second resumes from the first's state in memory, at the last page before the end of turn.
+// The server counts that end of turn with the generation prompt (frontend._past_last_text), 2 tokens on Qwen's
+// templates, as the tokens no continuation shares; counted from the generation prompt alone (7), the state sat
+// past what the second request shares, and it prefilled from the start.
+void testATypedOnMessageResumesFromAOneTokenRead() {
+  constexpr uint32_t kEndOfTurn = 2, kGeneration = 7, kPage = KvCache::pageTokens;
+  test::EngineHarness h({.pages = 64});
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  // The page boundary below the generation prompt falls right after the message's text and its end of turn.
+  std::vector<uint32_t> read(10 * kPage + kGeneration);
+  std::iota(read.begin(), read.end(), 1);
+  EngineRequest first = request(1, read);
+  first.generationPromptTokens = kEndOfTurn + kGeneration;
+  first.maxNewTokens = 1;
+  engine.submit(std::move(first));
+  tickUntil(h, now, [&] { return idle(engine); }, "the read did not complete");
+  std::vector<uint32_t> typed(read.begin(), read.end() - kEndOfTurn - kGeneration);
+  typed.resize(typed.size() + 60, 900);
+  typed.resize(typed.size() + kEndOfTurn + kGeneration, 901);
+  EngineRequest second = request(2, typed);
+  second.generationPromptTokens = kEndOfTurn + kGeneration;
+  engine.submit(std::move(second));
+  tickUntil(h, now, [&] { return idle(engine); }, "the typed-on message did not complete");
+  const uint32_t resumed = (static_cast<uint32_t>(read.size()) - kEndOfTurn - kGeneration) / kPage * kPage;
+  require(events.starts.back() == resumed, "the typed-on message resumed from " +
+                                               std::to_string(events.starts.back()) + ", not " +
+                                               std::to_string(resumed));
+}
+
 void testConcurrentColdPrefixesComputeOnce() {
   test::EngineHarness h({.pages = 64});
   Executor &model = h.model;
@@ -425,8 +457,15 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
   h.runUntilIdle();
   engine.submit(request(2, branch(6400, 900'000)));
   h.runUntilIdle();
-  require(test::evictStep(resources).gave() &&
-              resources.snapshot().stateCache.checkpointEntries == 0,
+  // The checkpoint leaves alone: an eviction would take the producer's resume point first, which the other
+  // conversation's replay point below it supersedes.
+  {
+    const CacheLookup checkpoint = resources.lookup(std::span(prompt).first(4097), {});
+    require(checkpoint.state && checkpoint.state->boundary() == 4096, "the other conversation left no checkpoint");
+    const uint64_t block = checkpoint.state->kvBlock();
+    resources.invalidateState(block);
+  }
+  require(resources.snapshot().stateCache.checkpointEntries == 0,
           "the other conversation's checkpoint was not evicted");
   engine.submit(request(3, prompt));
   double now = 1;
@@ -986,6 +1025,204 @@ void testEndedReplyKeepsItsLastCheckpoint() {
   }
 }
 
+// Four conversations served turn by turn at a budget that holds the states of about two: a reply's capture takes
+// only buffers that are free, so no other conversation's kept point is pushed out to the SSD for a reply, and each
+// turn resumes at its prompt's replay point at least, reading the reply before it again where that reply got no
+// state.
+void testFourConversationsKeepEachOthersPoints() {
+  test::EngineHarness h({.pages = 1024, .pageBytes = 2, .tier = test::TierOptions{.capacity = 256, .transferLimit = 8},
+                         .memory = test::FakeMemory::Config{}, .limits = {.limitBytes = 600}});
+  h.model.offloadTier = std::make_shared<OffloadControl>();
+  h.model.offloadTier->ready = true;
+  h.model.restoreControl->ready = true;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  std::array<std::vector<uint32_t>, 4> prompts;
+  std::array<uint32_t, 4> replayPoints{};
+  for (uint32_t conversation = 0; conversation < 4; ++conversation) {
+    prompts[conversation].resize(97);
+    std::iota(prompts[conversation].begin(), prompts[conversation].end(), 1000 * (conversation + 1));
+  }
+  std::string missed;
+  uint64_t id = 0;
+  for (uint32_t turn = 1; turn <= 4; ++turn)
+    for (uint32_t conversation = 0; conversation < 4; ++conversation) {
+      std::vector<uint32_t> &prompt = prompts[conversation];
+      engine.submit(conversationTurn(++id, prompt, 70));
+      tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+      if (turn > 1 && events.starts.back() < replayPoints[conversation])
+        missed += " conversation " + std::to_string(conversation) + " turn " + std::to_string(turn) + " at " +
+                  std::to_string(events.starts.back()) + " not " + std::to_string(replayPoints[conversation]) + ";";
+      replayPoints[conversation] = static_cast<uint32_t>(prompt.size() - 7) / KvCache::pageTokens * KvCache::pageTokens;
+      prompt = nextTurn(prompt, 70);
+    }
+  require(!h.cache.snapshot().stateCache.promotions, "a conversation's kept point went to the SSD for another's reply");
+  require(missed.empty(), "a turn resumed before its prompt's replay point:" + missed);
+}
+
+// A conversation that renders its replies back, three turns with an SSD tier: a reclaim of every state not in use
+// writes only the conversation's newest point, its last reply's state, and the point before it, the last prompt's
+// replay point that a regenerate resumes from (StateCache::kKeptBehind); the fourth turn resumes at the newest from
+// the disk. Its earlier points go unwritten: before, a reclaim wrote the three prompts' replay points and dropped
+// the replies' states, so the fourth turn resumed at its prompt's last replay point and read the third reply
+// again.
+void testAReclaimWritesNoSupersededPoint() {
+  test::EngineHarness h({.pages = 64, .tier = test::TierOptions{.capacity = 64, .transferLimit = 8}});
+  h.model.offloadTier = std::make_shared<OffloadControl>();
+  h.model.offloadTier->ready = true;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  std::vector<uint32_t> prompt(97);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  for (uint64_t turn = 1; turn <= 3; ++turn) {
+    engine.submit(conversationTurn(turn, prompt, 70));
+    tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+    prompt = nextTurn(prompt, 70);
+  }
+  const StateCacheSnapshot before = h.cache.snapshot().stateCache;
+  // One state write at a time: each lands before the next reclaim.
+  for (uint32_t step = 0; step < 8; ++step) {
+    reclaimUpToInUse(h.cache);
+    static_cast<void>(h.cache.pollTransfers());
+  }
+  const StateCacheSnapshot after = h.cache.snapshot().stateCache;
+  require(after.offloads - before.offloads == 1 + StateCache::kKeptBehind,
+          "a reclaim wrote " + std::to_string(after.offloads - before.offloads) +
+              " states, not the newest and the points it keeps behind it");
+  h.model.restoreControl->ready = true;
+  engine.submit(conversationTurn(4, prompt, 1));
+  tickUntil(h, now, [&] { return idle(engine); }, "the fourth turn did not complete");
+  const uint32_t replyEnd = static_cast<uint32_t>(prompt.size() - 41) / KvCache::pageTokens * KvCache::pageTokens;
+  require(events.starts.back() == replyEnd,
+          "the fourth turn resumed from " + std::to_string(events.starts.back()) + ", not " + std::to_string(replyEnd));
+}
+
+// With a persistent tier, a turn's two kept points, its prompt's replay point and the reply's state after it,
+// are copied ahead the delay after the request ends (WriteBehind::ended), both of them: a restart then finds the
+// point a regenerate of the last turn resumes from. Neither is copied sooner, as another request steps the engine,
+// though the replay point was published longer than the delay before the request ended.
+void testATurnsKeptPointsAreCopiedTheDelayAfterItEnds() {
+  constexpr double kDelay = WriteBehind::kDelayMilliseconds;
+  test::EngineHarness h({.pages = 512, .tier = test::TierOptions{.capacity = 512, .transferLimit = 8, .bytesPerMillisecond = 1e6, .persistent = true}});
+  h.model.offloadTier = std::make_shared<OffloadControl>();
+  h.model.offloadTier->ready = true;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  std::vector<uint32_t> prompt(WriteBehind::kMinimumTokens + 200);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  // Turns whose deadlines lie past the delays the test waits.
+  const auto turn = [&](uint64_t id, const std::vector<uint32_t> &tokens) {
+    EngineRequest result = conversationTurn(id, tokens, 70);
+    result.deadlineMilliseconds = now + 10 * kDelay;
+    return result;
+  };
+  engine.submit(turn(1, prompt));
+  tickUntil(h, now, [&] { return idle(engine); }, "the first turn did not complete");
+  now += 2 * kDelay;
+  tickUntil(h, now, [&] { return !engine.snapshot().writeBehind.waiting; }, "the first turn's point was not settled");
+  const uint64_t durable = engine.snapshot().writeBehind.durable;
+  // The second turn renders the reply back; its decode outlasts the delay.
+  engine.submit(turn(2, nextTurn(prompt, 70)));
+  tickUntil(h, now, [&] { return events.outputs[2].size() >= 10; }, "the second turn did not decode");
+  now += kDelay + 5000;
+  tickUntil(h, now, [&] { return idle(engine); }, "the second turn did not complete");
+  const double ended = h.now();
+  const uint32_t demotions = h.tier->demotions;
+  // Another conversation's short request a second later steps the engine within the delay.
+  now = ended + 1000;
+  engine.submit(turn(3, std::vector<uint32_t>(97, 3)));
+  tickUntil(h, now, [&] { return idle(engine); }, "the other request did not complete");
+  require(h.now() < ended + kDelay && h.tier->demotions == demotions && engine.snapshot().writeBehind.waiting == 2,
+          "a point of the turn was copied before the delay after its end, or was not waiting for it");
+  now = ended + kDelay + 1;
+  tickUntil(h, now, [&] { return !engine.snapshot().writeBehind.waiting; }, "the turn's points were not copied");
+  require(engine.snapshot().writeBehind.durable == durable + 2,
+          "the delay after the turn copied " + std::to_string(engine.snapshot().writeBehind.durable - durable) +
+              " points, not its replay point and its reply's state");
+}
+
+// A conversation whose prompt starts with a head of 3,000 tokens, a system prompt and tools the server marks
+// (headTokens), keeps a state at the head's end, a junction: the next conversation sharing the head resumes there on
+// first use, and with a persistent tier the state is copied ahead, for a restart. Before, only the second
+// conversation's own junction served a third, and the second prefilled from the start. A prompt without a head,
+// or with one shorter than the draft window a state's capture costs (kMinimumJunctionGain), keeps none.
+void testASecondConversationResumesAtASharedHead() {
+  constexpr double kDelay = WriteBehind::kDelayMilliseconds;
+  for (const uint32_t headTokens : {3000U, 0U, 1024U}) {
+    test::EngineHarness h({.pages = 1024,
+                           .tier = test::TierOptions{.capacity = 1024, .transferLimit = 8,
+                                                     .bytesPerMillisecond = 1e6, .persistent = true}});
+    h.model.offloadTier = std::make_shared<OffloadControl>();
+    h.model.offloadTier->ready = true;
+    Events &events = h.events;
+    engine::Engine &engine = h.engine;
+    double now = 1;
+    const auto conversation = [&](uint64_t id, uint32_t seed) {
+      std::vector<uint32_t> prompt(3000);
+      std::iota(prompt.begin(), prompt.end(), 1);
+      prompt.resize(prompt.size() + 1500, seed);
+      EngineRequest result = conversationTurn(id, prompt, 8);
+      result.headTokens = headTokens;
+      result.deadlineMilliseconds = now + 10 * kDelay;
+      return result;
+    };
+    engine.submit(conversation(1, 20'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the first conversation did not complete");
+    now += 2 * kDelay;
+    tickUntil(h, now, [&] { return !engine.snapshot().writeBehind.waiting; }, "the first conversation's points waited");
+    const bool kept = headTokens >= model::ExecutionLimits::draftContextTokens;
+    require(engine.snapshot().writeBehind.durable == (kept ? 2U : 1U),
+            "head " + std::to_string(headTokens) + ": " + std::to_string(engine.snapshot().writeBehind.durable) +
+                " points copied ahead, not the replay point" + (kept ? " and the head" : ""));
+    engine.submit(conversation(2, 30'000));
+    tickUntil(h, now, [&] { return idle(engine); }, "the second conversation did not complete");
+    const uint32_t head = kept ? headTokens / KvCache::pageTokens * KvCache::pageTokens : 0;
+    require(events.starts.back() == head, "head " + std::to_string(headTokens) +
+                                              ": the second conversation resumed from " +
+                                              std::to_string(events.starts.back()) + ", not " + std::to_string(head));
+  }
+}
+
+// A conversation that renders its replies back, three turns with an SSD tier: a reclaim of every state not in use
+// drops the points two turns behind and writes the last turn's prompt-end, the point behind the newest
+// (StateCache::kKeptBehind), so a regenerate of the last answer resumes there, from the SSD. Keeping the newest point
+// alone, the regenerate resumed at the reply before and read the last prompt's own text again.
+void testARegenerateAfterAReclaimResumesAtItsPromptEnd() {
+  test::EngineHarness h({.pages = 64, .tier = test::TierOptions{.capacity = 64, .transferLimit = 8}});
+  h.model.offloadTier = std::make_shared<OffloadControl>();
+  h.model.offloadTier->ready = true;
+  h.model.decodeFinishes = false;
+  Events &events = h.events;
+  engine::Engine &engine = h.engine;
+  double now = 1;
+  std::vector<uint32_t> prompt(97);
+  std::iota(prompt.begin(), prompt.end(), 1);
+  std::vector<uint32_t> last;
+  for (uint64_t turn = 1; turn <= 3; ++turn) {
+    engine.submit(conversationTurn(turn, prompt, 70));
+    tickUntil(h, now, [&] { return idle(engine); }, "the turn did not complete");
+    last = prompt;
+    prompt = nextTurn(prompt, 70);
+  }
+  for (uint32_t step = 0; step < 8; ++step) {
+    reclaimUpToInUse(h.cache);
+    static_cast<void>(h.cache.pollTransfers());
+  }
+  require(!h.cache.snapshot().stateCache.bytes, "a state stayed in RAM past the reclaim");
+  h.model.restoreControl->ready = true;
+  engine.submit(conversationTurn(4, last, 1));
+  tickUntil(h, now, [&] { return idle(engine); }, "the regenerate did not complete");
+  const uint32_t replay = static_cast<uint32_t>(last.size() - 7) / KvCache::pageTokens * KvCache::pageTokens;
+  require(events.starts.back() == replay, "the regenerate after the reclaim resumed from " +
+                                              std::to_string(events.starts.back()) + ", not " + std::to_string(replay));
+}
+
 // A finished request's KV holds part of the budget, so a later request's KV
 // meets the wall as it grows, where each wall test's budget puts it; captured
 // states are OffloadStates from then on, which reclaim may write to the SSD
@@ -1062,8 +1299,10 @@ void testCompletedReplyStateIsDroppedAtTheWall() {
 // 4,320 after a reclaim, restored from the SSD tier; so does turn 3, for
 // turn 4 at 6,464. A turn 2 that renders turn 1's reply otherwise leaves
 // its own opportunistic: after a reclaim turn 3 resumes from its replay
-// point at 2,208. Turns of 70 tokens keep none: after turn 2 resumed at 160,
-// a reclaim sends turn 3 to its replay point at 192.
+// point at 2,208. Turns of 70 tokens keep theirs too, whatever the reply's
+// length: after turn 2 resumed at 160, turn 3 resumes at its reply's end at
+// 256 after a reclaim, which wrote that state and dropped the replay points
+// it supersedes.
 void testRepliesAreKeptOnceAConversationRendersThemBack() {
   const auto starts = [](uint32_t output, std::vector<bool> reclaimAfter, bool otherwise = false) {
     test::EngineHarness h({.pages = 512});
@@ -1101,8 +1340,8 @@ void testRepliesAreKeptOnceAConversationRendersThemBack() {
           "a reclaim dropped the reply's state of a turn that resumed through a kept one");
   require(starts(2100, {false, true}, true) == Starts{0, 64, 2208},
           "a reclaim wrote the reply's state of a turn that rendered the reply before it otherwise");
-  require(starts(70, {false, true}) == Starts{0, 160, 192},
-          "a reclaim wrote the state of a reply too short to be worth a write");
+  require(starts(70, {false, true}) == Starts{0, 160, 256},
+          "a reclaim dropped the reply's state of a short reply that its conversation renders back");
 }
 
 // A capture at a page that holds a checkpoint already reuses it as it is: a
@@ -2488,6 +2727,12 @@ std::span<const test::TestCase> requestsTests() {
       {"testPreemptedReplyCheckpointIsDropped", testPreemptedReplyCheckpointIsDropped},
       {"testRunningReplyCheckpointIsDropped", testRunningReplyCheckpointIsDropped},
       {"testEndedReplyKeepsItsLastCheckpoint", testEndedReplyKeepsItsLastCheckpoint},
+      {"testAReclaimWritesNoSupersededPoint", testAReclaimWritesNoSupersededPoint},
+      {"testATypedOnMessageResumesFromAOneTokenRead", testATypedOnMessageResumesFromAOneTokenRead},
+      {"testARegenerateAfterAReclaimResumesAtItsPromptEnd", testARegenerateAfterAReclaimResumesAtItsPromptEnd},
+      {"testATurnsKeptPointsAreCopiedTheDelayAfterItEnds", testATurnsKeptPointsAreCopiedTheDelayAfterItEnds},
+      {"testFourConversationsKeepEachOthersPoints", testFourConversationsKeepEachOthersPoints},
+      {"testASecondConversationResumesAtASharedHead", testASecondConversationResumesAtASharedHead},
       {"testReplyCheckpointsAreNotWrittenAtTheWall", testReplyCheckpointsAreNotWrittenAtTheWall},
       {"testCompletedReplyStateIsDroppedAtTheWall", testCompletedReplyStateIsDroppedAtTheWall},
       {"testRepliesAreKeptOnceAConversationRendersThemBack", testRepliesAreKeptOnceAConversationRendersThemBack},

@@ -64,9 +64,13 @@ void validate(const BlockMoeWeights &weights, MoeShape shape) {
     throw std::invalid_argument("MoE expert chunks were checked for another block");
 }
 
-MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows) {
+MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows, bool int8Passes) {
   if (!shape.valid())
     throw std::invalid_argument("invalid MoE workspace shape");
+  // The int8 passes write the gate's rows into the expert output, sized for
+  // the routes' rows of the hidden size (addInt8Experts).
+  if (int8Passes && shape.expertIntermediateSize > shape.hiddenSize)
+    throw std::invalid_argument("MoE int8 passes need an expert intermediate no wider than the hidden size");
   const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
   const uint32_t tiles = moeMaximumTiles(rows, shape, tileRows);
   // A grouped row per route; the grouped input and the intermediate, which
@@ -76,12 +80,21 @@ MoeWorkspace workspaceFor(MoeShape shape, uint32_t rows, uint32_t tileRows) {
   // The router's fp32 scores, a row of routerWidth() expert slots per row,
   // live in the grouped input until the gather overwrites them.
   const uint64_t scoreBytes = uint64_t{rows} * shape.routerWidth() * sizeof(float);
+  // The int8 passes' codes, a byte an input, and scales, a float2 per 64
+  // inputs: the chunk's rows of the hidden size, and the grouped rows of the
+  // larger of it and the intermediate size, the gate/up input's then down's.
+  const uint64_t widest = std::max(shape.hiddenSize, shape.expertIntermediateSize);
+  const auto scales = [](uint64_t rows, uint64_t width) { return rows * (width / GGUF_PREFILL_INT8_GROUP) * 8; };
   return {routes * sizeof(uint32_t), routes * sizeof(float),
           uint64_t{tiles} * sizeof(MoeTileDescriptor), sizeof(MoeTileCount),
           routes * sizeof(uint32_t), routes * sizeof(uint32_t), uint64_t{shape.experts} * sizeof(uint32_t),
           std::max(tableBytes(shape.hiddenSize, matmulRows), scoreBytes),
           matmulRows * shape.expertIntermediateSize * sizeof(uint16_t),
-          routes * shape.hiddenSize * sizeof(uint16_t)};
+          routes * shape.hiddenSize * sizeof(uint16_t),
+          int8Passes ? uint64_t{rows} * shape.hiddenSize : 0,
+          int8Passes ? scales(rows, shape.hiddenSize) : 0,
+          int8Passes ? matmulRows * widest : 0,
+          int8Passes ? scales(matmulRows, widest) : 0};
 }
 
 // The shape's compiled routing (MoeShape::compiledRouting).
@@ -165,7 +178,7 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
 
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config)
     : shape_(shape), rows_(rows), config_(config) {
-  workspace_ = workspaceFor(shape, rows, tileRows());
+  workspace_ = workspaceFor(shape, rows, tileRows(), config.int8Passes);
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
 
@@ -194,6 +207,59 @@ void addGather(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoeP
              scratch.tileCount, scratch.groupedInput},
             MoeGatherParams{shape.hiddenSize, shape.routesPerToken()},
             {plan.maximumTiles(), shape.hiddenSize / 256, 1});
+}
+
+// Whether a projection's routed and shared segments both take the int8
+// tile in one format: its suffix (af4g64, af5g64), or nothing.
+std::string_view int8Format(const BlockExpertProjection &p) {
+  if (p.routed.formatId != p.shared.formatId || !quant_prefill_int8_format(p.routed.formatId)) return {};
+  return p.routed.formatId == GGUF_FMT_AF4G64 ? "af4g64" : "af5g64";
+}
+
+// A resident block's passes on int8 activations (MoeConfig::int8Passes):
+// the chunk's input rows quantized as the dense prefill quantizes them (per
+// row and 64 inputs), their codes and scales gathered by route, the gate into
+// expertOutput, up times the gate's SiLU into expertIntermediate (both bf16,
+// as the staged gate/up pass rounds them), the intermediate quantized into
+// the grouped codes the gate and up passes have read, and down into
+// expertOutput, which the combine reads.
+void addInt8Experts(metal::CommandGraph &graph, const MoeBuffers &buffers, const BlockMoeWeights &weights,
+                    const MoePlan &plan) {
+  const MoeShape shape = plan.shape();
+  const MoeScratch &scratch = buffers.scratch;
+  const uint32_t rows = plan.rows(), hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
+  // The grouped rows, a route each, and the tileRows - 1 a last tile may
+  // read past them.
+  const uint32_t routes = static_cast<uint32_t>(plan.workspace().groupedRoutesBytes / sizeof(uint32_t));
+  const uint32_t storage = routes + plan.tileRows() - 1;
+  const auto quantize = [&](const metal::MetalBuffer &input, const metal::MetalBuffer &codes,
+                            const metal::MetalBuffer &scales, uint32_t k, uint32_t quantized, uint32_t stride) {
+    const uint32_t groups = k / GGUF_PREFILL_INT8_GROUP;
+    graph.add("gguf_prefill_int8_quantize", {input, codes, scales}, GgufPrefillInt8QuantizeParams{k, quantized, stride},
+              {(groups + GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS - 1) / GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS, quantized, 1},
+              {GGUF_PREFILL_INT8_QUANTIZE_SIMDGROUPS * 32, 1, 1});
+  };
+  quantize(buffers.input, scratch.inputCodes, scratch.inputScales, hidden, rows, rows);
+  graph.add("moe_gather_int8",
+            {scratch.inputCodes, scratch.inputScales, scratch.groupedRoutes, scratch.tileDescriptors,
+             scratch.tileCount, scratch.groupedCodes, scratch.groupedScales},
+            MoeGatherInt8Params{hidden, shape.routesPerToken(), rows, storage},
+            {plan.maximumTiles(), hidden / 256, 1});
+  const std::string slices(compiledRouting(shape).slicesSuffix);
+  const auto pass = [&](const char *name, const BlockExpertProjection &p, uint32_t k, uint32_t n,
+                        const metal::MetalBuffer &output, const metal::MetalBuffer &aux) {
+    graph.add(std::string("moe_expert_int8_") + std::string(int8Format(p)) + "_" + name + slices,
+              {scratch.groupedCodes, scratch.groupedScales, scratch.tileDescriptors, scratch.tileCount,
+               p.shared.plane0, p.shared.plane1Slot(), p.shared.meta, output, aux, weights.slotTable},
+              MoeInt8ExpertParams{k, n, shape.experts, p.routed.formatId, p.shared.formatId,
+                                  weights.chunks.floorSlots(), weights.chunks.chunkSlots(), MOE_TILES_ALL, storage},
+              {n / GGUF_TILE_COLUMNS, plan.maximumTiles(), 1}, {GGUF_PREFILL_INT8_THREADS, 1, 1});
+    graph.addresses(weights.chunks.planes());
+  };
+  pass("gate", weights.gate, hidden, intermediate, scratch.expertOutput, scratch.expertOutput);
+  pass("up", weights.up, hidden, intermediate, scratch.expertIntermediate, scratch.expertOutput);
+  quantize(scratch.expertIntermediate, scratch.groupedCodes, scratch.groupedScales, intermediate, routes, storage);
+  pass("down", weights.down, intermediate, hidden, scratch.expertOutput, scratch.expertOutput);
 }
 
 void addCombine(metal::CommandGraph &graph, const MoeBuffers &buffers, const MoePlan &plan) {
@@ -262,6 +328,9 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
   const MoeGroupParams group = groupParams(plan, weights);
   if (weights.stream) {
     addExperts(graph, buffers.scratch, weights, weights.loadSlotTable, plan, group, MOE_TILES_LOADED);
+  } else if (plan.configuration().int8Passes && !buffers.lanes && !int8Format(weights.gate).empty() &&
+             !int8Format(weights.up).empty() && !int8Format(weights.down).empty()) {
+    addInt8Experts(graph, buffers, weights, plan);
   } else {
     addGather(graph, buffers, plan);
     addExperts(graph, buffers.scratch, weights, weights.slotTable, plan, group, MOE_TILES_ALL);

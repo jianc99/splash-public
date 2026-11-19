@@ -4,14 +4,22 @@ import threading
 from concurrent.futures import Future, wait
 
 from llguidance import LLMatcher, LLTokenizer
-from llguidance.hf import from_tokenizer as guidance_tokenizer
 from llguidance.numpy import allocate_token_bitmask, fill_next_token_bitmask
 
-from .chat_format import THINK_END, THINK_START, TOOL_CALL_OPEN
+from .chat_format import THINK_END, THINK_START, TOOL_CALL_CLOSE, TOOL_CALL_OPEN
 from .errors import APIError, ConstraintError
 from .lru import LRUCache
 from .protocol import NO_PARENT
 from .tokenization import added_tokens
+
+
+def guidance_tokenizer(tokenizer, **options):
+    """llguidance's table of a fast tokenizer (llguidance.hf.from_tokenizer).
+    Imported when a table is built: llguidance.hf imports transformers, which
+    the server imports only once its engine has started (server.main)."""
+    from llguidance.hf import from_tokenizer
+
+    return from_tokenizer(tokenizer, **options)
 
 
 class TokenConstraint:
@@ -151,8 +159,8 @@ def validate_tokenizer(tokenizer, chat_format):
     """Before the engine starts, refuse a tokenizer that does not encode the
     tags chat_format reads the model's output by as that format has them:
     the close of thinking, the model's own opening of it where the model
-    opens it, and a call's opening must each be the format's token, and
-    each stop text one token (check_capabilities checks which stop tokens,
+    opens it, and a call's opening and close must each be the format's
+    token, and each stop text one token (check_capabilities checks which stop tokens,
     once the engine names them). Refuse too one whose added tokens the
     server could not keep out of the text a client sent
     (tokenization.added_tokens), which would serve a prompt that quotes a tag
@@ -165,6 +173,7 @@ def validate_tokenizer(tokenizer, chat_format):
     expected = {
         THINK_END: chat_format.think_end_id,
         TOOL_CALL_OPEN: chat_format.call_open_id,
+        TOOL_CALL_CLOSE: chat_format.call_close_id,
     }
     if chat_format.think_start_id is not None:
         expected[THINK_START] = chat_format.think_start_id
@@ -182,6 +191,15 @@ def validate_tokenizer(tokenizer, chat_format):
             )
 
 
+def stop_token_ids(tokenizer, chat_format):
+    """The tokens the tokenizer encodes the chat format's stop texts as, one
+    each (validate_tokenizer), which the engine's Ready must state too."""
+    return tuple(
+        tokenizer.encode(stop, add_special_tokens=False)[0]
+        for stop in chat_format.stop_tokens
+    )
+
+
 def check_capabilities(tokenizer, chat_format, ready):
     """Once the engine is Ready, refuse a tokenizer that does not fit what it
     serves: its vocabulary must fit the engine's, its stop texts encode as
@@ -195,10 +213,7 @@ def check_capabilities(tokenizer, chat_format, ready):
         raise TokenizerContractError(
             "tokenizer vocabulary does not fit the native model"
         )
-    stops = tuple(
-        tokenizer.encode(stop, add_special_tokens=False)[0]
-        for stop in chat_format.stop_tokens
-    )
+    stops = stop_token_ids(tokenizer, chat_format)
     if sorted(stops) != sorted(ready.stop_token_ids):
         raise TokenizerContractError(
             f"the tokenizer encodes the stop texts {chat_format.stop_tokens} as "
@@ -233,16 +248,32 @@ class ConstraintFactory:
     CACHE_SIZE = 32
     CACHE_SOURCE_BYTES = 8 * 1024 * 1024
 
-    def __init__(self, tokenizer, ready):
-        # The engine's Ready, whose vocabulary, stop tokens and mask rows its
-        # constraints are sized by.
-        self.ready = ready
-        self.tokenizer = guidance_tokenizer(
+    @staticmethod
+    def table(tokenizer, chat_format, vocabulary):
+        """llguidance's table of `tokenizer`, which every grammar's masks
+        cover: the installation's `vocabulary` (assembly.vocabulary) and the
+        chat format's stop tokens. The server builds it while the engine
+        loads its weights (server.main), where it took 0.82 s after Ready on
+        a 32-core M5 Max; the factory checks it against the Ready."""
+        return guidance_tokenizer(
             tokenizer,
-            n_vocab=ready.vocabulary_size,
-            eos_token=list(ready.stop_token_ids),
+            n_vocab=vocabulary,
+            eos_token=list(stop_token_ids(tokenizer, chat_format)),
             slices=LLTokenizer.json_slices(),
         )
+
+    def __init__(self, table, ready):
+        # The engine's Ready, whose vocabulary, stop tokens and mask rows its
+        # constraints are sized by, and the table built before it (table),
+        # which must cover that vocabulary; its stop tokens are those
+        # check_capabilities found the Ready's.
+        if table.vocab_size != ready.vocabulary_size:
+            raise TokenizerContractError(
+                f"the grammars' table covers {table.vocab_size} tokens, but the "
+                f"native model serves {ready.vocabulary_size}"
+            )
+        self.ready = ready
+        self.tokenizer = table
         # Compiled matchers by grammar, within a budget of grammar bytes.
         self.cache = LRUCache(self.CACHE_SOURCE_BYTES, self.CACHE_SIZE)
         self.lock = threading.Lock()

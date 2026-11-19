@@ -231,7 +231,7 @@ def visible_outside_calls(text):
 
 
 class SeededRandomChunkStreamer(PassthroughStreamer):
-    def __init__(self, tokenizer, callback, *args):
+    def __init__(self, tokenizer, callback, *args, **options):
         super().__init__(tokenizer, callback)
         self.random = random.Random(20260821)
 
@@ -430,6 +430,33 @@ class PartialToolOutputTests(unittest.TestCase):
             for size in range(1, len(text) + 1):
                 with self.subTest(tool_calls=tool_calls, size=size):
                     splitter = model_output.ReasoningSplitter(True, tool_calls, QWEN)
+                    parts = [
+                        part
+                        for offset in range(0, len(text), size)
+                        for part in splitter.put(text[offset : offset + size])
+                    ]
+                    parts += splitter.finish()
+                    self.assertEqual(
+                        [
+                            "".join(value for kind, value in parts if kind == field)
+                            for field in ("reasoning_content", "content")
+                        ],
+                        expected,
+                    )
+
+    def test_tags_that_open_nothing_stay_reasoning_however_the_text_is_cut(self):
+        # A call tag without a call's opening after it, and a second <think>,
+        # are reasoning text.
+        for text, expected in (
+            (
+                "Quoting <tool_call> here.</think>\n\nanswer",
+                ["Quoting <tool_call> here.", "answer"],
+            ),
+            ("<think>abc</think>answer", ["<think>abc", "answer"]),
+        ):
+            for size in range(1, len(text) + 1):
+                with self.subTest(text=text, size=size):
+                    splitter = model_output.ReasoningSplitter(True, True, QWEN)
                     parts = [
                         part
                         for offset in range(0, len(text), size)

@@ -71,6 +71,7 @@ public:
   warmupDecodeBatch(uint32_t width) override;
   [[nodiscard]] WarmupStepResult
   warmupCompositeStateRestore() override;
+  void endWarmups() override;
   [[nodiscard]] ModelMemoryActual
   actualRuntimeMemory() const override;
 

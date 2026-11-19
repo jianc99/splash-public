@@ -10,8 +10,9 @@
 // experts outlive long chunks of other blocks; the union of a block's steps
 // loads at once, the steps sharing their expert passes' scratch as a prefill
 // group's chunks do; a size of one block holds every expert, through a release
-// and a restore; long chunks load in rounds through half the staging, also
-// across a release while the next block's experts are read ahead, and so
+// and a restore and a forget, which drops the streamed experts alone; long
+// chunks load in rounds through half the staging, also across a release
+// while the next block's experts are read ahead, and so
 // does a decode step of four lanes of 16 rows after a release; a read
 // ahead that fails fails no load that does not route its expert, a read of a
 // routed expert that fails fails the load, and a source written since it was
@@ -681,13 +682,20 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
     uint32_t block;
     const StepPlan *plan;
     bool restores; // after a release and a restore of the store
-  } steps[] = {{0, &chunk, false}, {2, &chunk, false}, {2, &decode, false},
-               {1, &chunk, false}, {2, &chunk, true},  {0, &decode, false}};
+    bool forgets;  // after the store forgot its streamed experts
+  } steps[] = {{0, &chunk, false, false}, {2, &chunk, false, false}, {2, &decode, false, false},
+               {1, &chunk, false, false}, {2, &chunk, true, false},  {0, &decode, false, false},
+               {0, &decode, false, true}, {2, &decode, false, true}};
   for (const Step &step : steps) {
     if (step.restores) {
       store.release();
       require(store.restore(splash::test::admitAll) && store.stats().resident == shape.experts,
               "a restored store does not hold every expert of a size of one block");
+    }
+    if (step.forgets) {
+      store.forget();
+      require(store.stats().resident == shape.experts,
+              "a store that forgot its streamed experts holds one, or not every expert of a size of one block");
     }
     const Model &m = step.block == 2 ? head : trunk;
     Buffers b;
@@ -696,23 +704,26 @@ int streamedLoneBlockSize(MetalBackend &backend, const MoeShape &shape, const st
     const ExpertStoreStats before = store.stats();
     const std::vector<uint16_t> got = runWeights(backend, streamed[step.block], b, *step.plan);
     const ExpertStoreStats after = store.stats();
-    uint64_t hostSteps = 0, read = 0;
+    uint64_t hostSteps = 0, read = 0, routed = 0;
     for (size_t use = 0; use < 2; ++use) {
       hostSteps += after.uses[use].pickup.count - before.uses[use].pickup.count;
       read += after.uses[use].read - before.uses[use].read;
+      routed += after.uses[use].routed - before.uses[use].routed;
     }
+    // A streamed block's step after the store forgot reads every expert it
+    // routes, though the step before routed them too.
     if (got != want || !slotsHoldTheirExperts(m, streamed[step.block], b, step.plan->plan) ||
         hostSteps != (step.block == 2 ? 0 : loadSteps(shape, step.plan->plan.rows(), step.block == 0)) ||
-        (step.block == 2 && read)) {
-      printf("  block %u%s: %llu host steps read %llu experts, or its output or slots differ from the resident "
-             "experts' FAIL\n",
-             step.block, step.restores ? " after a restore" : "", (unsigned long long)hostSteps,
-             (unsigned long long)read);
+        (step.block == 2 && read) || (step.forgets && step.block != 2 && read != routed)) {
+      printf("  block %u%s: %llu host steps read %llu of %llu experts, or its output or slots differ from the "
+             "resident experts' FAIL\n",
+             step.block, step.restores ? " after a restore" : step.forgets ? " after a forget" : "",
+             (unsigned long long)hostSteps, (unsigned long long)read, (unsigned long long)routed);
       ++failures;
     }
   }
   printf("streamed experts beside a size of one block, which holds every expert and loads none, before and after "
-         "a restore: bitwise the resident experts' %s\n",
+         "a restore and a forget, which drops the streamed experts alone: bitwise the resident experts' %s\n",
          failures ? "FAIL" : "ok");
   return failures;
 }

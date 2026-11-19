@@ -152,6 +152,7 @@ class SmokeRealTests(unittest.TestCase):
                         verify_rows=None,
                         max_image_pixels=None,
                         kv_format="bf16" if absolute else "int8",
+                        cached_states="exact" if absolute else None,
                     )
                     with (
                         mock.patch.object(
@@ -166,6 +167,12 @@ class SmokeRealTests(unittest.TestCase):
                             self.assertEqual(
                                 command[command.index("--kv-format") + 1],
                                 arguments.kv_format,
+                            )
+                            self.assertEqual(
+                                command[command.index("--cached-states") + 1]
+                                if "--cached-states" in command
+                                else None,
+                                arguments.cached_states,
                             )
                             self.assertEqual(
                                 popen.call_args.kwargs["cwd"], smoke_real.ROOT
@@ -195,6 +202,7 @@ class SmokeRealTests(unittest.TestCase):
             verify_rows=None,
             max_image_pixels=None,
             kv_format="int8",
+            cached_states=None,
         )
 
     @contextlib.contextmanager
@@ -369,7 +377,7 @@ class SmokeRealTests(unittest.TestCase):
                 with self.assertRaisesRegex(smoke_real.SmokeFailure, "lock"):
                     smoke_real.require_closed_cache(Path(temporary))
 
-    def run_persistent_cache(self, changes=(), switch=True):
+    def run_persistent_cache(self, changes=(), switch=True, source="disk"):
         """Runs the scenario against scripted servers of a model whose
         reasoning a request's effort switches or not, each change (read,
         section, key, value) setting a key of one status read. Returns the
@@ -400,7 +408,15 @@ class SmokeRealTests(unittest.TestCase):
                 "choices": [{"message": {"content": "Done"}}],
                 "usage": {"prompt_tokens": 5980},
             },
-            {"choices": [{"message": {"content": "Again"}}]},
+            {
+                "choices": [{"message": {"content": "Again"}}],
+                "usage": {
+                    "prompt_tokens_details": {
+                        "state_source": source,
+                        "lost_state": False,
+                    }
+                },
+            },
         ]
         turns, starts = [], []
         server = mock.Mock(port=8000)
@@ -474,6 +490,13 @@ class SmokeRealTests(unittest.TestCase):
         }.items():
             with self.subTest(name=name), self.assertRaises(smoke_real.SmokeFailure):
                 self.run_persistent_cache([change])
+        # Usage that does not say the state came from the SSD cache.
+        for source in ("memory", None):
+            with (
+                self.subTest(source=source),
+                self.assertRaises(smoke_real.SmokeFailure),
+            ):
+                self.run_persistent_cache(source=source)
 
     @staticmethod
     def timeout_status(**changes):

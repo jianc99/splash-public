@@ -14,6 +14,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import transformers
+
 from dev.tests.installer_fixtures import DENSE, MODEL, family_config
 from dev.tests.server_fixtures import (
     NO_THINKING_END,
@@ -80,7 +82,7 @@ class ServerMainTests(unittest.TestCase):
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=tokenizer
+                transformers.AutoTokenizer, "from_pretrained", return_value=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "check_capabilities"),
@@ -144,7 +146,9 @@ class ServerMainTests(unittest.TestCase):
                     unprepared_hold(),
                     mock.patch.object(api, "load_thinking_key", return_value=None),
                     mock.patch.object(
-                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                        transformers.AutoTokenizer,
+                        "from_pretrained",
+                        return_value=object(),
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
                     mock.patch.object(api, "check_capabilities"),
@@ -195,7 +199,9 @@ class ServerMainTests(unittest.TestCase):
             unprepared_hold(family),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=tokenizer or object()
+                transformers.AutoTokenizer,
+                "from_pretrained",
+                return_value=tokenizer or object(),
             ),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
@@ -274,7 +280,7 @@ class ServerMainTests(unittest.TestCase):
         for fault, ends, written in (
             (
                 mock.patch.object(
-                    api.AutoTokenizer,
+                    transformers.AutoTokenizer,
                     "from_pretrained",
                     side_effect=KeyError("added_tokens"),
                 ),
@@ -463,7 +469,7 @@ class ServerMainTests(unittest.TestCase):
             status = stack.enter_context(mock.patch.object(api, "print_status"))
             with self.assertRaises(SystemExit):
                 api.main()
-            api.AutoTokenizer.from_pretrained.assert_not_called()
+            transformers.AutoTokenizer.from_pretrained.assert_not_called()
         message = (
             "--reasoning-effort cannot set how test-model reasons: a Flint model "
             "decides each turn whether to reason, whatever effort its prompt names"
@@ -567,7 +573,7 @@ class ServerMainTests(unittest.TestCase):
             ),
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(transformers.AutoTokenizer, "from_pretrained"),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
@@ -626,7 +632,7 @@ class ServerMainTests(unittest.TestCase):
             ),
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained"),
+            mock.patch.object(transformers.AutoTokenizer, "from_pretrained"),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
             mock.patch.object(
@@ -730,7 +736,7 @@ class ServerMainTests(unittest.TestCase):
         for fault, ends in (
             (
                 mock.patch.object(
-                    api.AutoTokenizer,
+                    transformers.AutoTokenizer,
                     "from_pretrained",
                     side_effect=KeyError("added_tokens"),
                 ),
@@ -826,7 +832,9 @@ class ServerMainTests(unittest.TestCase):
                     unprepared_hold(),
                     mock.patch.object(api, "load_thinking_key", return_value=None),
                     mock.patch.object(
-                        api.AutoTokenizer, "from_pretrained", return_value=object()
+                        transformers.AutoTokenizer,
+                        "from_pretrained",
+                        return_value=object(),
                     ),
                     mock.patch.object(api, "validate_tokenizer"),
                     mock.patch.object(api, "check_capabilities"),
@@ -864,7 +872,7 @@ class ServerMainTests(unittest.TestCase):
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
+                transformers.AutoTokenizer, "from_pretrained", return_value=object()
             ),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "check_capabilities"),
@@ -873,6 +881,7 @@ class ServerMainTests(unittest.TestCase):
                 api.engine_runtime, "MultiplexedRuntime", return_value=runtime
             ),
             mock.patch.object(api, "NativeBackend", return_value=backend),
+            mock.patch.object(api, "ConstraintFactory"),
             mock.patch.object(api, "FrontendServer", return_value=server),
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
@@ -886,33 +895,90 @@ class ServerMainTests(unittest.TestCase):
         console_written()
         self.assertIn("Error · late", stderr.getvalue())
 
-    def test_main_rejects_an_unservable_chat_template_before_starting_native(self):
+    def test_main_stops_the_engine_it_started_for_an_unservable_chat_template(self):
+        """The engine starts before the tokenizer loads, so that it reads its
+        weights meanwhile; a tokenizer whose template the server cannot serve
+        stops it and reports the template's error."""
         server = mock.Mock()
+        order = []
+        runtime = mock.Mock()
+        runtime.start.side_effect = lambda: order.append("engine start")
+        runtime.close.side_effect = lambda: order.append("engine close")
+
+        def tokenizer(*_, **__):
+            order.append("tokenizer")
+            return SimpleNamespace(chat_template=None)
+
         with (
             mock.patch.object(api, "parse_args", return_value=main_args()),
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer,
-                "from_pretrained",
-                return_value=SimpleNamespace(chat_template=None),
+                transformers.AutoTokenizer, "from_pretrained", side_effect=tokenizer
             ),
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "check_capabilities"),
-            mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
             mock.patch.object(api, "FrontendServer", return_value=server),
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
             self.assertRaisesRegex(SystemExit, "1"),
         ):
             api.main()
-        runtime.assert_not_called()
+        self.assertEqual(order, ["engine start", "tokenizer", "engine close"])
+        runtime.wait_ready.assert_not_called()
         server.server_activate.assert_not_called()
         server.server_close.assert_called_once_with()
         console_written()
         self.assertIn(
             "Error · the tokenizer defines no chat template", stderr.getvalue()
         )
+
+    def test_an_engine_that_fails_while_the_tokenizer_loads_reports_its_error(self):
+        """The engine started first fails while the server loads its
+        tokenizer: the start reports the engine's error, not the tokenizer's
+        success, and serves nothing."""
+        server = mock.Mock()
+        order = []
+        runtime = mock.Mock()
+        runtime.start.side_effect = lambda: order.append("engine start")
+
+        def failed():
+            order.append("wait")
+            raise api.engine_runtime.EngineUnhealthy("native protocol reached EOF")
+
+        runtime.wait_ready.side_effect = failed
+
+        def tokenizer(*_, **__):
+            order.append("tokenizer")
+            return object()
+
+        with (
+            mock.patch.object(api, "parse_args", return_value=main_args()),
+            unprepared_hold(),
+            mock.patch.object(api, "load_thinking_key", return_value=None),
+            mock.patch.object(
+                transformers.AutoTokenizer, "from_pretrained", side_effect=tokenizer
+            ),
+            mock.patch.object(api, "validate_tokenizer"),
+            mock.patch.object(api, "check_capabilities"),
+            mock.patch.object(api, "ChatTemplates", **NO_THINKING_END),
+            mock.patch.object(
+                api.engine_runtime, "MultiplexedRuntime", return_value=runtime
+            ),
+            mock.patch.object(api, "ConstraintFactory"),
+            mock.patch.object(api, "FrontendServer", return_value=server),
+            mock.patch.object(api.signal, "signal"),
+            mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaisesRegex(SystemExit, "1"),
+        ):
+            api.main()
+        self.assertEqual(order, ["engine start", "tokenizer", "wait"])
+        server.server_activate.assert_not_called()
+        console_written()
+        self.assertIn("Error · native protocol reached EOF", stderr.getvalue())
 
     def test_main_rejects_port_conflict_before_loading_or_starting_native(self):
         args = main_args(port=8000)
@@ -921,7 +987,9 @@ class ServerMainTests(unittest.TestCase):
         with (
             mock.patch.object(api, "parse_args", return_value=args),
             mock.patch.object(api, "FrontendServer", return_value=server),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained") as tokenizer,
+            mock.patch.object(
+                transformers.AutoTokenizer, "from_pretrained"
+            ) as tokenizer,
             mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
@@ -940,6 +1008,8 @@ class ServerMainTests(unittest.TestCase):
         served = models / ".resolved/assembly"
         served.mkdir(parents=True)
         (served / "model.json").write_text("{}")
+        (served / "draft").mkdir()
+        (served / "draft/config.json").write_text('{"vocab_size": 248320}')
         link = models / "owner/model"
         link.parent.mkdir()
         link.symlink_to(served, target_is_directory=True)
@@ -958,7 +1028,7 @@ class ServerMainTests(unittest.TestCase):
             ),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
+                transformers.AutoTokenizer, "from_pretrained", return_value=object()
             ) as tokenizer,
             # The record names the family the model was installed as, whose
             # sampling requests get unless they name their own.
@@ -1054,7 +1124,9 @@ class ServerMainTests(unittest.TestCase):
             ),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(api, "FrontendServer", return_value=server),
-            mock.patch.object(api.AutoTokenizer, "from_pretrained") as tokenizer,
+            mock.patch.object(
+                transformers.AutoTokenizer, "from_pretrained"
+            ) as tokenizer,
             mock.patch.object(api.engine_runtime, "MultiplexedRuntime") as runtime,
             mock.patch.object(api.signal, "signal"),
             mock.patch("sys.stdout", new_callable=io.StringIO),
@@ -1093,7 +1165,7 @@ class CustomTemplateStartupTests(unittest.TestCase):
             unprepared_hold(),
             mock.patch.object(api, "load_thinking_key", return_value=None),
             mock.patch.object(
-                api.AutoTokenizer, "from_pretrained", return_value=object()
+                transformers.AutoTokenizer, "from_pretrained", return_value=object()
             ) as tokenizer,
             mock.patch.object(api, "validate_tokenizer"),
             mock.patch.object(api, "check_capabilities"),

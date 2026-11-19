@@ -21,6 +21,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -134,6 +135,8 @@ struct KvTierSnapshot final {
   uint32_t pendingPages = 0;
   uint32_t diskBlocks = 0;
   uint64_t diskBytes = 0;
+  // Why a tier the start asked for is off (its "SSD cache off" line); empty otherwise.
+  std::string offReason;
 };
 
 // What a start took back from a persistent tier: the states and KV blocks
@@ -419,16 +422,21 @@ public:
   // the budget, as every KV write does. Nothing starts while the tier serves
   // what is needed now, a restore that waits, a reclaim's demotion or a
   // Spill request's write through, and the pages take a small share of the
-  // tier's writes. A point is unneeded unless it is still the newest of its
-  // conversation (newestPoint). Every point is refused once a file stopped
+  // tier's writes. A point is unneeded unless the tier still copies it
+  // (copiedAhead). Every point is refused once a file stopped
   // taking writes, and one larger than the room it may take (pointFits) or
   // given up to make room for itself.
   [[nodiscard]] PersistStatus persist(uint64_t block);
-  // The block holds a restore point a conversation still resumes from: an
-  // ordinary state with no ordinary state below it, or with ordinary states
-  // on more than one of its branches, which no single conversation went on
-  // from. persist() copies only such a point.
-  [[nodiscard]] bool newestPoint(uint64_t block) const;
+  // The block holds a point this tier copies ahead: what the tier exists to
+  // bring back. A persistent tier brings back what a restart needs, the
+  // points a reclaim keeps (StateCache::superseded): a conversation's newest,
+  // the kKeptBehind behind it, and junctions, so that a regenerate after a
+  // restart resumes at the last prompt's end. A temporary tier brings back what
+  // memory pressure evicts and a next turn reads, the newest point and
+  // junctions (StateCache::newest): the point behind, written when a reclaim
+  // takes it, was copied ahead and never read in four agent sessions on the 27B
+  // MLX at --max-memory 21G (993 of 1,030 copied pages unread).
+  [[nodiscard]] bool copiedAhead(uint64_t block) const;
   // What the copies ahead of need in flight (persist) let a reclaim free at
   // once after they land: the bytes of the pages they copy and of the RAM
   // copy of the state they write.
@@ -446,6 +454,7 @@ public:
   // Measures the volume the disk tier lives on and sets the budget's limit
   // (DiskSpace::measure), for keepDiskLimit(); none without such a tier.
   void setDiskMeasure(std::function<void()> measure) { diskMeasure_ = std::move(measure); }
+  void setDiskOff(std::string reason) { kvTier_.offReason = std::move(reason); }
   // At a control pass, and when a write found the volume full: measures it
   // again, then gives up copies while the tier holds more than the limit,
   // in the order a full quota replaces them (freeDiskSpace), never a copy in
@@ -802,9 +811,22 @@ public:
   [[nodiscard]] bool stateResident(uint64_t kvBlock) const noexcept;
   // False only while this exact disposable publication is pinned.
   bool retireCheckpointState(StateCheckpoint checkpoint) noexcept;
-  // A reply's state, opportunistic or kept (StateCache::markReply).
+  // A reply's state, opportunistic (StateCache::markReply).
   void markReply(StateCheckpoint checkpoint) noexcept { states_.markReply(checkpoint); }
-  void keepReply(StateCheckpoint checkpoint) noexcept { states_.keepReply(checkpoint); }
+  // A reply's state that its conversation's next turn resumes from (StateCache::keepReplyAsPoint).
+  bool keepReplyAsPoint(StateCheckpoint checkpoint) { return states_.keepReplyAsPoint(checkpoint); }
+  // A junction's state (StateCache::markBranchPoint).
+  void markBranchPoint(uint64_t block) { states_.markBranchPoint(block); }
+  // A prefill checkpoint its running lane holds, and the lane storing it (StateCache::markHeld).
+  void markHeld(StateCheckpoint checkpoint) noexcept { states_.markHeld(checkpoint); }
+  void keepHeld(StateCheckpoint checkpoint) noexcept { states_.keepHeld(checkpoint); }
+  // Frees the RAM copy of the state at the block by writing it, as a
+  // reclaim does (StateCache::reclaim); false, and nothing done, while the
+  // tier takes no write of it or the staging buffer is busy.
+  [[nodiscard]] bool writeState(uint64_t kvBlock) {
+    return states_.reclaimable(kvBlock) && states_.reclaimWrites(kvBlock) && !states_.writing() &&
+           states_.reclaim(kvBlock).evicted;
+  }
   // This exact disposable publication is pinned: retireCheckpointState
   // refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {
@@ -1470,8 +1492,6 @@ private:
   uint32_t fitDiskLimit();
   // A persistent tier's label for the block's disk copy.
   void labelKv(uint64_t block, const std::shared_ptr<KvDiskSlot> &slot);
-  // Ordinary states below the block sit on exactly one of its branches.
-  [[nodiscard]] bool superseded(uint64_t block) const;
   // What a copy of the block takes of the quota: its slot's bytes, or
   // without a copy what a slot of its page's form takes; nothing for a block
   // with neither, which holds nothing to write.
@@ -1499,8 +1519,6 @@ private:
   // full quota gives those up as well. Without a disk budget the tier's
   // slots bound it.
   [[nodiscard]] bool pointFits(const PersistCursor &point) const;
-  // An ordinary state at the block or anywhere below it.
-  [[nodiscard]] bool holdsOrdinaryState(uint64_t block) const;
   void startRestore(uint64_t block);
   // By form, whether evicting the walk's KV may empty an extent
   // (Walk::reaches): of the pages its class may reuse (reusablePages), the

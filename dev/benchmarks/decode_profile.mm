@@ -235,7 +235,7 @@ void profileImages(metal::MetalBackend &backend,
       }
     }
     const metal::MetalBuffer embeddings = backend.allocateBuffer(
-        uint64_t{ops::Vision::embeddingRows(grid)} *
+        uint64_t{grid.mergedTokens()} *
             vision.tensors.layout.outputHiddenSize * sizeof(uint16_t),
         metal::BufferStorage::Private, "image embeddings");
     const auto encode = [&] {
@@ -561,6 +561,11 @@ int main(int argc, char **argv) {
                         point.cap, point.milliseconds);
         }
         static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
+        // As a start ends its warmups (Bootstrap).
+        const auto ending = std::chrono::steady_clock::now();
+        executor.endWarmups();
+        std::printf("warmups ended: %.2f ms\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ending).count());
       }
       model::RuntimeInstrumentation::forceStepRows(executor, stepRows);
       model::RuntimeInstrumentation::planBlocks(executor, blockPlans);

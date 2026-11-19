@@ -22,7 +22,7 @@ Messages requires it.
 | `POST /v1/messages` | Anthropic Messages |
 | `POST /v1/messages/count_tokens` | A Messages request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
 | `POST /v1/chat/completions/count_tokens` | A Chat request's prompt tokens, images included, as `{"input_tokens": N}`, without inference |
-| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit, the input it takes (`input_modalities`), what a request may carry (`limits`: `request_bytes`, `images`, `image_bytes`, `pdf_bytes`, `pdf_pages`, as [images and PDFs](#images-and-pdfs) has them) and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
+| `GET /v1/models`, `/v1/models/{id}` | The served model and its aliases, with the context limit, the input it takes (`input_modalities`), what a request may carry (`limits`: `request_bytes`, `images`, `image_bytes`, `image_aspect`, `pdf_bytes`, `pdf_pages`, as [images and PDFs](#images-and-pdfs) has them) and what reasoning efforts do ([default reasoning effort](server.md#default-reasoning-effort)) |
 | `POST /tokenize`, `/apply-template` | A text's tokens, or a conversation's rendered prompt, without inference |
 | `POST /v1/judgments`, `/v1/systemone` | Scores over fixed answers ([judgment contracts](#judgment-contracts)) |
 | `POST /v1/memory/release` | Gives the weights back now, as the idle release does, when no request is in service; the next request restores them ([explicit release](internals.md#explicit-weights-release)). It takes no body (or `{}`); `200` with `{"released": true, "weights": …}`, `409 engine_busy` while the engine serves a request or restores its weights, `503 engine_busy` when the engine does not answer within 5 s, `503 engine_recovering` or `server_shutdown` while the engine restarts or the server stops, and `500 engine_failed` once the engine has stopped for good, before the server exits |
@@ -45,7 +45,11 @@ Completions, text completions, Responses and Messages share these fields:
 - `priority`: `foreground`, `normal` (the default) or `background`. A request
   waits while one of a higher priority runs, and when lanes or memory run short
   a higher priority suspends a running request of a lower one
-  ([admission and eviction](internals.md#admission-and-eviction)).
+  ([admission and eviction](internals.md#admission-and-eviction)). A
+  `background` request held back for 10 s (not served since its arrival or
+  its last step) is served as `normal` from then on, so that attended work
+  cannot starve it; for memory it stays `background`, and a suspension makes
+  it `background` again.
 - `timeout`: the seconds a request may take from its arrival; it can only
   shorten `--request-timeout`. A request that runs out returns 504
   `request_timeout`.
@@ -56,10 +60,11 @@ Completions, text completions, Responses and Messages share these fields:
   whitespace, as Anthropic requires; Anthropic sets no count, and Splash takes
   up to four, which bound the memory and time of its stop search. A stop is at
   most 16,384 characters (a longer one returns 400). A stop string ends the
-  output where the model writes it, inside a tool call or structured output too,
-  which it cuts as the token limit does: a call it cuts keeps the arguments it
-  has, and no call of the output counts as made; a cut structured answer is not
-  validated.
+  output where the model writes it in the answer: it is not searched in the
+  reasoning nor inside a tool call, where the tags' own tokens bound them
+  ([chat formats](models.md#chat-formats)), and the search starts afresh after
+  each, so a stop never spans them, and after the newlines that set the answer
+  apart from the reasoning. A structured answer a stop cuts is not validated.
 - `return_progress`, with `stream` true: prompt progress before the output
   ([output limits and streaming](#output-limits-and-streaming)).
 - `cache_salt`: a nonempty string. A request shares cached prompts, their KV and
@@ -255,6 +260,15 @@ defines no penalties and no `min_p` for Messages; Splash's Messages takes
 them and `logit_bias` as Chat does, with the same 400 for a bad value, so that
 a client whose requests go only to Messages can set them too.
 
+`--sampling-default NAME=VALUE` (repeatable) sets the value a sampling field
+takes when a request leaves it out, in place of the default above. A value
+the request sends still wins, and of two pairs for one name the last wins.
+The server checks each value at startup against what a request may set.
+
+```sh
+splash serve --model mlx-community/Qwen3.8-27B-4bit --sampling-default temperature=0.6 --sampling-default presence_penalty=1.5
+```
+
 In vLLM's order, after temperature `min_p` first drops every token less
 likely than `min_p` times the most likely one, `top_k` then keeps the most
 likely of the rest, every one when it is 0 or -1 or past the vocabulary, and
@@ -376,6 +390,14 @@ rest of the uncached input, and the prefix cache keeps a prompt as prefill
 computes it, at no cost of its own. So uncached input is `input_tokens` less
 `cached_tokens`, as in Messages, which reports no `cache_creation_input_tokens`.
 
+Beside the cached tokens, the same object (Messages: `usage` itself) says what
+the request reused: `prefix_tokens`, how far the cache matched its prompt's KV;
+`state_source`, where the state it resumed from was (`"memory"`, `"disk"` for
+the SSD cache's copy, or null for none); and `lost_state`, true when a matched
+block past that state once held a state that is gone. `cached_tokens` is what
+the request resumed from and did not read again; `prefix_tokens` can go past it
+where no state was kept, the matched KV past the state then read again.
+
 Every API keeps a response's state where its generation ended: at the last
 32-token page boundary, counted from the start of the prompt, that the prompt
 and its generated tokens reach, beside the state before its generation prompt.
@@ -490,7 +512,7 @@ not give: `["integer", "any"]` constrains no type, and
 | not declared | `seven` | `"seven"` |
 
 Calls are not validated against their schemas; a client reports what its tool
-rejects. A `stop` string may cut a call ([request fields](#request-fields)).
+rejects. A `stop` string leaves a call whole ([request fields](#request-fields)).
 
 The output is read as the chat template lays calls out, in the family's
 syntax ([chat formats](models.md#chat-formats)). In Qwen's XML a call opens at
@@ -739,6 +761,7 @@ fields; additional fields may be added:
 | `streamed_table` | While the PLE table streams, the [streamed PLE table](server.md#ple-table-streaming)'s cache, stages, reads and prefetches; `null` otherwise |
 | `streamed_experts` | While routed experts stream, the [streamed experts](server.md#streamed-experts)' store: its bytes at its cap and floor, its live chunks and those at the cap, the chunks it gave back and took back, its live chunks' bytes and slots and its resident experts, per use its loads, reads, read-ahead and host-step round trips, and its failure; `null` otherwise |
 | `kv_spill` | While a block-sparse target's KV can go to the SSD, its [KV on the SSD](server.md#kv-on-the-ssd): the requests that started in each mode, converted to `spill`, had their output bounded (once per request, at its start or a resume) or ended at that bound (and of those, the converted ones: `converted_bounded`, `converted_length_ends`), and were refused for the quota, the write budget or a closed tier, and the starts waiting for the quota (`requests`); the pages that hold only their index and those whose KV is on the SSD; the write-through of spilling requests' pages; page moves (`spill_moves`), and of those the releases that gave a spilling request's pages' memory back for a claim and their pages (`releases`, `released_pages`); rewrites and restores; the quota of KV in service; the hot block cache's memory, hits, reads and host steps (`block_cache`; `read` over `resolves` is the blocks a layer's step missed on average) and the history streams' reads, how long each layer's took (`read_ms`, whose total gives with `bytes` the streams' bandwidth) and staging (`history_stream`); absent for a target whose KV stays in memory, whose plan's `memory_plan.budget.kv_spill` is `null` |
+| `disk.read_bytes`, `spilled_kv_read_bytes`, `weights_read_bytes` | Bytes read from the SSD since engine start: by the [SSD cache](server.md#ssd-cache) (`read_bytes`: restored KV pages and states, and spilled K/V), of which spilled K/V a decode's block reads and a prefill's history stream took (`spilled_kv_read_bytes`); and from the model's own files by the weights that stay there, streamed experts and a streamed table (`weights_read_bytes`), which `read_bytes` does not count. A long prompt of a streamed model reads tens of GB of weights: 29 GB for 50,842 tokens of Qwen3.6-35B-A3B on a 16 GB Mac |
 | `disk.written_last_hour_bytes`, `written_last_day_bytes` | The [SSD cache](server.md#ssd-cache)'s write rate: the bytes its writes took over the last hour and the last day the Mac was awake, in the host pages each write stores, as `--max-cache-disk-writes` counts them, with a write budget or without. Each window ends now and is exact to a minute; an engine that started less than an hour or a day ago has written all of its count |
 | `disk.write_behind.waiting`, `durable`, `unneeded`, `refused` | The restore points the [SSD cache](server.md#ssd-cache) copies ahead: those queued for their copies, the one being copied among them (`waiting`), and since engine start those copied (`durable`), gone on from first (`unneeded`) and not copied for want of room or a file that takes writes (`refused`). An idle engine can report points waiting. Without `--persistent-cache` a point is copied only while a reclaim has reached cached KV or a state with no copy on the SSD within the last minute, 10 s after its publication once its request has ended; otherwise it waits for memory to run short, which may never happen, and is not work the engine owes. With it each point is written once it falls due, 10 s after its publication at the earliest, and at a clean stop (up to 6 s), so there `waiting` is SSD work still to come and drains by itself |
 | `kv.window` | For a target with sliding-window layers, its [windows](internals.md#sliding-windows): the `window_pages` a row's window and a state's tail keep Full, whether pages past every window give up their windowed layers' K/V (`trim`, off with the native `--kv-window-trim off`), the pool's `full_pages` and `slim_pages` in use and the Slim extents' `slim_bytes`, the `pinned_blocks` states' tails hold, the `trimmed_pages` since engine start, the `upgrades` of blocks that took the page of a writer that computed them again, and the `refused_states` whose tail was not Full; absent for other targets |

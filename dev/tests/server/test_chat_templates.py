@@ -12,7 +12,7 @@ from transformers import PreTrainedTokenizerFast
 
 from dev.tests import server_fixtures as fixtures
 from server import chat_messages, chat_templates
-from server.chat_format import QWEN, REASONING_EFFORTS
+from server.chat_format import FLINT, QWEN, REASONING_EFFORTS
 from server.chat_templates import (
     LATER_SYSTEM_UNSUPPORTED,
     NATIVE,
@@ -613,7 +613,13 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         )
         self.assertEqual(harness.tokenizer.renderer.chat_template, source("qwen36"))
 
-    def test_requests_carry_the_length_of_their_generation_prompt(self):
+    def test_requests_carry_the_tokens_after_their_last_text(self):
+        """A request carries how many of its prompt's last tokens come after
+        its last message's text: the generation prompt and, on Qwen's
+        templates, that message's end of turn before it, `<|im_end|>` and its
+        line break. Every continuation shares the prompt up to there: more of
+        the same message, a regenerate, a next turn. Flint's generation
+        prompt, its assistant role token, follows the text directly."""
         messages = [
             {"role": "user", "content": "Hi"},
             {"role": "assistant", "content": "Hello"},
@@ -631,7 +637,7 @@ class ChatTemplateFrontendTests(unittest.TestCase):
             },
         ]
 
-        def frontend(name, *special):
+        def frontend(name, *special, chat_format=QWEN):
             return fixtures.make_frontend(
                 chat_tokenizer(source(name), *special),
                 None,
@@ -639,17 +645,29 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                 4096,
                 10,
                 2,
-                vision=True,
+                vision=chat_format is QWEN,
+                chat_format=chat_format,
             )
+
+        def text_ids(app, body, cut):
+            """The prompt's tokens through its last message's text: the
+            history the template renders without a generation prompt, less
+            what follows `cut`'s last place in it."""
+            history = app.apply_template(
+                {**body, "add_generation_prompt": False}, deadline=fixtures.FOREVER
+            )
+            if cut:
+                history = history[: history.rindex(cut)]
+            return app.tokenizer(history, add_special_tokens=False)["input_ids"]
 
         for name in ("qwen36_gguf", "qwen38_gguf"):
             app = frontend(name, "<|im_start|>", "<|im_end|>", QWEN.image_pad)
             self.assertTrue(
                 app.chat_templates.describe().endswith("generation prompt 5-7 tokens")
             )
-            # <|im_start|> assistant \n <think> \n\n </think> \n\n; with
-            # thinking, the first four and \n.
-            for effort, expected in (("none", 7), ("high", 5)):
+            # <|im_end|> \n, then <|im_start|> assistant \n <think> \n\n
+            # </think> \n\n; with thinking, the first four and \n.
+            for effort, expected in (("none", 9), ("high", 7)):
                 with self.subTest(name=name, effort=effort):
                     body = {
                         "model": "test-model",
@@ -658,13 +676,8 @@ class ChatTemplateFrontendTests(unittest.TestCase):
                     }
                     job = app.prepare(body, deadline=fixtures.FOREVER)
                     self.assertEqual(job.generation_prompt_tokens, expected)
-                    history = app.apply_template(
-                        {**body, "add_generation_prompt": False},
-                        deadline=fixtures.FOREVER,
-                    )
                     self.assertEqual(
-                        job.prompt_tokens[:-expected],
-                        app.tokenizer(history, add_special_tokens=False)["input_ids"],
+                        job.prompt_tokens[:-expected], text_ids(app, body, "<|im_end|>")
                     )
                     # Images precede it, so expanding them keeps its length.
                     image_job = app.prepare(
@@ -680,14 +693,304 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         app = frontend("qwen36_gguf", "<|im_end|>")
         body = {"model": "test-model", "messages": messages}
         job = app.prepare(body, deadline=fixtures.FOREVER)
-        history = app.apply_template(
-            {**body, "add_generation_prompt": False}, deadline=fixtures.FOREVER
-        )
-        self.assertGreater(job.generation_prompt_tokens, 0)
+        self.assertGreater(job.generation_prompt_tokens, 2)
         self.assertEqual(
             job.prompt_tokens[: -job.generation_prompt_tokens],
-            app.tokenizer(history, add_special_tokens=False)["input_ids"],
+            text_ids(app, body, "<|im_end|>"),
         )
+        # Flint: the role token alone, its message boundary too.
+        app = frontend(
+            "flint",
+            "<|user|>",
+            "<|assistant|>",
+            "<|system|>",
+            "<|observation|>",
+            chat_format=FLINT,
+        )
+        body = {"model": "test-model", "messages": messages}
+        job = app.prepare(body, deadline=fixtures.FOREVER)
+        self.assertEqual(job.generation_prompt_tokens, 1)
+        self.assertEqual(job.prompt_tokens[:-1], text_ids(app, body, None))
+
+    def test_requests_carry_the_end_of_their_head(self):
+        """A prompt that opens with a system prompt or with tools, which the
+        template renders in its first message, carries where that message
+        ends, so that the engine keeps a state there for the next conversation
+        sharing it; a prompt without such a message carries none."""
+        app = fixtures.make_frontend(
+            chat_tokenizer(source("qwen38_gguf"), "<|im_start|>", "<|im_end|>"),
+            None,
+            "test-model",
+            4096,
+            10,
+            2,
+            vision=False,
+        )
+        end = app.tokenizer.convert_tokens_to_ids("<|im_end|>")
+        first = [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+            {"role": "user", "content": "Again"},
+        ]
+        other = [{"role": "user", "content": "Something else"}]
+        system = {"role": "system", "content": "Leading instructions"}
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "read",
+                "description": "Reads a file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name, head, tools in (
+            ("system", [system], None),
+            ("tools", [], [tool]),
+            ("neither", [], None),
+        ):
+            with self.subTest(name=name):
+                jobs = [
+                    app.prepare(
+                        {
+                            "model": "test-model",
+                            "messages": head + conversation,
+                            **({"tools": tools} if tools else {}),
+                        },
+                        deadline=fixtures.FOREVER,
+                    )
+                    for conversation in (first, other)
+                ]
+                if not head and not tools:
+                    self.assertEqual([job.head_tokens for job in jobs], [0, 0])
+                    continue
+                expected = jobs[0].prompt_tokens.index(end) + 1
+                self.assertEqual([job.head_tokens for job in jobs], [expected] * 2)
+                self.assertEqual(
+                    jobs[0].prompt_tokens[:expected], jobs[1].prompt_tokens[:expected]
+                )
+
+    def test_an_agent_loop_extends_the_previous_prompt_and_reply_in_every_api(self):
+        """After a tool loop with thinking, the next request of each API,
+        whether it adds a tool result, a user message or a user message with
+        an image (how agent clients such as oh-my-pi send an image a tool
+        read), starts with the previous prompt and the reply the model wrote
+        in it, so the cache reads only what was added. The Qwen3.8 templates
+        keep earlier thinking unless preserve_thinking is false; were earlier
+        turns rendered without it, a new user message would change the prompt
+        from the first reply on and read it all again (#706)."""
+        parameters = {"type": "object", "properties": {"path": {"type": "string"}}}
+        image = fixtures.png_data_url()
+
+        def chat(events):
+            messages = [{"role": "system", "content": "You are an agent."}]
+            for kind, value in events:
+                if kind == "user":
+                    messages.append({"role": "user", "content": value})
+                elif kind == "image":
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "Attached image:"},
+                                {"type": "image_url", "image_url": {"url": image}},
+                            ],
+                        }
+                    )
+                elif kind == "call":
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": f"Read file {value}.",
+                            "tool_calls": [
+                                {
+                                    "id": f"call_{value}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read",
+                                        "arguments": json.dumps(
+                                            {"path": f"{value}.py"}
+                                        ),
+                                    },
+                                }
+                            ],
+                        }
+                    )
+                else:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": f"call_{value}",
+                            "content": f"line {value}",
+                        }
+                    )
+            tools = [
+                {
+                    "type": "function",
+                    "function": {"name": "read", "parameters": parameters},
+                }
+            ]
+            return {"messages": messages, "tools": tools}
+
+        def messages_api(events):
+            messages = []
+            for kind, value in events:
+                if kind == "call":
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "thinking", "thinking": f"Read file {value}."},
+                                {
+                                    "type": "tool_use",
+                                    "id": f"call_{value}",
+                                    "name": "read",
+                                    "input": {"path": f"{value}.py"},
+                                },
+                            ],
+                        }
+                    )
+                    continue
+                if kind == "user":
+                    block = {"type": "text", "text": value}
+                elif kind == "image":
+                    block = {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": image.split(",", 1)[1],
+                        },
+                    }
+                else:
+                    block = {
+                        "type": "tool_result",
+                        "tool_use_id": f"call_{value}",
+                        "content": f"line {value}",
+                    }
+                if messages and messages[-1]["role"] == "user":
+                    messages[-1]["content"].append(block)
+                else:
+                    messages.append({"role": "user", "content": [block]})
+            body = {
+                "model": "test-model",
+                "system": "You are an agent.",
+                "messages": messages,
+                "tools": [{"name": "read", "input_schema": parameters}],
+                "thinking": {"type": "adaptive"},
+            }
+            return anthropic_dialect.to_chat_prompt(
+                body, thinking_resolver=lambda signature: signature
+            )
+
+        def responses_api(events):
+            items = []
+            for kind, value in events:
+                if kind == "user":
+                    items.append({"type": "message", "role": "user", "content": value})
+                elif kind == "image":
+                    items.append(
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [
+                                {"type": "input_text", "text": "Attached image:"},
+                                {"type": "input_image", "image_url": image},
+                            ],
+                        }
+                    )
+                elif kind == "call":
+                    items += [
+                        {
+                            "type": "reasoning",
+                            "summary": [],
+                            "content": [
+                                {
+                                    "type": "reasoning_text",
+                                    "text": f"Read file {value}.",
+                                }
+                            ],
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": f"call_{value}",
+                            "name": "read",
+                            "arguments": json.dumps({"path": f"{value}.py"}),
+                        },
+                    ]
+                else:
+                    items.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": f"call_{value}",
+                            "output": f"line {value}",
+                        }
+                    )
+            body = {
+                "instructions": "You are an agent.",
+                "tools": [
+                    {"type": "function", "name": "read", "parameters": parameters}
+                ],
+            }
+            return responses_dialect.to_chat_body(body, items)[0]
+
+        # A task, two turns of a read call and its result, then the reply
+        # that calls the third read: what the cache holds.
+        loop = [("user", "Fix the test"), ("call", 0), ("result", 0)]
+        loop += [("call", 1), ("result", 1)]
+        previous = [*loop, ("call", 2)]
+        added = {
+            "a tool result": [("result", 2)],
+            "a user message": [("result", 2), ("user", "Also the docs")],
+            "a user image": [("result", 2), ("image", None)],
+        }
+        for name in ("qwen38", "qwen38_gguf"):
+            app = fixtures.make_frontend(
+                chat_tokenizer(
+                    source(name), "<|im_start|>", "<|im_end|>", QWEN.image_pad
+                ),
+                None,
+                "test-model",
+                4096,
+                10,
+                2,
+                vision=True,
+            )
+
+            def tokens(body, *, reply=False):
+                job = app.prepare(
+                    {**body, "model": "test-model", "reasoning_effort": "medium"},
+                    deadline=fixtures.FOREVER,
+                )
+                # Ending in the reply, the conversation is what the cache
+                # holds: its prompt without a next generation prompt, whose
+                # count takes the reply's end of turn too (<|im_end|> and its
+                # line break).
+                end = len(job.prompt_tokens) - job.generation_prompt_tokens + 2
+                return job.prompt_tokens[:end] if reply else job.prompt_tokens
+
+            # The third reply as the model writes it after the prompt's <think>.
+            reply = app.tokenizer(
+                "Read file 2.\n</think>\n\n<tool_call>\n<function=read>\n"
+                "<parameter=path>\n2.py\n</parameter>\n</function>\n</tool_call>"
+                "<|im_end|>",
+                add_special_tokens=False,
+            )["input_ids"]
+            for api, body in (
+                ("chat", chat),
+                ("messages", messages_api),
+                ("responses", responses_api),
+            ):
+                cached = [*tokens(body(loop)), *reply]
+                with self.subTest(name=name, api=api):
+                    # The template follows the reply's <|im_end|> with a line
+                    # break the model did not write.
+                    rendered = tokens(body(previous), reply=True)
+                    self.assertEqual(rendered[: len(cached)], cached)
+                for label, events in added.items():
+                    with self.subTest(name=name, api=api, added=label):
+                        following = tokens(body(previous + events))
+                        self.assertGreater(len(following), len(cached))
+                        self.assertEqual(following[: len(cached)], cached)
 
     def test_generation_prompts_need_no_turn_marker(self):
         """Whatever a chat format's markers, the generation prompt is what its
@@ -760,10 +1063,11 @@ class ChatTemplateFrontendTests(unittest.TestCase):
         qwen = source("qwen36_gguf")
         off, on = {"enable_thinking": False}, {"enable_thinking": True}
         for options, extra, kwargs, thinking, tokens in (
-            ({}, {}, off, False, 7),
-            ({"default_reasoning_effort": "high"}, {}, off, False, 7),
-            ({}, {"reasoning_effort": "high"}, off, False, 7),
-            ({}, {"reasoning_effort": "none"}, on, True, 5),
+            # The generation prompt and the message's end of turn before it.
+            ({}, {}, off, False, 9),
+            ({"default_reasoning_effort": "high"}, {}, off, False, 9),
+            ({}, {"reasoning_effort": "high"}, off, False, 9),
+            ({}, {"reasoning_effort": "none"}, on, True, 7),
         ):
             with self.subTest(options=options, extra=extra, kwargs=kwargs):
                 job = chat_frontend(qwen, **options).prepare(

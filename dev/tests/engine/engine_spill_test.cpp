@@ -1274,14 +1274,14 @@ void testAResidentStartDoesNotHoldAQuotaWaitOpen() {
   };
   // The quota's holder runs below the others' priority: it does not run
   // while they do.
-  submit(1, 33, 4000, RequestPriority::Background);
+  submit(1, 33, 4000, RequestPriority::Normal);
   run([&] { return spill.events.outputs.contains(1); }, "the first request did not decode");
-  submit(2, 8, 4000, RequestPriority::Normal);
+  submit(2, 8, 4000, RequestPriority::Foreground);
   run([&] { return spill.engine.resourceWaitSnapshot(spill.now).diskQuota == 1; },
       "the second request did not wait for the quota");
   // A shorter Resident prompt leads the waiting one and starts beside it; it
   // decodes for twice the wait's limit.
-  submit(3, 1, KvCache::pageTokens - 1, RequestPriority::Normal);
+  submit(3, 1, KvCache::pageTokens - 1, RequestPriority::Foreground);
   run([&] { return spill.events.outputs.contains(3); }, "the Resident start did not decode");
   const double startedAt = spill.now;
   const size_t held = spill.events.outputs.at(1).size();

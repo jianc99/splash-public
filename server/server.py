@@ -24,8 +24,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from transformers import AutoTokenizer
-
 from install import assembly
 from install.models import ModelError
 
@@ -56,7 +54,7 @@ from .errors import (
     field_error,
     remaining_request_time,
 )
-from .frontend import Frontend
+from .frontend import Frontend, accepts_sampling
 from .http_security import (
     OriginRefused,
     RefusedOriginLog,
@@ -64,7 +62,7 @@ from .http_security import (
     socket_hosts,
     validate_headers,
 )
-from .images import MAX_IMAGE_BYTES
+from .images import MAX_ASPECT, MAX_IMAGE_BYTES
 from .latency import RequestLatency
 from .metrics import prometheus_metrics
 from .origins import ANY_ORIGIN
@@ -585,12 +583,14 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _limits(self):
         """What a request may carry, which a client can check an attachment
         against before it sends: its bytes (--max-request-size); its images,
-        a PDF's pages counted among them; an image's bytes; a PDF's bytes,
-        which the request's PDFs share, and its pages."""
+        a PDF's pages counted among them; an image's bytes and its longer
+        side over its shorter; a PDF's bytes, which the request's PDFs share,
+        and its pages."""
         return {
             "request_bytes": self.server.max_request_bytes,
             "images": MAX_IMAGE_SPANS,
             "image_bytes": MAX_IMAGE_BYTES,
+            "image_aspect": MAX_ASPECT,
             "pdf_bytes": MAX_PDF_BYTES,
             "pdf_pages": MAX_PAGES,
         }
@@ -1231,9 +1231,21 @@ def parse_args(argv=None):
     serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
     serve_options.check_serve_arguments(parser, args)
+    # Before the engine loads, not when the frontend is built after it: each
+    # value passes the check a request's own value meets (accepts_sampling).
+    for name, value in args.sampling_default:
+        if not accepts_sampling(name, value):
+            parser.error(f"--sampling-default: invalid value {name}={value!r}")
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
     return args
+
+
+def _sampling_defaults(family, args):
+    """What a request gets for each sampling field it leaves out: the
+    family's published sampling, with --sampling-default's values over it,
+    the last of a name winning."""
+    return {**asdict(family.sampling), **dict(args.sampling_default)}
 
 
 def _native_command(args, model_root, relaunch_context=None):
@@ -1373,6 +1385,8 @@ def main():
                 f"{args.model} is not prepared as a model of a family this "
                 "release serves: prepare it again"
             )
+        # Its vocabulary, which the grammars' table covers (ConstraintFactory).
+        vocabulary = assembly.vocabulary(model_root)
         if args.reasoning_effort is not None and not (
             family.chat_format.reasoning_switch
         ):
@@ -1390,6 +1404,35 @@ def main():
         if args.chat_template_file is not None:
             custom = read_template_file(args.chat_template_file)
             print_status(f"Chat template file · {args.chat_template_file}")
+
+        def warming(event):
+            # As the warm-up begins and as each of its steps ends: it can take
+            # minutes on the first start after an update, so the console and
+            # the record, which the app shows, say how far it is. It runs on
+            # the reader thread, which must not block (on_warming):
+            # print_status only queues the line for the console's one writer,
+            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
+            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
+            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+
+        # The engine starts now and reads its weights while this process
+        # imports the tokenizer's library and loads the tokenizer and the
+        # chat template, which it needs none of: on a 32-core M5 Max, with
+        # the 27B and the 35B, that was 1.2-1.3 s of a 12.2 s start spent
+        # before the engine was spawned. A failure here closes the engine
+        # (finally, below); one of the engine's is raised by wait_ready.
+        runtime = engine_runtime.MultiplexedRuntime(
+            _native_command(args, model_root),
+            relaunch_command=lambda first: _native_command(
+                args, model_root, first.max_context_tokens
+            ),
+            pending_limit=args.queue_size,
+        )
+        runtime.on_warming = warming
+        runtime.start()
+        # Imported here, while the engine loads: transformers takes 0.35-0.75 s.
+        from transformers import AutoTokenizer
+
         # A tokenizer the loader cannot read fails with whatever its parsers
         # raise, such as a KeyError for a tokenizer.json without added_tokens:
         # each is the model's.
@@ -1416,25 +1459,11 @@ def main():
             thinking_end = thinking_end_tokens(
                 tokenizer, chat_templates.select(None).thinking_end, family.chat_format
             )
-        runtime = engine_runtime.MultiplexedRuntime(
-            _native_command(args, model_root),
-            relaunch_command=lambda first: _native_command(
-                args, model_root, first.max_context_tokens
-            ),
-            pending_limit=args.queue_size,
+        # The grammars' table, built while the engine loads (0.82 s on a
+        # 32-core M5 Max); the factory checks it against the Ready.
+        grammar_table = ConstraintFactory.table(
+            tokenizer, family.chat_format, vocabulary
         )
-
-        def warming(event):
-            # As the warm-up begins and as each of its steps ends: it can take
-            # minutes on the first start after an update, so the console and
-            # the record, which the app shows, say how far it is. It runs on
-            # the reader thread, which must not block (on_warming):
-            # print_status only queues the line for the console's one writer,
-            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
-            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
-            serve_record.warming(args.serve_record, event.steps_done, event.steps)
-
-        runtime.on_warming = warming
 
         def engine_recovering(recovering):
             # The record follows the engine once the server is ready, for
@@ -1468,10 +1497,10 @@ def main():
             # No deadline unless given, as in vLLM and SGLang; a request still
             # ends when its client disconnects.
             math.inf if args.request_timeout is None else args.request_timeout,
-            constraint_factory=ConstraintFactory(tokenizer, served),
+            constraint_factory=ConstraintFactory(grammar_table, served),
             chat_templates=chat_templates,
             chat_format=family.chat_format,
-            sampling_defaults=asdict(family.sampling),
+            sampling_defaults=_sampling_defaults(family, args),
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
             response_store=dialects.responses.ResponseStore(),
@@ -1555,6 +1584,9 @@ def main():
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()
+            elif runtime is not None:
+                # A start that failed while the engine loaded stops it.
+                runtime.close()
         finally:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:

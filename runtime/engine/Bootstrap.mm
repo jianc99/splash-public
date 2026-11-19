@@ -340,6 +340,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     run(RuntimeBootstrapStage::CompositeStateRestore,
         report.warmup.compositeStateRestore,
         [&] { return modelRuntime.warmupCompositeStateRestore(); }, true);
+    modelRuntime.endWarmups();
   }
 
   ActualMemoryReport actual;

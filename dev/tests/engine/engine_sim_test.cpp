@@ -675,10 +675,11 @@ void testRegrowthAfterABurstTakesOnlyCacheThatFreesNow() {
 // Critical pressure after the same burst, macOS's level sampled every half second for 6 s: each settled
 // second takes about the margin, cache that frees now before the store's chunk above its floor, never
 // the store below its floor, and the newest resume point stays in RAM while older cache covers the
-// margin.
+// margin. It comes once the burst's points have their copies, the delay after the last request ended
+// at 63.3 s (WriteBehind::ended): within it no cached point frees without a write.
 void testCriticalTakesTheMarginASecondAndKeepsTheResumePoint() {
   const Machine &machine = k35BStudio18G;
-  constexpr double critical = 66'000.0, normal = 72'000.0;
+  constexpr double critical = 76'000.0, normal = 82'000.0;
   std::vector<test::HostEvent> script;
   for (double at = critical; at < normal; at += 500.0)
     script.push_back({at, machine.otherBytes, engine::MemoryPressure::Critical});
@@ -865,7 +866,8 @@ void testAColdPromptStartsWithinTheOvertakesAmidCachedResends() {
 // reads, the starts and the host's critical passes release the pages whose copies landed, between commands. Nothing
 // breaks an engine rule (std::logic_error), the cache's invariants hold after every step, no claim's count of what it
 // takes covered its need where its takes then did not (MemoryLedger::CountChecks), no lane yields outside the
-// critical pressure and the 5 s after it where none yields at twice the limit, and each request ends as it does where
+// critical pressure and the 5 s after it where none yields at twice the limit (but a Background lane, which runs
+// beside higher work only once it has aged and which memory ranks last), and each request ends as it does where
 // the limit and the host hold every request, at twice the limit: with the same output and finish reason (the fake
 // model's tokens do not depend on the K/V it reads). SPLASH_SIM_RELEASE_SEEDS runs more seeds than the four.
 void testRandomSchedulesWithReleasesEndAsWithoutThem() {
@@ -917,23 +919,37 @@ void testRandomSchedulesWithReleasesEndAsWithoutThem() {
     turn.tokens.insert(turn.tokens.end(), question.begin(), question.end());
     schedule.push_back(std::move(turn));
     std::ranges::sort(schedule, {}, &Arrival::at);
+    std::string priorities;
+    for (const Arrival &arrival : schedule)
+      priorities += " " + std::to_string(arrival.id) + ":" + std::to_string(int(arrival.priority)) + "@" +
+                    std::to_string(int(arrival.at));
     const double critical = double(pick(60, 180)) * 1'000.0;
     const std::vector<test::HostEvent> script{
         {critical, kStudio18G.otherBytes, engine::MemoryPressure::Critical},
         {critical + 3'000.0, kStudio18G.otherBytes, engine::MemoryPressure::Normal}};
     // The tight run's yields outside the critical pressure and the 5 s after it.
     size_t calmYields = 0;
+    std::string calmYielded;
     const auto run = [&](const Machine &machine) {
       Serving serving(machine, &machine == &tight ? script : std::vector<test::HostEvent>{});
       size_t next = 0, yields = 0;
       calmYields = 0;
+      calmYielded.clear();
       const auto observe = [&] {
         if (!serving.fixture.loop.commandInFlight())
           serving.fixture.cache.checkInvariants();
-        const size_t now = serving.fixture.executor.suspendedIds.size();
-        if (now != yields && (serving.now() < critical || serving.now() > critical + 8'000.0))
-          calmYields += now - yields;
-        yields = now;
+        // A Background lane runs beside higher work only once it has aged,
+        // and memory still ranks it last: its yields are that rule's (seed 1:
+        // lane 4, Background, aged beside a Normal one, yielded at 225 s).
+        const std::vector<uint64_t> &suspended = serving.fixture.executor.suspendedIds;
+        if (serving.now() < critical || serving.now() > critical + 8'000.0)
+          for (size_t index = yields; index < suspended.size(); ++index)
+            if (std::ranges::find(schedule, suspended[index], &Arrival::id)->priority !=
+                engine::RequestPriority::Background) {
+              ++calmYields;
+              calmYielded += " " + std::to_string(suspended[index]) + " at " + std::to_string(serving.now()) + " ms";
+            }
+        yields = suspended.size();
       };
       while (serving.ended.size() < schedule.size()) {
         for (; next < schedule.size() && schedule[next].at <= serving.now(); ++next)
@@ -956,11 +972,13 @@ void testRandomSchedulesWithReleasesEndAsWithoutThem() {
     };
     const auto ends = run(tight);
     const size_t tightYields = calmYields;
+    const std::string tightYielded = calmYielded;
     require(ends == run(ample), "seed " + std::to_string(seed) +
                                     ": a request ended otherwise than where the limit and the host hold them all");
     require(calmYields != 0 || tightYields == 0,
             "seed " + std::to_string(seed) + ": " + std::to_string(tightYields) +
-                " lanes yielded at the tight limit outside the critical pressure, none at twice the limit");
+                " lanes yielded at the tight limit outside the critical pressure (" + tightYielded +
+                " ), none at twice the limit; id:priority@arrival" + priorities);
   }
   require(releases != 0, "no schedule released a lane's pages");
   note("random schedules with " + std::to_string(releases) + " releases ended as where nothing was short");

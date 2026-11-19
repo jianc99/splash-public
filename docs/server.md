@@ -186,6 +186,7 @@ paths for `--model-dir`, `--draft-model` and `--mmproj`.
 | `--cache-dir` | `~/Library/Caches/Splash/prefix-cache` | Where `--persistent-cache` keeps its files; needs `--persistent-cache`. |
 | `--served-model-name` | None | Additional model name the API accepts; repeatable. See [API model aliases](#api-model-aliases). |
 | `--announce-served-name` | Off | Report the first `--served-model-name` in responses; needs `--served-model-name`. |
+| `--sampling-default` | None (the served family's published `temperature`, `top_p` and `top_k`; the neutral value for the rest) | Value of a sampling field that a request leaves out; repeatable, e.g. `temperature=0.6`. See [sampling](api.md#sampling). |
 | `--reasoning-effort` | `SPLASH_REASONING_EFFORT` or each request's own | Effort of every Chat, Responses and Messages request, whatever the request asks; `none` turns thinking off. See [default reasoning effort](#default-reasoning-effort). |
 | `--default-reasoning-effort` | `SPLASH_DEFAULT_REASONING_EFFORT` or the template's | Effort of Chat and Responses requests that set none. See [default reasoning effort](#default-reasoning-effort). |
 | `--thinking-token-budget` | `SPLASH_THINKING_TOKEN_BUDGET` or none | Thinking tokens of a request that sets no budget. See [thinking token budget](#thinking-token-budget). |
@@ -306,8 +307,12 @@ that includes loopback when launching agents locally.
 ### Memory and context
 
 Splash sizes memory and context when it starts. Its Metal budget is the GPU's
-recommended working set less a small margin; `--max-memory` can only lower it,
-such as `--max-memory 28G`, and the log says when a larger one is ignored. The
+recommended working set less a small margin, and at most nine tenths of the
+Mac's memory; `--max-memory` lowers it, such as `--max-memory 28G`, and the log
+says when a larger one is ignored. On a Mac whose GPU wired limit was raised
+(`iogpu.wired_limit_mb`), the recommendation follows the raised limit: the
+automatic budget still leaves a tenth of the memory unwired, and only an
+explicit `--max-memory` goes past that, up to the recommendation. The
 automatic plan takes the whole budget, its streamed stores starting with no more
 than the host's memory leaves the engine when it starts (below); on a Mac that
 also runs other applications, `--max-memory` leaves them room whatever they hold
@@ -866,7 +871,10 @@ keep on the volume by the same count (`file_bytes`),
 `write_budget_bytes`, the bytes the next state's write not in use may take
 now, and `writes_deferred_ms`, how long writes held back for SSD reads a step
 waited for. Without a write budget `writes_gated` is
-never `budget` and `write_budget_bytes` is 0. `written_last_hour_bytes` and
+never `budget` and `write_budget_bytes` is 0. A cache the start asked for that
+is off, as on a volume with too little room beyond the space it keeps free,
+reports why in `off_reason`, the words of its `SSD cache off` line; absent
+while it is on, or set Off. `written_last_hour_bytes` and
 `written_last_day_bytes` are the cache's write rate: what its writes took over
 the last hour and the last day the Mac was awake, counted as the write budget
 counts them, with a budget or without. The day's bytes are the number to set

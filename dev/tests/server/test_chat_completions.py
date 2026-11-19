@@ -4,8 +4,10 @@ from dataclasses import replace
 
 from dev.tests.server_fixtures import (
     FakeRuntime,
+    FakeTokenizer,
     HarnessTestCase,
     Plan,
+    byte_backend,
     chat_body,
     openai_client,
     responses_body,
@@ -14,6 +16,29 @@ from server.chat_format import QWEN
 
 
 class ChatCompletionTests(HarnessTestCase):
+    def test_usage_says_what_the_request_reused(self):
+        # A state read back from the SSD cache, the prompt's KV matched past
+        # it where a state was lost: each in usage beside cached_tokens.
+        from server import protocol as wire
+
+        runtime = FakeRuntime(
+            Plan([[1], [2]], matched_tokens=1, start=(2, wire.StateSource.DISK, True))
+        )
+        harness = self.harness(runtime)
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", chat_body(seed=7)
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(payload)["usage"]["prompt_tokens_details"],
+            {
+                "cached_tokens": 1,
+                "prefix_tokens": 2,
+                "state_source": "disk",
+                "lost_state": True,
+            },
+        )
+
     def test_nonstream_reasoning_usage_metrics_and_seed(self):
         runtime = FakeRuntime(Plan([[1], [2], [3]]))
         harness = self.harness(runtime)
@@ -31,7 +56,12 @@ class ChatCompletionTests(HarnessTestCase):
                 "prompt_tokens": 2,
                 "completion_tokens": 3,
                 "total_tokens": 5,
-                "prompt_tokens_details": {"cached_tokens": 1},
+                "prompt_tokens_details": {
+                    "cached_tokens": 1,
+                    "prefix_tokens": 1,
+                    "state_source": "memory",
+                    "lost_state": False,
+                },
                 "completion_tokens_details": {"reasoning_tokens": 3},
             },
         )
@@ -144,6 +174,77 @@ class ChatCompletionTests(HarnessTestCase):
         self.assertEqual(response["choices"][0]["finish_reason"], "stop")
         self.assertEqual(response["usage"]["completion_tokens"], 2)
         self.assertEqual((runtime.stop_count, runtime.cancel_count), (1, 0))
+
+    def test_a_stop_sequence_ends_the_answer_not_the_reasoning_or_a_call(self):
+        # The fake vocabulary's </think> is token 26; tokens 60 and 63 are a
+        # call's opening and close as the format has them.
+        tokenizer = FakeTokenizer()
+        tokenizer.fragments.update(
+            {
+                60: "<tool_call>",
+                61: "\n<function=weather>\n<parameter=city>\nPa ris 144\n",
+                62: "</parameter>\n</function>\n",
+                63: "</tool_call>",
+                64: "12*12 is 144.",
+                65: "\n\nIt is 144 indeed",
+                66: " and more",
+            }
+        )
+        tokenizer.backend_tokenizer = byte_backend(tokenizer.fragments)
+        runtime = FakeRuntime(
+            Plan([[64], [26], [65], [66]], reason="length", delay=0.01),
+            Plan([[64], [26], [60, 61], [62, 63], [65], [66]], reason="length"),
+        )
+        harness = self.harness(
+            runtime,
+            tokenizer=tokenizer,
+            chat_format=replace(
+                QWEN, think_end_id=26, call_open_id=60, call_close_id=63
+            ),
+        )
+        status, _, payload = harness.request(
+            "POST", "/v1/chat/completions", chat_body(stop=["144"])
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        choice = response["choices"][0]
+        self.assertEqual(
+            (
+                choice["message"]["reasoning_content"],
+                choice["message"]["content"],
+                choice["finish_reason"],
+            ),
+            ("12*12 is 144.", "It is ", "stop"),
+        )
+        self.assertEqual(response["usage"]["completion_tokens"], 3)
+        self.assertEqual(
+            response["usage"]["completion_tokens_details"]["reasoning_tokens"], 1
+        )
+        self.assertEqual(runtime.stop_count, 1)
+        status, _, payload = harness.request(
+            "POST",
+            "/v1/chat/completions",
+            chat_body(
+                stop=["144"],
+                tools=[{"type": "function", "function": {"name": "weather"}}],
+            ),
+        )
+        self.assertEqual(status, 200, payload)
+        response = json.loads(payload)
+        message = response["choices"][0]["message"]
+        self.assertEqual(
+            [
+                json.loads(call["function"]["arguments"])
+                for call in message["tool_calls"]
+            ],
+            [{"city": "Pa ris 144"}],
+        )
+        self.assertEqual(message["content"], "\n\nIt is ")
+        self.assertEqual(response["choices"][0]["finish_reason"], "tool_calls")
+        self.assertEqual(response["usage"]["completion_tokens"], 7)
+        self.assertEqual(
+            response["usage"]["completion_tokens_details"]["reasoning_tokens"], 1
+        )
 
     def test_usage_counts_only_tokens_before_the_thinking_delimiter(self):
         # The fake vocabulary's </think> is token 26.

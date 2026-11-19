@@ -63,6 +63,8 @@ public:
   ~StateUse() noexcept;
 
   void reset() noexcept;
+  // The block it marks; 0 once reset.
+  [[nodiscard]] uint64_t kvBlock() const noexcept { return kvBlock_; }
 
 private:
   friend class StateCache;
@@ -180,11 +182,12 @@ public:
   // The matching checkpoint is a reply's state, which its decode captured:
   // opportunistic, a reclaim frees its RAM copy with no write and never
   // writes it, as a next prompt resumes there only if it renders the reply
-  // back token for token. keepReply makes it a checkpoint a reclaim writes
-  // as any, once its request has shown its conversation does render replies
-  // back. A reuse by another publication, or a use, ends either.
+  // back token for token. A reuse by another publication, or a use, ends it.
   void markReply(StateCheckpoint checkpoint) noexcept;
-  void keepReply(StateCheckpoint checkpoint) noexcept;
+  // The same for a prefill checkpoint its lane holds and can write itself; keepHeld, once the lane stores it, makes
+  // it a checkpoint a reclaim writes.
+  void markHeld(StateCheckpoint checkpoint) noexcept;
+  void keepHeld(StateCheckpoint checkpoint) noexcept;
   // The matching checkpoint is pinned: retireCheckpointState refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept;
   // An unfinished request's conversation resumes from the state at this
@@ -203,6 +206,26 @@ public:
   [[nodiscard]] bool contains(uint64_t kvBlock) const noexcept;
   // An ordinary state, in either tier.
   [[nodiscard]] bool ordinary(uint64_t kvBlock) const noexcept;
+  // The state at the block is ordinary and superseded: ordinary states below it sit on exactly one of its
+  // branches, more than kKeptBehind of them nested, so a turn resumes past it and only an edit of what lies between
+  // would come back to it. A conversation's newest point, the kKeptBehind points behind it and a junction, which two
+  // continuations share, are kept. A reclaim takes superseded points first and never writes them, and write-behind
+  // copies none (Cache::copiedAhead): of a 35-turn agent session at its memory wall on Qwen3.6-35B-A3B (a
+  // 16 GB M4 Mac mini), 33 of the 34 states written on eviction were superseded and none was read.
+  [[nodiscard]] bool superseded(uint64_t kvBlock) const noexcept;
+  // A conversation's newest point, or a junction: no ordinary state below it on one branch alone.
+  [[nodiscard]] bool newest(uint64_t kvBlock) const;
+  // The points kept behind the newest: its own prompt-end, which a regenerate or an edit of the last turn resumes
+  // from, at the wall and after a restart. The strict rule (0), which drops that point as well, is for a diagnostic
+  // build, to measure the hit rate it costs.
+  static constexpr uint32_t kKeptBehind = 1;
+  // Its request ended rendering an earlier reply back: the reply's state, a checkpoint, becomes its
+  // conversation's newest point, an ordinary state, which its next turn resumes from.
+  // False when the checkpoint is no longer that reply's.
+  bool keepReplyAsPoint(StateCheckpoint checkpoint);
+  // A junction's state, published where a request leaves another's chain: a branch point, never superseded, though
+  // its second continuation holds no state below it until that request publishes one.
+  void markBranchPoint(uint64_t kvBlock);
   // The size of the state at this block; zero without one.
   [[nodiscard]] uint64_t bytes(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.
@@ -330,15 +353,18 @@ private:
   friend class CompositeStateLease;
   friend class StateUse;
 
-  // A reply's state (markReply), opportunistic until its request keeps it.
-  enum class Reply : uint8_t { None, Opportunistic, Kept };
   struct Entry {
     std::shared_ptr<const CompositeState> ram;
     std::shared_ptr<const CompositeState> disk;
     uint32_t pins = 0;
     uint64_t lastUsed = 0;
     bool checkpoint = false;
-    Reply reply = Reply::None;
+    // A reply's state (markReply) until its request keeps it as a point (keepReplyAsPoint), or a prefill checkpoint
+    // its lane holds (markHeld) until the lane stores it (keepHeld).
+    bool opportunistic = false;
+    // An ordinary state another below it supersedes (supersededBelow()), set as the states below it change.
+    bool superseded = false;
+    bool branchPoint = false;
     bool invalid = false;
     uint64_t publication = 0;
     RecencyOrder::Node ramNode;
@@ -361,7 +387,8 @@ private:
   // A RAM copy that leaves through a write while the tier takes one: a
   // writable one without a disk copy, but an opportunistic reply's.
   [[nodiscard]] static bool writer(const Entry &entry) noexcept {
-    return entry.ram && !entry.disk && entry.ram->writable() && entry.reply != Reply::Opportunistic;
+    return entry.ram && !entry.disk && entry.ram->writable() && !entry.opportunistic &&
+           !entry.superseded;
   }
   [[nodiscard]] static const std::shared_ptr<const CompositeState> &
   copy(const Entry &entry) noexcept {
@@ -411,6 +438,13 @@ private:
   // and a checkpoint is upgraded, its disk copy labelled with its new class
   // at once.
   void makeOrdinary(uint64_t kvBlock, Entry &entry);
+  // An ordinary state at the block or anywhere below it.
+  [[nodiscard]] bool holdsOrdinaryState(uint64_t kvBlock) const;
+  // Whether the state at the block has more than `behind` ordinary states nested below it on one branch alone.
+  [[nodiscard]] bool supersededBelow(uint64_t kvBlock, uint32_t behind) const;
+  // Sets the superseded mark of the block's state and of the nearest ordinary states above it, kKeptBehind + 1 of
+  // them, whose marks an ordinary state appearing or leaving at the block can change.
+  void markSuperseded(uint64_t kvBlock);
   [[nodiscard]] bool writing(uint64_t kvBlock) const noexcept {
     return pending_ && pending_->kvBlock == kvBlock;
   }

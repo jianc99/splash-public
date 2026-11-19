@@ -194,6 +194,16 @@ public:
   [[nodiscard]] bool released() const noexcept override;
   void release() override;
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
+  // Forgets every streamed expert, its slot free, the recycling starting
+  // over, while no command is in flight; the experts of a size of one block
+  // stay. The start's warmups (model::RuntimeModel::endWarmups) run made-up
+  // rows a lane at widths 1-4: their experts, routed again and again, sit
+  // in the recycling's frequent list, which a prompt's long chunks (scans)
+  // never displace. MEASURED on the 24 GB M6, Qwen3.8-Flash-Next Q2_0 with
+  // 6.5 GiB of experts, a 512-token prompt after them: its prefill 2644 ms
+  // against 2235 ms without them, and the first decode cycle missed 1196 of
+  // its 1663 experts against 5.
+  void forget();
   // While memory is short: gives back the last live elastic chunk of the
   // streamed size with the largest share of its slots above its floor. The
   // experts it holds move to free slots below it, after as many of the

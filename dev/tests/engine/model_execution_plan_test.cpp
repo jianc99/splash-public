@@ -284,6 +284,52 @@ void checkDecodeStepMoe(const model::LoadedModel &loaded) {
   }
 }
 
+// A MoE plan runs its experts' int8 passes only where the block's experts
+// take them (MoeShape::int8Experts), int8 activations are on and the device's
+// dense prefill runs the int8 tile (Apple10, Apple11) on the chunk's rows
+// (more than the decode tiles' 64): `--activations bf16`, Apple9, decode steps
+// and chunks of 64 rows or fewer keep the staged experts' exact activations.
+void checkMoeInt8Passes(const model::LoadedModel &loaded) {
+  const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  for (uint32_t family : {9U, 10U, 11U})
+    for (const ops::Int8Activations setting : {ops::Int8Activations::On, ops::Int8Activations::Off})
+      for (const bool experts : {false, true}) {
+        DeviceCapabilities device;
+        device.appleGpuFamily = family;
+        device.gpuCoreCount = 20;
+        const ops::ExecutionPlans plans(device, setting);
+        ops::MoeShape shape = geometry.target.moeBlockShape();
+        shape.int8Experts = experts;
+        for (const uint32_t rows : {1U, 64U, 65U, 263U, 2048U}) {
+          const bool int8 = experts && setting == ops::Int8Activations::On && family >= 10 && rows > 64;
+          const ops::MoePlan plan = plans.moe(shape, geometry.target.moeRouterFormat, rows);
+          require(plan.configuration().int8Passes == int8,
+                  "a MoE plan of Apple" + std::to_string(family) + (setting == ops::Int8Activations::On ? "" : " with bf16 activations") +
+                      (experts ? "" : " without int8 experts") + " of " + std::to_string(rows) + " rows" +
+                      (int8 ? " runs no" : " runs") + " int8 passes");
+          require((plan.workspace().groupedCodesBytes > 0) == int8, "a MoE plan's int8 scratch does not follow its passes");
+        }
+      }
+  // The int8 passes hold the gate's rows in the expert output, rows of the
+  // hidden size: a block whose experts are wider is refused, not overrun.
+  DeviceCapabilities device;
+  device.appleGpuFamily = 10;
+  device.gpuCoreCount = 20;
+  const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+  ops::MoeShape wide = geometry.target.moeBlockShape();
+  wide.int8Experts = true;
+  wide.expertIntermediateSize = wide.hiddenSize + 64;
+  bool refused = false;
+  try {
+    static_cast<void>(plans.moe(wide, geometry.target.moeRouterFormat, 2048));
+  } catch (const std::invalid_argument &) {
+    refused = true;
+  }
+  require(refused, "a MoE plan ran int8 passes over experts wider than the hidden size");
+  wide.int8Experts = false;
+  static_cast<void>(plans.moe(wide, geometry.target.moeRouterFormat, 2048));
+}
+
 // The decode arena's plan counts each buffer it allocates in whole host
 // pages, as Metal allocates them and the memory ledger charges them: one
 // request's KV capacity rests on it, and a plan of the scratch fields' sum
@@ -550,6 +596,7 @@ int main() {
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>());
+    checkMoeInt8Passes(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepMoe(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkDecodeStepMoe(loadedModel<model::Qwen4ExpWeights>());
     std::cout << "model execution plans: PASS (three paired geometries)\n";

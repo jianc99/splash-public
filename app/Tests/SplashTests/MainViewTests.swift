@@ -76,6 +76,8 @@ struct MainViewTests {
         #expect(state.server.warmup == ServeRecord.Warmup(steps_done: 3, steps: 10))
         #expect(state.status == "\(state.displayName(of: model)) · Warming up · 3 of 10")
         #expect(state.serverStatus.note == Server.Step.warming.note)
+        // A new install's first start prepares the GPU too, not only the first after an update.
+        #expect(Server.Step.warming.note?.hasPrefix("A model's first start after an install or an update") == true)
         server.signal("warm")
         try await waitFor(state.server.phase == .ready)
         #expect(state.serverTitle == name)
@@ -130,7 +132,7 @@ private final class FakeServer {
         let runtime = try FakeRuntime("splash-fake-server", launcher: "stepped_server")
         root = runtime.root
         port = runtime.port
-        state = runtime.state(keychain: Keychain(service: "Splash Tests"))
+        state = runtime.state()
     }
 
     /// Lets the launcher go on past the step that waits for `name`.
