@@ -124,12 +124,14 @@ void testStateWithoutACacheSlotGoesToDisk() {
           "the prefix was not restored from the disk state");
   // A rolling checkpoint denied a cache slot goes to disk like any state,
   // and stays there beside the replay state of the same prompt, as the
-  // prompt's last checkpoint.
+  // prompt's last checkpoint. Its tail at 7936, denied one inside its
+  // command, is dropped: the command goes on past it, uncut.
+  const uint64_t cuts = counters.captureCuts;
   engine.submit(request(4, std::vector<uint32_t>(2 * kPrefillCheckpointTokens + 1, 4)));
   runUntilIdle(engine);
   counters = engine.snapshot();
   require(counters.checkpointPublications == 1 &&
-              counters.checkpointPublicationFailures == 0 &&
+              counters.checkpointPublicationFailures == 0 && counters.captureCuts == cuts &&
               counters.diskStatePublications == 3 && executor.diskSnapshots == 3 &&
               counters.resources.stateCache.checkpointEntries == 1 &&
               counters.resources.stateCache.checkpointRetirements == 0 &&
@@ -137,7 +139,8 @@ void testStateWithoutACacheSlotGoesToDisk() {
           "the checkpoint did not go to disk and stay there");
 }
 
-// A state already on disk at the same block is deduplicated, not written again.
+// A state already on disk at the same block is deduplicated, not written again. The prompt's tail
+// checkpoint, denied RAM inside its command, is dropped.
 void testStateAlreadyOnDiskIsDeduplicated() {
   test::TestKvStorage storage(512, 4096, 4);
   KvPool pool(storage, 0);
@@ -163,7 +166,7 @@ void testStateAlreadyOnDiskIsDeduplicated() {
           "both lanes did not compute the prompt");
   const auto counters = engine.snapshot();
   require(executor.diskSnapshots == 1 && counters.diskStatePublications == 1 &&
-              counters.replayStatePublications == 1 &&
+              counters.replayStatePublications == 1 && counters.checkpointPublications == 0 &&
               counters.deduplicatedStatePublications == 1,
           "a state already on disk was counted as written");
 }
@@ -231,7 +234,9 @@ void testFailedFinalStateKeepsTheDiskCheckpoint() {
     Events events;
     engine::Engine engine(test::engineConfig(), cache, executor, events);
     guardReleases(storage, engine);
-    const std::vector<uint32_t> prompt(2 * kPrefillCheckpointTokens + 1, 65);
+    // A checkpoint at 4096, the replay point at 6272: too near it for a tail
+    // checkpoint, which would replace it.
+    const std::vector<uint32_t> prompt(6273, 65);
     EngineRequest decoding = request(610, prompt);
     decoding.maxNewTokens = 64;
     engine.submit(decoding);
@@ -333,7 +338,8 @@ void testDiskCheckpointStaysUntilItsSuccessorIsPublished() {
 }
 
 // No checkpoint is planned within a prefill chunk of the replay boundary; one a chunk or more away
-// is published, in RAM or on disk, beside the replay state.
+// is published, in RAM or on disk, beside the replay state. The tail checkpoint 256 before it,
+// planned when no checkpoint is, lies inside a command: published in RAM, denied RAM it is dropped.
 void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
   const uint32_t chunk = model::ExecutionLimits::prefillTokenBudget;
   for (bool denyRam : {false, true}) {
@@ -352,14 +358,17 @@ void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
       engine.submit(request(1, prompt));
       runUntilIdle(engine);
       const auto counters = engine.snapshot();
-      const uint64_t checkpoint = remaining >= chunk;
-      require(counters.checkpointPublications == checkpoint &&
+      const std::vector<uint32_t> atCheckpoint(kPrefillCheckpointTokens + 1, 71);
+      const uint64_t kept = denyRam ? remaining >= chunk : 1;
+      require((cache.probe(atCheckpoint, {}).cachedTokens() == kPrefillCheckpointTokens) ==
+                      (remaining >= chunk) &&
+                  counters.checkpointPublications == kept &&
                   counters.checkpointPublicationFailures == 0 &&
                   counters.replayStatePublications == 1 &&
                   counters.replayStatePublicationFailures == 0 &&
-                  executor.diskSnapshots == (denyRam ? 1 + checkpoint : 0) &&
-                  counters.resources.stateCache.entries == 1 + checkpoint &&
-                  counters.resources.stateCache.checkpointEntries == checkpoint &&
+                  executor.diskSnapshots == (denyRam ? 1 + kept : 0) &&
+                  counters.resources.stateCache.entries == 1 + kept &&
+                  counters.resources.stateCache.checkpointEntries == kept &&
                   events.completedCount == 1 && events.failedCount == 0,
               "a checkpoint within a chunk of the replay boundary was planned or the final "
               "state was lost");
@@ -373,8 +382,9 @@ void testNoCheckpointWithinAChunkOfTheReplayBoundary() {
   }
 }
 
-// A lane cancelled past a skipped near-final checkpoint resumes from the checkpoint before it, in
-// RAM or on disk.
+// A lane cancelled past a skipped near-final checkpoint resumes from the tail checkpoint beside
+// the checkpoint before it in RAM, or from that checkpoint on disk: denied RAM inside its command,
+// the tail is dropped.
 void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
   for (bool disk : {false, true}) {
     test::TestKvStorage storage(512, 4096, 4);
@@ -389,36 +399,38 @@ void testSkippedCheckpointKeepsPreviousRecoveryPoint() {
     Events events;
     engine::Engine engine(test::engineConfig(), cache, executor, events);
     guardReleases(storage, engine);
+    // Checkpoints at 4096 and the tail's at 7968, the replay point at 8224.
     const std::vector<uint32_t> prompt(2 * kPrefillCheckpointTokens + 33, 73);
+    const uint32_t tail = 2 * kPrefillCheckpointTokens + 32 - kTrimmedTailTokens;
+    const uint32_t cancelAt = 2 * kPrefillCheckpointTokens;
+    const uint64_t kept = disk ? 1 : 2;
     engine.submit(request(1, prompt));
     for (uint32_t step = 0; step < 128; ++step) {
       static_cast<void>(engine.tick(step + 1));
-      if (!engine.commandInFlight() &&
-          executor.requests.at(1).position == 2 * kPrefillCheckpointTokens)
+      if (!engine.commandInFlight() && executor.requests.at(1).position == cancelAt)
         break;
     }
     const auto before = engine.snapshot();
-    require(!engine.commandInFlight() &&
-                executor.requests.at(1).position == 2 * kPrefillCheckpointTokens &&
+    require(!engine.commandInFlight() && executor.requests.at(1).position == cancelAt &&
                 std::none_of(executor.plans.at(1).boundaries.begin(),
                              executor.plans.at(1).boundaries.end(),
                              [](const DraftBoundaryPlan &boundary) {
                                return boundary.boundary == 2 * kPrefillCheckpointTokens;
                              }) &&
-                before.checkpointPublications == 1 &&
+                before.checkpointPublications == kept &&
                 before.checkpointPublicationFailures == 0 &&
-                before.resources.stateCache.checkpointEntries == 1 &&
+                before.resources.stateCache.checkpointEntries == kept &&
                 before.resources.stateCache.checkpointRetirements == 0 &&
-                executor.diskSnapshots == (disk ? 1 : 0),
+                before.captureCuts == 0 && executor.diskSnapshots == (disk ? 1 : 0),
             "a near-final checkpoint was planned or replaced its predecessor");
     engine.cancel(1);
     runUntilIdle(engine);
     engine.submit(request(2, prompt));
     runUntilIdle(engine);
-    require(events.starts.back() == kPrefillCheckpointTokens &&
+    require(events.starts.back() == (disk ? kPrefillCheckpointTokens : tail) &&
                 engine.snapshot().cancelled == 1 && engine.snapshot().completed == 1 &&
                 events.failedCount == 0 &&
-                cache.snapshot().stateCache.checkpointEntries == 1,
+                cache.snapshot().stateCache.checkpointEntries == kept,
             "cancellation after a skipped checkpoint lost the earlier recovery point");
   }
 }

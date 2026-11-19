@@ -866,6 +866,11 @@ uint32_t Engine::promptReplayBoundary(const Request &active) noexcept {
   return (active.promptTokens - tail) / KvCache::pageTokens * KvCache::pageTokens;
 }
 
+uint32_t Engine::tailBoundary(const Request &active) noexcept {
+  const uint32_t replay = promptReplayBoundary(active);
+  return replay > kTrimmedTailTokens ? replay - kTrimmedTailTokens : 0;
+}
+
 uint32_t Engine::sharedPrefillBoundary(const Request &left,
                                        const Request &right) {
   // Requests of different cache salts share no block.
@@ -1283,7 +1288,40 @@ DraftContextPlan Engine::configureDraftStatePlan(Request &active,
   addStateBoundary(active, stateBoundary, promptReplayBoundary(active), false, true);
 
   static_cast<void>(addSharedPrefillBoundaries(active, stateBoundary, true));
+  addTailCheckpoint(active, stateBoundary);
   return pendingDraftStatePlan(active, stateBoundary);
+}
+
+void Engine::addTailCheckpoint(Request &active, uint32_t stateBoundary) {
+  // An agent client often rewrites the tail of the previous turn's last
+  // message, so its next turn diverges a few dozen tokens before this
+  // prompt's replay point and would restore from the last checkpoint, up to
+  // a checkpoint interval and a chunk back. A checkpoint kTrimmedTailTokens
+  // before the replay point keeps that restore within that distance. Like a
+  // planned checkpoint, it is planned a prefill chunk or more past the state
+  // before it. It retires no checkpoint before it, which stays for a rewrite
+  // below the tail: a request costs one capture, kTrimmedTailTokens more
+  // draft-context rows and one more cached state at rest, beside its last
+  // rolling checkpoint and its replay point, reclaimed oldest first. A lane
+  // that resumes past its prompt rebuilds what memory pressure took from it,
+  // and plans none: under that pressure it would take one more state's
+  // buffers.
+  const uint32_t replay = promptReplayBoundary(active);
+  const uint32_t tail = tailBoundary(active);
+  if (!config_.prefillCheckpointTokens || !tail || replayStateBoundary(active) != replay)
+    return;
+  auto &plan = active.stateBoundaries;
+  const auto at = [&](uint32_t tokens) {
+    return std::lower_bound(plan.begin(), plan.end(), tokens,
+                            [](const Request::StateBoundary &point, uint32_t value) { return point.tokens < value; });
+  };
+  const auto next = at(tail);
+  if (next != plan.end() && next->tokens < replay)
+    return;
+  const uint32_t before = next != plan.begin() ? std::prev(next)->tokens : stateBoundary;
+  if (tail >= uint64_t{before} + model::ExecutionLimits::prefillTokenBudget &&
+      addStateBoundary(active, stateBoundary, tail, true, true))
+    at(tail)->tail = true;
 }
 
 bool Engine::addStateBoundary(Request &active, uint32_t after, uint32_t tokens,
@@ -1446,6 +1484,10 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
   // rebuilt replay point counts as a replay-state publication, not a
   // junction.
   const bool replay = !checkpoint && objective.tokens == promptReplayBoundary(active);
+  // The tail checkpoint retires none before it: the lane's last rolling
+  // checkpoint stays cached beside it, as beside the replay point.
+  const bool tail = checkpoint && objective.tail;
+  const bool keepsCheckpoint = replay || tail;
   uint64_t &failures = checkpoint ? counters_.checkpointPublicationFailures
                        : replay   ? counters_.replayStatePublicationFailures
                                   : counters_.junctionMaterializationFailures;
@@ -1473,14 +1515,15 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     // ended at without them (below). One only on disk gives none: it stays
     // the recovery point until this state is published, and retires after
     // the publication, as does the one a reused state leaves. No checkpoint
-    // is published while a restore lease pins the one before it. The
-    // prompt's replay point keeps the lane's checkpoint (below).
-    if (checkpoint && checkpointPinned(active)) {
+    // is published while a restore lease pins the one before it, but the
+    // tail. The prompt's replay point and the tail keep the lane's
+    // checkpoint (below).
+    if (checkpoint && !tail && checkpointPinned(active)) {
       ++failures;
       return false;
     }
     const bool resident = cache_.stateResident(active.latestCheckpoint.kvBlock);
-    if (!replay && resident)
+    if (!keepsCheckpoint && resident)
       static_cast<void>(retireCheckpoint(active));
     // The command has completed, so the state it ended at for its lane's
     // checkpoint is taken from the lane now. The replay point keeps that
@@ -1530,13 +1573,13 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
     }
   }
   // The previous recovery point, if the lane still holds one, retires now,
-  // except at the prompt's replay point: there it stays cached, as
-  // disposable as any checkpoint, for a later request that shares the
+  // except at the prompt's replay point or its tail: there it stays cached,
+  // as disposable as any checkpoint, for a later request that shares the
   // prompt up to it but not up to the replay point. The lane holds it
   // until this state is published; a refused publication leaves it the
   // lane's recovery point, unless it retired above to give this state its
   // buffers.
-  if (!replay)
+  if (!keepsCheckpoint)
     static_cast<void>(retireCheckpoint(active));
   active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                        : StateCheckpoint{};

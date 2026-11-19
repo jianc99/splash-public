@@ -229,10 +229,10 @@ void testSharedPrefillRebuildsTheMissingJunctionOnce() {
   std::vector<uint32_t> branch(6575, 7);
   std::fill(branch.begin() + 6517, branch.end(), 8);
   {
-    // The prompt kept its last checkpoint, at 4096; the branch point has KV
-    // and no state.
+    // The prompt kept its last checkpoint, its tail at 6272; the branch point
+    // has KV and no state.
     auto hit = cache.lookup(branch, {});
-    require(hit.kvBoundary == 6496 && hit.resumeBoundary() == 4096,
+    require(hit.kvBoundary == 6496 && hit.resumeBoundary() == 6272,
             "fixture did not recreate an internal branch past the kept checkpoint");
   }
   const uint32_t before = model.prefillRows;
@@ -241,8 +241,8 @@ void testSharedPrefillRebuildsTheMissingJunctionOnce() {
     engine.submit(request(id, branch));
   }
   h.runUntilIdle();
-  require(model.prefillRows - before == (6496 - 4096) + 4 * (6575 - 6496) &&
-              model.restored == 4096 + 3 * 6496 && events.completedCount == 5,
+  require(model.prefillRows - before == (6496 - 6272) + 4 * (6575 - 6496) &&
+              model.restored == 6272 + 3 * 6496 && events.completedCount == 5,
           "concurrent internal branches each rebuilt the missing GDN state");
 }
 
@@ -452,18 +452,19 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
   };
   // Its replay point is where the producer resumes, and another
   // conversation's KV goes on with the prompt to 6400, where the producer
-  // plans a junction; that conversation's checkpoint at 4096 is evicted.
+  // plans a junction; that conversation's checkpoints, at 4096 and its
+  // tail's at 6336, are evicted.
   engine.submit(request(1, std::vector<uint32_t>(prompt.begin(), prompt.begin() + 1057)));
   h.runUntilIdle();
   engine.submit(request(2, branch(6400, 900'000)));
   h.runUntilIdle();
-  // The checkpoint leaves alone: an eviction would take the producer's resume point first, which the other
+  // The checkpoints leave alone: an eviction would take the producer's resume point first, which the other
   // conversation's replay point below it supersedes.
-  {
-    const CacheLookup checkpoint = resources.lookup(std::span(prompt).first(4097), {});
-    require(checkpoint.state && checkpoint.state->boundary() == 4096, "the other conversation left no checkpoint");
-    const uint64_t block = checkpoint.state->kvBlock();
-    resources.invalidateState(block);
+  for (const uint32_t boundary : {4096u, 6336u}) {
+    const std::vector<uint32_t> other = branch(6400, 900'000);
+    const CacheLookup checkpoint = resources.lookup(std::span(other).first(boundary + 1), {});
+    require(checkpoint.state && checkpoint.state->boundary() == boundary, "the other conversation left no checkpoint");
+    resources.invalidateState(checkpoint.state->kvBlock());
   }
   require(resources.snapshot().stateCache.checkpointEntries == 0,
           "the other conversation's checkpoint was not evicted");
@@ -504,8 +505,10 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
   require(start(3) == 1056 && start(4) == 4096 && start(5) == 6976 && start(6) == 7232 &&
               start(7) == 8192,
           "a late sibling did not resume from the producer's state it shares");
+  // Each conversation published its checkpoint at 4096 and its tail
+  // checkpoint, at 6336 and 11744; the producer's at 8192 became a junction.
   const auto counters = engine.snapshot();
-  require(counters.checkpointPublications == 2 && events.completedCount == 7 &&
+  require(counters.checkpointPublications == 4 && events.completedCount == 7 &&
               events.failedCount == 0 &&
               resources.lookup(branch(8192, 2'000'000), {}).resumeBoundary() == 8192,
           "the checkpoint a late sibling shares was not published as a junction");
@@ -515,6 +518,8 @@ void testLateSiblingBoundaryNeedsAWholeDraftWindow() {
 // (6144) or past it (6784) gets that checkpoint, or a junction after it, as its
 // junction; the producer's next command ends there, and a junction past the
 // checkpoint takes its place, so the command does not capture the checkpoint.
+// The producer publishes its checkpoints at 4096 and 8192 and its tail one at
+// 11744.
 void testLateSiblingJunctionAtOrPastAPlannedCheckpoint() {
   for (const uint32_t shared : {6144u, 6784u}) {
     test::EngineHarness h({.pages = 2048, .engine = {.prefillCheckpointTokens = 2048}});
@@ -558,7 +563,7 @@ void testLateSiblingJunctionAtOrPastAPlannedCheckpoint() {
     const auto counters = engine.snapshot();
     require(events.completedCount == 3 && events.failedCount == 0 &&
                 events.starts.back() == shared && counters.captureCuts == 1 &&
-                counters.junctionMaterializations == 1 && counters.checkpointPublications == 2 &&
+                counters.junctionMaterializations == 1 && counters.checkpointPublications == 3 &&
                 counters.checkpointPublicationFailures == 0 &&
                 resources.lookup(branch(2'000'000), {}).resumeBoundary() == shared,
             "the sibling did not resume from the producer's junction after one command");
@@ -567,7 +572,8 @@ void testLateSiblingJunctionAtOrPastAPlannedCheckpoint() {
 
 // A sibling's shared boundary on one of the producer's checkpoints makes that
 // checkpoint a state the sibling resumes from: it is published as a junction
-// and outlives the producer's later progress instead of rolling with it.
+// and outlives the producer's later progress instead of rolling with it. The
+// producer's one rolling checkpoint is its tail's, at 7936.
 void testSharedJunctionAtACheckpointIsReusable() {
   test::EngineHarness h({.pages = 512});
   engine::Cache &resources = h.cache;
@@ -590,9 +596,9 @@ void testSharedJunctionAtACheckpointIsReusable() {
   require(events.starts.at(1) == 4096 &&
               executor.restored == 4096,
           "the sibling did not resume from the producer's shared boundary");
-  require(counters.junctionMaterializations == 1 && counters.checkpointPublications == 0 &&
+  require(counters.junctionMaterializations == 1 && counters.checkpointPublications == 1 &&
               counters.resources.stateCache.checkpointRetirements == 0 &&
-              counters.resources.stateCache.checkpointEntries == 0,
+              counters.resources.stateCache.checkpointEntries == 1,
           "the shared boundary was published as a rolling checkpoint");
   std::vector<uint32_t> next(prompt.begin(), prompt.begin() + 4100);
   next.resize(4140, 1);
