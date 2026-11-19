@@ -307,8 +307,15 @@ that includes loopback when launching agents locally.
 ### Memory and context
 
 Splash sizes memory and context when it starts. Its Metal budget is the GPU's
-recommended working set less a small margin; `--max-memory` can only lower it,
-such as `--max-memory 28G`, and the log says when a larger one is ignored. The
+recommended working set less a small margin, and at most nine tenths of the
+Mac's memory: at their default wired limit, the 16 to 128 GB Macs measured
+leave 32 to 12% unwired, more than that tenth; larger Macs were not measured.
+`--max-memory` sets the budget in place of that, such as `--max-memory 28G`, up
+to the recommendation less its margin, and the log says when a larger one is
+capped. On a Mac whose GPU wired limit was raised (`iogpu.wired_limit_mb`), the
+recommendation follows the raised limit: the automatic budget still leaves a
+tenth of the memory unwired, and only an explicit `--max-memory` goes past
+that, up to the recommendation. The
 automatic plan takes the whole budget, its streamed stores starting with no more
 than the host's memory leaves the engine when it starts (below); on a Mac that
 also runs other applications, `--max-memory` leaves them room whatever they hold

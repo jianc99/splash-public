@@ -612,8 +612,8 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
       }
     }
   }
-  // Without a ceiling, or with one above this Mac's budget, which only a
-  // notice names, the start reaches the loader.
+  // Without a ceiling, or with one above the most it can set on this Mac,
+  // which a notice names, the start reaches the loader.
   for (const uint64_t ceiling : {uint64_t{0}, 1024 * kGiB}) {
     config.maximumMemoryBytes = ceiling;
     const std::string log = test::capturedStderr([&] {
@@ -621,9 +621,9 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
                                 "a sufficient weight budget did not reach the "
                                 "model loader");
     });
-    require((log.find("--max-memory ignored: its 1024.0 GiB exceed this Mac's Metal budget of ") !=
+    require((log.find("--max-memory capped: its 1024.0 GiB exceed the most it can set on this Mac, ") !=
              std::string::npos) == (ceiling != 0),
-            "a ceiling above the budget was ignored without a notice, or no ceiling was named");
+            "a ceiling above the budget was capped without a notice, or no ceiling was named");
   }
 }
 
@@ -734,8 +734,9 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
                                             test::qwen3_8Vision(), model::TargetSource::Safetensors,
                                             model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
-  const uint64_t device =
-      EngineMemoryPolicy::hardBudgetBytes(metal::probeDeviceCapabilities().recommendedMaxWorkingSetBytes, 0);
+  const DeviceCapabilities capabilities = metal::probeDeviceCapabilities();
+  const uint64_t device = EngineMemoryPolicy::hardBudgetBytes(capabilities.recommendedMaxWorkingSetBytes, 0,
+                                                              capabilities.physicalMemoryBytes);
   const uint64_t above = model::streamableWeights(root.path(), config.model, {}).loadedBytes + kGiB / 2;
   std::vector<uint64_t> limits{above};
   if (above >= device)

@@ -57,8 +57,9 @@ int main(int argc, char **argv) {
       // No start of the engine loads weights past its Metal memory budget,
       // which --max-memory only lowers, and a load past it can fail in a Metal
       // command for memory: refuse it before any image loads.
-      const uint64_t budget =
-          engine::EngineMemoryPolicy::hardBudgetBytes(backend.capabilities().recommendedMaxWorkingSetBytes, 0);
+      const auto &device = backend.capabilities();
+      const uint64_t budget = engine::EngineMemoryPolicy::hardBudgetBytes(device.recommendedMaxWorkingSetBytes, 0,
+                                                                         device.physicalMemoryBytes);
       if (const uint64_t bytes = tools::weightBytes(root, descriptor, options); bytes > budget)
         throw std::runtime_error("the weights need " + std::to_string(bytes / engine::kMiB) +
                                  " MiB, and the Metal memory budget is " + std::to_string(budget / engine::kMiB) +
