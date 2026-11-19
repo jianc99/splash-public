@@ -24,8 +24,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from transformers import AutoTokenizer
-
 from install import assembly
 from install.models import ModelError
 
@@ -1399,6 +1397,35 @@ def main():
         if args.chat_template_file is not None:
             custom = read_template_file(args.chat_template_file)
             print_status(f"Chat template file · {args.chat_template_file}")
+
+        def warming(event):
+            # As the warm-up begins and as each of its steps ends: it can take
+            # minutes on the first start after an update, so the console and
+            # the record, which the app shows, say how far it is. It runs on
+            # the reader thread, which must not block (on_warming):
+            # print_status only queues the line for the console's one writer,
+            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
+            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
+            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+
+        # The engine starts now and reads its weights while this process
+        # imports the tokenizer's library and loads the tokenizer and the
+        # chat template, which it needs none of: on a 32-core M5 Max, with
+        # the 27B and the 35B, they take 1.2-1.3 s of a 12.2 s start. A
+        # failure here closes the engine (finally, below); one of the
+        # engine's is raised by wait_ready.
+        runtime = engine_runtime.MultiplexedRuntime(
+            _native_command(args, model_root),
+            relaunch_command=lambda first: _native_command(
+                args, model_root, first.max_context_tokens
+            ),
+            pending_limit=args.queue_size,
+        )
+        runtime.on_warming = warming
+        runtime.start()
+        # Imported here, while the engine loads: transformers takes 0.35-0.75 s.
+        from transformers import AutoTokenizer
+
         # A tokenizer the loader cannot read fails with whatever its parsers
         # raise, such as a KeyError for a tokenizer.json without added_tokens:
         # each is the model's.
@@ -1425,25 +1452,6 @@ def main():
             thinking_end = thinking_end_tokens(
                 tokenizer, chat_templates.select(None).thinking_end, family.chat_format
             )
-        runtime = engine_runtime.MultiplexedRuntime(
-            _native_command(args, model_root),
-            relaunch_command=lambda first: _native_command(
-                args, model_root, first.max_context_tokens
-            ),
-            pending_limit=args.queue_size,
-        )
-
-        def warming(event):
-            # As the warm-up begins and as each of its steps ends: it can take
-            # minutes on the first start after an update, so the console and
-            # the record, which the app shows, say how far it is. It runs on
-            # the reader thread, which must not block (on_warming):
-            # print_status only queues the line for the console's one writer,
-            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
-            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
-            serve_record.warming(args.serve_record, event.steps_done, event.steps)
-
-        runtime.on_warming = warming
 
         def engine_recovering(recovering):
             # The record follows the engine once the server is ready, for
@@ -1564,6 +1572,9 @@ def main():
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()
+            elif runtime is not None:
+                # A start that failed while the engine loaded stops it.
+                runtime.close()
         finally:
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
