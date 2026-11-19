@@ -15,6 +15,11 @@ struct LaunchOptions: View {
         let family = state.family(of: state.selection)
         GroupedSection {
             ForEach(Self.options(.main, for: family)) { OptionRow(option: $0, family: family) }
+            // The server running says what its concurrency limit costs in context, which only its log
+            // said.
+            if state.server.phase == .ready, let cost = state.server.lanesCost {
+                LanesCostNote(cost: cost)
+            }
             DisclosureRow(title: "Advanced", open: $advanced)
                 .background(ViewAnchor { row.view = $0 })
                 .onChange(of: advanced) { if advanced { row.scrollToTop() } else { row.stop() } }
@@ -80,6 +85,20 @@ extension EnvironmentValues {
     /// What the launch option of the row the view is in lacks to apply, while it doesn't
     /// (`LaunchOption.lacks`).
     @Entry var optionRowNeeds: String?
+}
+
+/// What the server running pays in context for a concurrency limit past four.
+private struct LanesCostNote: View {
+    let cost: Server.LanesCost
+
+    var body: some View {
+        Label("The concurrency limit of \(cost.lanes) leaves \(ContextLength.title(cost.context)) of context; 4 would leave \(ContextLength.title(cost.defaultContext)).",
+              systemImage: "info.circle")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
 }
 
 /// Why the server running has the SSD cache off though its options asked for one, in the
