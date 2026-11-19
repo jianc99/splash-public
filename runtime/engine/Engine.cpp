@@ -1150,6 +1150,9 @@ void Engine::completeAdmission(Request &active, CacheLookup &lookup,
   if (lookup.state) {
     active.unprovenState = lookup.state->kvBlock();
     active.latestCheckpoint = cache_.checkpointState(lookup.state->kvBlock());
+    // A lane's recovery point is written before a reclaim lets it go.
+    if (active.latestCheckpoint)
+      cache_.supersedeCheckpoint(active.latestCheckpoint.kvBlock, false);
     // A restored replay point of the prompt already has the ordinary state
     // the lane needs, in whichever tier holds it: a promotion that found no
     // cache slot leaves it on disk. Other restored progress points, the end of
@@ -1581,8 +1584,15 @@ bool Engine::publishStateBoundary(Request &active, Request::StateBoundary object
   // buffers.
   if (!keepsCheckpoint)
     static_cast<void>(retireCheckpoint(active));
+  // The rolling checkpoint the tail keeps, unless another lane recovers from it, is superseded: the tail and the
+  // replay point lie past it, so a reclaim drops it unwritten, and a lookup restores it until then.
+  if (tail && active.latestCheckpoint && !checkpointShared(active))
+    cache_.supersedeCheckpoint(active.latestCheckpoint.kvBlock, true);
   active.latestCheckpoint = checkpoint ? cache_.checkpointState(block)
                                        : StateCheckpoint{};
+  // A lane's recovery point, one another lane's tail superseded too, is written before a reclaim lets it go.
+  if (checkpoint)
+    cache_.supersedeCheckpoint(block, false);
   // A junction is where this request leaves another's chain: a branch point, which no state below it supersedes.
   if (!checkpoint && !replay)
     cache_.markBranchPoint(block);

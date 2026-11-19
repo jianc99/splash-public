@@ -366,6 +366,14 @@ void StateCache::markBranchPoint(uint64_t kvBlock) {
   markSuperseded(kvBlock);
 }
 
+void StateCache::supersedeCheckpoint(uint64_t kvBlock, bool superseded) noexcept {
+  const auto found = entries_.find(kvBlock);
+  if (found == entries_.end() || !found->second.checkpoint || found->second.superseded == superseded)
+    return;
+  found->second.superseded = superseded;
+  reindex(kvBlock, found->second);
+}
+
 bool StateCache::keepReplyAsPoint(StateCheckpoint checkpoint) {
   const auto found = entries_.find(checkpoint.kvBlock);
   if (found == entries_.end() || found->second.publication != checkpoint.publication ||

@@ -255,7 +255,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # Scheduler.cpp -4, Bootstrap.hpp -1).
 # 30,918: +74 for a tail checkpoint before a prompt's replay boundary
 # (Engine.cpp 43, Engine.hpp 18, EngineMemory.cpp 13).
-ENGINE_LINE_BUDGET = 30_918
+# 30,942: +24 for the rolling checkpoint a tail keeps, superseded (Engine.cpp
+# 10, StateCache.cpp 8, StateCache.hpp 4, Cache.hpp 2).
+ENGINE_LINE_BUDGET = 30_942
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

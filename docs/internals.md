@@ -2382,8 +2382,10 @@ a ~60-token status block), and restores there instead of up to a checkpoint
 interval back. A lane resumed past its prompt plans none. The tail retires no
 checkpoint: the last rolling one stays for a rewrite below the tail, so a
 request keeps at most its last rolling checkpoint, its tail and its replay
-state at rest, one state more than without the tail; both checkpoints are
-reclaimed first, oldest first, as any checkpoint is. Refused memory inside its
+state at rest, one state more than without the tail. That rolling checkpoint
+is superseded, as the tail and the replay point lie past it: a lookup restores
+it while it stays, and a reclaim takes it first and drops it unwritten, unless
+a lane has taken it as its recovery point since. Refused memory inside its
 command, the tail's capture is dropped rather than end its command. Each other
 checkpoint retires only once the next one or a junction is published, which
 takes its buffers, when memory refuses others, only after its command has

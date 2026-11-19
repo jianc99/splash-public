@@ -223,6 +223,10 @@ public:
   // A junction's state, published where a request leaves another's chain: a branch point, never superseded, though
   // its second continuation holds no state below it until that request publishes one.
   void markBranchPoint(uint64_t kvBlock);
+  // A checkpoint a later checkpoint and the replay point of the same request lie past (Engine::addTailCheckpoint):
+  // superseded, a reclaim takes it first and never writes it, while a lookup still restores it. False again once a
+  // lane takes it as its recovery point. Only a checkpoint; an ordinary state's mark follows its branches.
+  void supersedeCheckpoint(uint64_t kvBlock, bool superseded) noexcept;
   // The size of the state at this block; zero without one.
   [[nodiscard]] uint64_t bytes(uint64_t kvBlock) const noexcept;
   // A RAM copy exists.

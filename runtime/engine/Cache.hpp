@@ -817,6 +817,8 @@ public:
   bool keepReplyAsPoint(StateCheckpoint checkpoint) { return states_.keepReplyAsPoint(checkpoint); }
   // A junction's state (StateCache::markBranchPoint).
   void markBranchPoint(uint64_t block) { states_.markBranchPoint(block); }
+  // A checkpoint a tail and a replay point lie past (StateCache::supersedeCheckpoint).
+  void supersedeCheckpoint(uint64_t block, bool superseded) noexcept { states_.supersedeCheckpoint(block, superseded); }
   // This exact disposable publication is pinned: retireCheckpointState
   // refuses it.
   [[nodiscard]] bool checkpointPinned(StateCheckpoint checkpoint) const noexcept {
