@@ -233,7 +233,11 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # 30,673: +1 for forgetting a lane count's remembered step costs.
 # 30,685: +12 for a runtime's lanes in its memory plan, warmups, scheduler
 # and /status.
-ENGINE_LINE_BUDGET = 30_685
+# 30,747: +62 for the lanes a start asks for (--max-concurrent-requests),
+# what a refusal says they take, and what four lanes would serve instead,
+# their stores or the context a first start of four serves, in its log line
+# and /status.
+ENGINE_LINE_BUDGET = 30_747
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
