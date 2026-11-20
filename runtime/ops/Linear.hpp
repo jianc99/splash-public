@@ -153,9 +153,15 @@ struct StagedRowGroups final {
   return groups.rows * groups.groups;
 }
 // The rows a staged plan of `rows` rows stores: its tile's, or 16 for a plan
-// on the 16-row tile (LinearConfig::sixteenRows) or on the int8 tiles, whose
-// shortest height is 16 (LinearConfig::decodeInt8).
+// on the 16-row tile (LinearConfig::sixteenRows); on the int8 tiles
+// (LinearConfig::decodeInt8), whose shortest height is 16 and tallest 32, at
+// least 16 and past one staged tile's rows whole row groups of 32: on a 20-core
+// M5 Pro Bonsai's [16640 x 5120] input took 0.42 ms at 80 rows as five groups
+// of 16 and 0.38 at 96 as three of 32 (at 48 rows, three of 16 0.26 and two of
+// 32 0.27).
 [[nodiscard]] constexpr uint32_t stagedStorageRows(uint32_t rows, bool sixteenRows, bool decodeInt8 = false) noexcept {
+  if (decodeInt8 && rows > kMaximumDecodeTileRows)
+    return (rows + kMaximumInt8Rows - 1) / kMaximumInt8Rows * kMaximumInt8Rows;
   return sixteenRows || decodeInt8 ? std::max(16u, stagedTileRows(rows)) : stagedTileRows(rows);
 }
 // The row groups of an int8 plan of `storageRows` (stagedStorageRows): one

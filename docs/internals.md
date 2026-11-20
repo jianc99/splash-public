@@ -654,9 +654,11 @@ The rules:
    runs a staged plan that stores at least `decodeInt8FromRows` rows (16 on
    Apple10 and Apple11, a 16-row plan among them; never on Apple9) whose K
    splits keep whole PQ2_0 blocks on those tiles, at the plan's splits and
-   passes; their shortest height is 16 rows and their tallest 32. The int8
-   tiles also run row groups of them in one dispatch (`ops::int8RowGroups`,
-   as the staged tile's), which no plan takes yet.
+   passes: their shortest height is 16 rows and their tallest 32, and a
+   decode step's plan of more runs row groups of them in one dispatch
+   (`ops::int8RowGroups`: 32 rows each, 16 at 48 rows, whole 32-row groups
+   stored past 64 rows), so such a unit decodes in int8 activations whatever
+   its lanes; a prefill chunk's plan takes them at 16 or 32 rows.
 3. *Float projection.* The accelerator tile runs where the device has one,
    from `minimumRows` rows and a grid of its tiles of at least half the class's
    half tiles per core for BF16 values, F32 values or a quantized format's rows.

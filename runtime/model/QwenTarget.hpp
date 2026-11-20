@@ -88,15 +88,16 @@ template <class Layout, class Layer> struct QwenTargetWeights final : QwenTarget
 };
 
 // The rows every tensor a decode step's plans store rows in holds, for steps
-// of up to `lanes` lanes: the rows the decode tiles store a step of the most
-// rows in (ops::stagedStorageRows), on the staged tile and past one tile's
-// rows on its two row groups: the decode arena's row and target step tensors,
-// and a target's own step scratch (Qwen4Steps).
+// of up to `lanes` lanes: the most the decode tiles store a step of the most
+// rows in (ops::stagedStorageRows), its rows on the staged tile and its row
+// groups, and past 32 rows the int8 tiles' groups of 32 (96 rows at five
+// lanes, 128 at seven): the decode arena's row and target step tensors, and a
+// target's own step scratch (Qwen4Steps).
 [[nodiscard]] constexpr uint32_t decodeStorageRows(uint32_t lanes) noexcept {
   static_assert(ExecutionLimits::stepRows(SPLASH_MAXIMUM_BATCH_WIDTH) <= ops::kMaximumStagedRows,
                 "the decode tiles hold a decode step of the most lanes");
   const uint32_t rows = ExecutionLimits::stepRows(lanes);
-  return ops::stagedStorageRows(rows, false);
+  return std::max(ops::stagedStorageRows(rows, false), ops::stagedStorageRows(rows, false, true));
 }
 
 // Runtime-visible tensor geometry shared by the supported Qwen hybrid

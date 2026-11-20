@@ -279,9 +279,11 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
 // tiles over the 27B's shapes at 65-2048 rows on a 32-core M5 Max, a 16-core
 // M5 Pro and a 12-core M6), and a staged plan that stores at least
 // decodeInt8FromRows rows (a 16-row plan counts 16) and whose K splits keep
-// whole PQ2_0 blocks and that stores at most the int8 tiles' kMaximumInt8Rows
-// runs the int8 decode tiles where they take the unit, at the plan's rows,
-// splits and passes.
+// whole PQ2_0 blocks runs the int8 decode tiles where they take the unit, at
+// the plan's storage rows, splits and passes: a decode step's at every row
+// count from there (past 32 rows in row groups of them, int8RowGroups), so a
+// rotated PQ2_0 unit, Ternary-Bonsai's, decodes in one precision whatever its
+// lanes; a prefill chunk's at the tiles' 16 or 32 rows, as in 1.7.0.
 LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations, StepKind step,
                               LinearWorkload w, const UnitFormats &unit, std::span<const UnitFormats> pairTensors) {
   LinearConfig config = bf16Projection(calibration, step, w, unit, pairTensors);
@@ -292,7 +294,7 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
   const uint32_t storage = stagedStorageRows(w.rows, config.sixteenRows);
   config.decodeInt8 = config.tile == LinearTile::GgufStaged && unit.decodeInt8Takes &&
                       decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&
-                      storage >= p.decodeInt8FromRows && storage <= kMaximumInt8Rows;
+                      storage >= p.decodeInt8FromRows && (step == StepKind::Decode || storage <= kMaximumInt8Rows);
   return config;
 }
 
