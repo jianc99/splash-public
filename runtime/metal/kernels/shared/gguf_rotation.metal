@@ -56,8 +56,8 @@ kernel void gguf_rotate(device const bfloat *input [[buffer(0)]], device const c
 
 // The int8 rows of the int8 decode tiles (metal/abi/Gguf.h GgufRotationInt8Params): gguf_rotate's bf16 values H (D x),
 // each rotation block of a row quantized by the int8-activation rule (kernels/common/int8_activations.h), in the
-// tiles' stage order (gguf_decode_int8_position), the scales after the p.rows int8 rows. Grid (width /
-// GGUF_ROTATION_BLOCK, rows).
+// tiles' stage order (gguf_decode_int8_position), each p.rows rows (a row group's, ops::stagedRowGroups) their codes
+// then their scales. Grid (width / GGUF_ROTATION_BLOCK, rows).
 kernel void gguf_rotate_int8(device const bfloat *input [[buffer(0)]], device const char *signs [[buffer(1)]],
                              device uchar *output [[buffer(2)]], constant GgufRotationInt8Params &p [[buffer(3)]],
                              uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
@@ -68,6 +68,9 @@ kernel void gguf_rotate_int8(device const bfloat *input [[buffer(0)]], device co
   threadgroup uint simd_finite[GGUF_ROTATION_THREADS / 32];
   const uint K = p.width, column = group.x * GGUF_ROTATION_BLOCK;
   const ulong row = ulong(group.y) * K + column;
+  // The row's group and its codes' first byte in it.
+  device uchar *codes = output + ulong(group.y / p.rows) * gguf_rotation_int8_bytes(K, p.rows) +
+                        ulong(group.y % p.rows) * K;
   float4 v;
   bool finite = true;
   for (uint i = 0; i < 4; ++i) {
@@ -91,12 +94,13 @@ kernel void gguf_rotate_int8(device const bfloat *input [[buffer(0)]], device co
   const Int8Block block = int8_activation_block(m);
   for (uint i = 0; i < 4; ++i) {
     const uint k = column + 4 * tid + i;
-    output[row - column + (k & ~31u) + gguf_decode_int8_position(k & 31u)] =
+    codes[(k & ~31u) + gguf_decode_int8_position(k & 31u)] =
         uchar(char(int8_activation_code(x[i], block.inverse)));
   }
   if (tid != 0) return;
   for (uint i = 0; i < GGUF_ROTATION_THREADS / 32; ++i) finite &= simd_finite[i] != 0;
-  device uint *scale = (device uint *)(output + ulong(p.rows) * K) + group.y * (K / GGUF_ROTATION_BLOCK) + group.x;
+  device uint *scale = (device uint *)(codes - ulong(group.y % p.rows) * K + ulong(p.rows) * K) +
+                       (group.y % p.rows) * (K / GGUF_ROTATION_BLOCK) + group.x;
   *scale = int8_activation_bits(block.scale, finite);
 }
 
