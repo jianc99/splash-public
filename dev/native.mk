@@ -176,12 +176,15 @@ TEST_DRAFT_SELECTOR_TEST := $(ENGINE_TEST_BUILD)/draft-selector
 TEST_TARGET_SAMPLING_TEST := $(ENGINE_TEST_BUILD)/target-sampling
 TEST_TARGET_SAMPLING_WIDE_TEST := $(ENGINE_TEST_BUILD)/target-sampling-16
 TEST_VISION_METAL_TEST := $(ENGINE_TEST_BUILD)/vision-metal
-TEST_VISION_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/vision-attention
+TEST_DENSE_ATTENTION_TEST := $(ENGINE_TEST_BUILD)/dense-attention
+TEST_DENSE_LINEAR_TEST := $(ENGINE_TEST_BUILD)/dense-linear
 TEST_BACKEND_BENCHMARK := $(ENGINE_TEST_BUILD)/backend-benchmark
 TEST_DECODE_PROFILE := $(ENGINE_TEST_BUILD)/decode-profile
 TEST_TEACHER_LOGITS := $(ENGINE_TEST_BUILD)/teacher-logits
 TEST_ATTENTION_SWEEP := $(ENGINE_TEST_BUILD)/attention-sweep
 TEST_GGUF_PROJECTION_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-projection-benchmark
+TEST_VISION_TOWER_BENCHMARK := $(ENGINE_TEST_BUILD)/vision-tower-benchmark
+TEST_DENSE_LINEAR_BENCHMARK := $(ENGINE_TEST_BUILD)/dense-linear-benchmark
 TEST_GGUF_MOE_BENCHMARK := $(ENGINE_TEST_BUILD)/gguf-moe-benchmark
 TEST_MODEL_RUNTIME_ORACLE := $(ENGINE_TEST_BUILD)/model-runtime-oracle
 WEIGHT_DIGESTS := $(ENGINE_TEST_BUILD)/weight-digests
@@ -288,6 +291,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_GGUF_PREPARATION) \
 	$(TEST_ATTENTION_PLAN) \
 	$(TEST_ATTENTION_VARIANTS) \
+	$(TEST_KERNEL_SELECTION) \
 	$(TEST_ROPE_TABLES) \
 	$(TEST_LINEAR_PLAN) \
 	$(TEST_RESOURCES_TEST) \
@@ -307,7 +311,8 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 	$(TEST_TARGET_SAMPLING_TEST) \
 	$(TEST_TARGET_SAMPLING_WIDE_TEST) \
 	$(TEST_VISION_METAL_TEST) \
-	$(TEST_VISION_ATTENTION_TEST) \
+	$(TEST_DENSE_ATTENTION_TEST) \
+	$(TEST_DENSE_LINEAR_TEST) \
 	$(TEST_METAL_BACKEND_TEST) \
 	$(TEST_HANDOFF_TEST) \
 	$(TEST_PRESSURE_SERVING) \
@@ -319,7 +324,7 @@ TEST_METAL_TARGETS := $(TEST_DRAFT_PREPARATION) \
 TEST_CONFIG_TARGETS := $(filter-out $(LIB) $(HOST_STEP_LIB),$(sort $(TEST_CPU_TARGETS) $(TEST_METAL_TARGETS))) \
 	$(TEST_MODEL_RUNTIME_ORACLE) $(TEST_VISION_ENCODER_TEST) \
 	$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
-	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) \
+	$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK) \
 	$(TEST_Q8_AIR) $(TEST_Q8_KERNEL_AIRS) $(TEST_RESIDENCY_AIR) $(TEST_HOST_STEP_AIR) $(TEST_METAL_BACKEND_AIR) \
 	$(TEST_GGUF_DEQUANT_AIR) $(TEST_GGUF_MOE_AIR) $(TEST_ATTENTION_STORE_AIR) $(TEST_STATE_CODEC_AIR)
 # Benchmarks and tools that build with the production flags.
@@ -420,7 +425,7 @@ $(TEST_OPERATOR_WORKSPACE): dev/tests/engine/operator_workspace_test.cc \
 $(TEST_EXECUTION_PLANS): dev/tests/engine/execution_plans_test.cc \
 		$(ENGINE_LIBRARY)
 $(TEST_KERNEL_SELECTION): dev/tests/engine/kernel_selection_test.cc \
-		$(ENGINE_LIBRARY)
+		$(ENGINE_INSTRUMENTED_METAL_OBJECT) $(ENGINE_LIBRARY)
 $(TEST_MODEL_EXECUTION_PLANS): dev/tests/engine/model_execution_plan_test.cpp \
 		$(ENGINE_LIBRARY)
 $(TEST_DRAFT_VOCABULARY): dev/tests/engine/draft_vocabulary_test.cpp $(ENGINE_LIBRARY)
@@ -509,7 +514,9 @@ $(TEST_TARGET_SAMPLING_TEST): dev/tests/engine/target_sampling_metal_test.mm \
 $(TEST_TARGET_SAMPLING_WIDE_TEST): dev/tests/engine/target_sampling_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_TARGET_SAMPLING_WIDE_TEST): ENGINE_TEST_CXXFLAGS += -DTARGET_SAMPLING_LANE_ROWS=16
-$(TEST_VISION_ATTENTION_TEST): dev/tests/engine/vision_attention_metal_test.mm \
+$(TEST_DENSE_ATTENTION_TEST): dev/tests/engine/dense_attention_metal_test.mm \
+		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_DENSE_LINEAR_TEST): dev/tests/engine/dense_linear_metal_test.mm \
 		$(ENGINE_LIBRARY) $(LIB)
 $(TEST_Q8_METAL_TEST): dev/tests/engine/q8_paged_kv_metal_test.mm
 $(TEST_Q8_STORAGE_TEST): dev/tests/engine/q8_page_storage_test.mm \
@@ -541,6 +548,8 @@ $(TEST_GGUF_PROJECTION_BENCHMARK): dev/benchmarks/gguf_projection_benchmark.mm \
 $(TEST_GGUF_MOE_BENCHMARK): dev/benchmarks/gguf_moe_benchmark.mm \
 		dev/benchmarks/DispatchReplay.hpp \
 		$(ENGINE_LIBRARY) $(LIB)
+$(TEST_VISION_TOWER_BENCHMARK): dev/benchmarks/vision_tower_benchmark.mm $(ENGINE_LIBRARY) $(LIB)
+$(TEST_DENSE_LINEAR_BENCHMARK): dev/benchmarks/dense_linear_benchmark.mm $(ENGINE_LIBRARY) $(LIB)
 
 $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(TEST_ANE_FFN) \
 		$(TEST_ANE_PROGRAM_FAULTS) $(TEST_GGUF_DEQUANT) $(TEST_GGUF_ROTATION) \
@@ -552,12 +561,13 @@ $(TEST_MODEL_CONFIGURATION) $(TEST_DRAFT_PREPARATION) $(TEST_GGUF_PROJECTION) $(
 		$(TEST_GDN_METAL_TEST) $(TEST_STATE_CODEC_TEST) $(TEST_ATTENTION_PLAN) $(TEST_LINEAR_PLAN) \
 		$(TEST_DFLASH_BATCH_CONTROL_TEST) $(TEST_DRAFT_ATTENTION_TEST) \
 		$(TEST_GDN_DECODE_TEST) $(TEST_DRAFT_SELECTOR_TEST) \
-		$(TEST_TARGET_SAMPLING_TEST) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(TEST_VISION_ATTENTION_TEST) \
-		$(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) $(TEST_ROPE_TABLES) \
+		$(TEST_TARGET_SAMPLING_TEST) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(TEST_DENSE_ATTENTION_TEST) \
+		$(TEST_DENSE_LINEAR_TEST) $(TEST_Q8_METAL_TEST) $(TEST_Q8_STORAGE_TEST) $(TEST_ATTENTION_VARIANTS) \
+		$(TEST_ROPE_TABLES) \
 		$(TEST_METAL_BACKEND_TEST) $(TEST_HANDOFF_TEST) $(TEST_PRESSURE_SERVING) $(TEST_VISION_ENCODER_TEST) \
 		$(TEST_MODEL_RUNTIME_ORACLE) \
 		$(TEST_DECODE_PROFILE) $(TEST_TEACHER_LOGITS) $(TEST_ATTENTION_SWEEP) \
-		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK): | $(ENGINE_TEST_BUILD)
+		$(TEST_GGUF_PROJECTION_BENCHMARK) $(TEST_GGUF_MOE_BENCHMARK) $(TEST_VISION_TOWER_BENCHMARK) $(TEST_DENSE_LINEAR_BENCHMARK): | $(ENGINE_TEST_BUILD)
 	$(RUN_CONFIGURED) $(CXX) $(ENGINE_TEST_CXXFLAGS) -fobjc-arc $(TEST_INPUTS) \
 		$(ENGINE_LINKFLAGS) -o $@
 
@@ -725,6 +735,7 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(TEST_QWEN4_KERNELS) $(LIB) bitwise
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_PLAN) $(TEST_PRODUCTION_LIB)
 	$(METAL_TEST_ENV) $(TEST_ATTENTION_VARIANTS) $(TEST_PRODUCTION_LIB)
+	$(METAL_TEST_ENV) $(TEST_KERNEL_SELECTION) --library $(LIB) dev/tests/engine/kernel_selection_golden.txt
 	$(METAL_TEST_ENV) $(TEST_ROPE_TABLES) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_LINEAR_PLAN) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_RESOURCES_TEST) $(LIB)
@@ -744,7 +755,8 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_TARGET_SAMPLING_WIDE_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_VISION_METAL_TEST) $(LIB)
-	$(METAL_TEST_ENV) $(TEST_VISION_ATTENTION_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_DENSE_ATTENTION_TEST) $(LIB)
+	$(METAL_TEST_ENV) $(TEST_DENSE_LINEAR_TEST) $(LIB)
 	$(METAL_TEST_ENV) $(TEST_METAL_BACKEND_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_HANDOFF_TEST) $(TEST_METAL_BACKEND_LIB)
 	$(METAL_TEST_ENV) $(TEST_PRESSURE_SERVING) $(LIB)
@@ -753,6 +765,10 @@ test-engine-metal: $(TEST_METAL_TARGETS)
 # The vision fixture is named after the installed model's family, which its
 # model.json records. Nothing is printed when the installation serves no
 # vision (vision_format none: --language-only, or a GGUF without an mmproj).
+# vision-encoder runs twice: under shader validation, where it holds the fp32
+# parity on real shapes and compares no embedding digests (validation
+# compiles the shaders to other bits), and without it, where it compares the
+# fixture's pinned digests too.
 # ORACLE_ARGS: options every run of the runtime oracle takes besides its own,
 # as the oracle takes them (model_runtime_oracle_test.mm), an option given
 # twice taking its later value. A block-sparse target's spill check runs in
@@ -780,6 +796,8 @@ test-real: preflight $(TARGET) $(TEST_MODEL_RUNTIME_ORACLE) \
 	family=$$($(BUILD_ID_PYTHON) -c '$(VISION_FIXTURE_FAMILY)' "$(MODEL_ROOT)") && \
 		if test -n "$$family"; then \
 			$(METAL_TEST_ENV) $(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
+				dev/tests/fixtures/vision-parity/$$family && \
+			$(TEST_VISION_ENCODER_TEST) $(LIB) "$(MODEL_ROOT)" \
 				dev/tests/fixtures/vision-parity/$$family; \
 		else echo "vision parity: skipped, the installation serves text only"; fi
 	$(TEST_MODEL_RUNTIME_ORACLE) $(LIB) "$(MODEL_ROOT)" --ane-ffn-share 0 $(ORACLE_ARGS)

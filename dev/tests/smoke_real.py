@@ -133,6 +133,8 @@ class RealServer:
         if arguments.max_image_pixels is not None:
             command.extend(("--max-image-pixels", str(arguments.max_image_pixels)))
         command.extend(("--kv-format", arguments.kv_format))
+        if arguments.cached_states is not None:
+            command.extend(("--cached-states", arguments.cached_states))
         self.process = subprocess.Popen(
             command,
             cwd=ROOT,
@@ -1750,6 +1752,12 @@ def run_persistent_cache(arguments) -> None:
             )
             reused = after["cache"]["reused_tokens"] - before["cache"]["reused_tokens"]
             require(states >= 1, "the next turn restored no state from disk")
+            # Its usage says so: the state it resumed from was the SSD cache's.
+            details = reply["usage"]["prompt_tokens_details"]
+            require(
+                details["state_source"] == "disk" and not details["lost_state"],
+                f"the next turn's usage said {details!r}",
+            )
             # The tail past the restore point's block boundary is recomputed.
             require(
                 min(restored, reused) * 10 >= prompt_tokens * 9,
@@ -1794,6 +1802,12 @@ def add_server_arguments(parser):
     )
     parser.add_argument("--max-image-pixels", type=int)
     parser.add_argument("--kv-format", choices=("int8", "bf16"), default="int8")
+    parser.add_argument(
+        "--cached-states",
+        choices=("int8", "exact"),
+        help="the format of cached recurrent states (splash serve "
+        "--cached-states); exact restores a state as it ran",
+    )
     parser.add_argument("--startup-timeout", type=float, default=1800)
 
 

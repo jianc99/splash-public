@@ -147,6 +147,7 @@ public:
   }
   void end(uint64_t) override {}
 
+  std::vector<uint32_t> prefillRowClasses() const override { return {}; }
   model::WarmupStepResult warmupPrefill(uint32_t rows) override {
     if (!rows || rows > model::ExecutionLimits::prefillTokenBudget)
       throw std::invalid_argument("invalid prefill warmup rows");
@@ -162,6 +163,7 @@ public:
   model::WarmupStepResult warmupCompositeStateRestore() override {
     return warmup(5);
   }
+  void endWarmups() override { calls.push_back(6); }
   model::ModelMemoryActual actualRuntimeMemory() const override {
     return {1, 1};
   }
@@ -237,8 +239,8 @@ void testAllNativeWarmupsPrecedeReady() {
   auto report = warmup(harness, plan, rowClasses);
   require(report.stage == RuntimeBootstrapStage::Ready && report.memoryAudit.valid,
           "successful native bootstrap was incomplete");
-  require(harness.executor().calls == std::vector<int>({0, 0, 0, 0, 0, 1, 2, 3, 4, 5}),
-          "bootstrap did not warm its prefills and B1/B2/B3/B4 in order");
+  require(harness.executor().calls == std::vector<int>({0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6}),
+          "bootstrap did not warm its prefills and B1/B2/B3/B4 in order, then end its warmups");
   require(harness.executor().prefillRows ==
               std::vector<uint32_t>({model::ExecutionLimits::prefillTokenBudget, 1, 9, 17, 33}),
           "bootstrap did not warm a prefill of maximum rows and one of each row class");
@@ -316,6 +318,7 @@ void testBudgetLimitedWarmupTriesOnlyWidthsThatFit() {
     for (uint32_t lane = 1; lane <= width; ++lane)
       expected.push_back(static_cast<int>(lane));
     expected.push_back(5);
+    expected.push_back(6);
     require(harness.executor().calls == expected,
             "warmup attempted a decode width that cannot fit the plan");
     for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
@@ -346,6 +349,7 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
       if (deniedWidth >= 0)
         expected.push_back(deniedWidth);
       expected.push_back(5);
+      expected.push_back(6);
       require(harness.executor().calls == expected,
               "bootstrap retried wider batches after allocation denial");
       for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {

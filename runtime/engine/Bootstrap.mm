@@ -340,6 +340,7 @@ RuntimeBootstrapReport ServingRuntime::requireWarmup(
     run(RuntimeBootstrapStage::CompositeStateRestore,
         report.warmup.compositeStateRestore,
         [&] { return modelRuntime.warmupCompositeStateRestore(); }, true);
+    modelRuntime.endWarmups();
   }
 
   ActualMemoryReport actual;
@@ -500,8 +501,7 @@ std::unique_ptr<ServingRuntime> ServingRuntime::start(
   model::RuntimeModel *modelPointer = modelRuntime.get();
   NativeRuntime *loopPointer = nativeLoop.get();
   RuntimeBootstrapReport report = requireWarmup(
-      resources->memoryPlan(), resources->modelContext().operators.prefillRowClasses(),
-      *modelRuntime, resources->kvPool(),
+      resources->memoryPlan(), modelRuntime->prefillRowClasses(), *modelRuntime, resources->kvPool(),
       [loopPointer](const protocol::WarmingEvent &event) { loopPointer->announceWarming(event); },
       [resourcesPointer, modelPointer, loopPointer, pressure = config.resources.memoryPressure] {
         // Audit every attempted warmup before reclaiming idle buffers.

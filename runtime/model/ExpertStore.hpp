@@ -32,8 +32,8 @@
 // A streamed block's load runs after its steps' grouping (ops::
 // MoeExpertStream), in rounds: each a host step of the command, which claims
 // a slot for each routed expert that is not resident (in the first round),
-// never one of an expert the same load routes, and reads the native rows of
-// some of them into places of the store's staging, then a repack
+// never one of an expert the same load routes, and reads the rows of some
+// of them into places of the store's staging, then a repack
 // (moe_expert_load) of those places into their slots. A load of at most 32
 // rows (a decode step's, or a prompt chunk's of so few rows)
 // is one round over every place; any other load stages half the places a
@@ -42,8 +42,11 @@
 // experts' rows that a file stores as they are is read straight from it
 // (F_NOCACHE without the buffer cache): its bytes widened to whole pages, into
 // places that start on a page, and the repack starts from the rows' offset
-// in the first page. Rows a loader builds (a quantized safetensors tensor's)
-// are built into the places instead.
+// in the first page. An MLX affine or mxfp4 tensor's experts are read so too,
+// as three such runs, its codes', scales' and biases' planes as the
+// checkpoint stores them (storedPlanes), which the repack interleaves; rows a
+// loader builds (an NVFP4 or FP8 tensor's, or permuted ones) are built into
+// the places instead.
 //
 // Once a round has staged its experts, the next experts are read ahead while
 // the GPU runs, into the places the round left free, an expert at a time in
@@ -81,8 +84,9 @@
 // releaseToFloor() and growTowardCap() on the engine thread while no command
 // is in flight (model::WeightMemory), so never beside a load, under the
 // store's mutex, which orders them against a read-ahead's start; a
-// read-ahead writes the staging alone, so they let it run on; released() on
-// the engine thread and stats() on any. Neither of those two waits for a
+// read-ahead writes the staging alone, so they let it run on; forget() too,
+// after the start's warmups, stopping a read-ahead as release() does;
+// released() on the engine thread and stats() on any. Neither of those two waits for a
 // load: a status query never waits behind a command's reads.
 //
 // Shrinks and growth (releaseAboveFloor(), releaseToFloor(), growTowardCap())
@@ -194,6 +198,16 @@ public:
   [[nodiscard]] bool released() const noexcept override;
   void release() override;
   [[nodiscard]] bool restore(const metal::AllocationAdmission &admit) override;
+  // Forgets every streamed expert, its slot free, the recycling starting
+  // over, while no command is in flight; the experts of a size of one block
+  // stay. The start's warmups (model::RuntimeModel::endWarmups) run made-up
+  // rows a lane at widths 1-4: their experts, routed again and again, sit
+  // in the recycling's frequent list, which a prompt's long chunks (scans)
+  // never displace. MEASURED on the 24 GB M6, Qwen3.8-Flash-Next Q2_0 with
+  // 6.5 GiB of experts, a 512-token prompt after them: its prefill 2644 ms
+  // against 2235 ms without them, and the first decode cycle missed 1196 of
+  // its 1663 experts against 5.
+  void forget();
   // While memory is short: gives back the last live elastic chunk of the
   // streamed size with the largest share of its slots above its floor. The
   // experts it holds move to free slots below it, after as many of the

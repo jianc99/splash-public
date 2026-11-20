@@ -37,6 +37,8 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/ExpertStore.hpp"
+#include "model/SparseRowStore.hpp"
 #include "model/SsdReaders.hpp"
 #include "model/VisionLoader.hpp"
 #include "model/WeightImages.hpp"
@@ -235,7 +237,7 @@ void profileImages(metal::MetalBackend &backend,
       }
     }
     const metal::MetalBuffer embeddings = backend.allocateBuffer(
-        uint64_t{ops::Vision::embeddingRows(grid)} *
+        uint64_t{grid.mergedTokens()} *
             vision.tensors.layout.outputHiddenSize * sizeof(uint16_t),
         metal::BufferStorage::Private, "image embeddings");
     const auto encode = [&] {
@@ -337,6 +339,10 @@ struct AnswerCycle final {
   uint32_t lane = 0, cycle = 0, rows = 0, tokens = 0;
 };
 std::vector<AnswerCycle> answerCycles;
+// An FNV-1a digest of every token the timed cycles of a width retained, each
+// lane's in its place, until profileWidth prints it: two builds that lay the
+// same rows (--step-rows) and compute them alike print the same digest.
+uint64_t outputDigest = 0;
 
 CycleTiming decodeCycle(metal::MetalBackend &backend,
                         model::Runtime &executor,
@@ -358,6 +364,9 @@ CycleTiming decodeCycle(metal::MetalBackend &backend,
   uint64_t tokens = 0;
   for (size_t index = 0; index < lanes.size(); ++index) {
     tokens += results[index].outputTokens.size();
+    for (const uint32_t token : results[index].outputTokens)
+      for (const uint64_t word : {uint64_t{index}, uint64_t{token}})
+        outputDigest = (outputDigest ^ word) * 0x100000001b3ULL;
     if (!results[index].failure.empty())
       throw std::runtime_error(results[index].failure);
     lanes[index].answered += static_cast<uint32_t>(results[index].outputTokens.size());
@@ -428,8 +437,8 @@ int main(int argc, char **argv) {
           cycles = parseCount(argv[index + 1], "--cycles");
         else if (option == "--widths") {
           widths = parseCount(argv[index + 1], "--widths");
-          if (widths > 4)
-            throw std::invalid_argument("--widths takes 1 to 4");
+          if (widths > model::ExecutionLimits::maximumBatchWidth)
+            throw std::invalid_argument("--widths takes 1 to the most lanes of a step");
           textOptions = true;
         }
         else if (option == "--kv-format") {
@@ -549,7 +558,7 @@ int main(int argc, char **argv) {
       context.verifyRows = verifyRows;
       model::Runtime executor(context);
       if (warmups) {
-        for (uint32_t width = 1; width <= 4; ++width) {
+        for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width) {
           // A start's decode warmup of the lane count, which measures its
           // classes' costs, and the costs it measured.
           const auto started = std::chrono::steady_clock::now();
@@ -561,6 +570,11 @@ int main(int argc, char **argv) {
                         point.cap, point.milliseconds);
         }
         static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
+        // As a start ends its warmups (Bootstrap).
+        const auto ending = std::chrono::steady_clock::now();
+        executor.endWarmups();
+        std::printf("warmups ended: %.2f ms\n",
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ending).count());
       }
       model::RuntimeInstrumentation::forceStepRows(executor, stepRows);
       model::RuntimeInstrumentation::planBlocks(executor, blockPlans);
@@ -569,7 +583,7 @@ int main(int argc, char **argv) {
                   backend.capabilities().deviceName.c_str(), promptTokens,
                   cycles, std::string(ops::formatName(stateFormat)).c_str());
 
-      std::array<Lane, 4> lanes;
+      std::array<Lane, model::ExecutionLimits::maximumBatchWidth> lanes;
       for (uint32_t index = 0; index < lanes.size(); ++index) {
         lanes[index] = {index + 1, index, 0,
                         pageRange(index * pagesPerLane, pagesPerLane)};
@@ -644,8 +658,10 @@ int main(int argc, char **argv) {
         std::vector<CycleTiming> fused;
         static_cast<void>(model::RuntimeInstrumentation::takeStepChoices(executor));
         answerCycles.clear();
+        outputDigest = 0xcbf29ce484222325ULL;
         for (uint32_t cycle = 0; cycle < cycles; ++cycle)
           fused.push_back(cycleOf(active));
+        std::printf("%s output digest %016llx\n", title, static_cast<unsigned long long>(outputDigest));
         if (stepLog)
           for (const AnswerCycle &answer : answerCycles)
             std::printf("%s answer cycle: lane %u, cycle %u, rows %u, tokens %u\n", title, answer.lane, answer.cycle,
@@ -704,7 +720,27 @@ int main(int argc, char **argv) {
         accumulate(table, timings);
         print(title, table, cycles, median.gpuSeconds);
       };
+      // The streamed experts the B1 cycles read (--expert-memory): per
+      // cycle, the routed experts, those not resident, the bytes read, and
+      // the loads' host steps (work: reading and staging them), which tell
+      // what a cycle waits for the SSD.
+      const model::ExpertStore *experts = model.expertStore();
+      const model::ExpertStoreStats expertsBefore = experts ? experts->stats() : model::ExpertStoreStats{};
       profileWidth("B1 decode cycle", std::span<Lane>(&lanes[0], 1));
+      if (experts) {
+        const model::ExpertStoreStats after = experts->stats();
+        const model::ExpertStoreStats::Use &u = after.uses[1], &b = expertsBefore.uses[1];
+        const double perCycle = 1.0 / cycles;
+        std::printf("experts B1: %llu of %llu resident in %llu MiB; per cycle %.1f block loads, %.1f routed, %.1f "
+                    "not resident, %.1f read ahead, %.2f MiB read; host step work mean %.3f p50 %.3f p95 %.3f ms "
+                    "over the run\n",
+                    (unsigned long long)after.resident, (unsigned long long)after.experts,
+                    (unsigned long long)(after.capBytes >> 20), (u.loads - b.loads) * perCycle,
+                    (u.routed - b.routed) * perCycle, (u.read - b.read) * perCycle,
+                    (u.readAhead - b.readAhead) * perCycle, (u.readBytes - b.readBytes) * perCycle / (1 << 20),
+                    u.work.count ? u.work.totalMilliseconds / u.work.count : 0.0, u.work.p50Milliseconds,
+                    u.work.p95Milliseconds);
+      }
       // Add one lane at a time so M16 and M24 paths are measured too.
       for (uint32_t index = 1; index < widths; ++index) {
         prefill(executor, lanes[index], promptOf(index), answer);
@@ -712,6 +748,25 @@ int main(int argc, char **argv) {
         profileWidth(title.c_str(), std::span<Lane>(lanes.data(), index + 1));
       }
 
+      // A streamed table's stages and reads over the whole run (--ple-memory),
+      // which tell what reading its rows from its source costs.
+      if (const model::SparseRowStore *store = model.streamedTable()) {
+        const model::SparseRowStats stats = store->stats();
+        for (uint32_t use = 0; use < model::kSparseRowUses; ++use) {
+          const model::SparseRowStats::Use &u = stats.uses[use];
+          std::printf("table %s %s: %llu stages, %llu ids, %llu distinct, %llu hit, %llu read; stage mean %.3f "
+                      "p50 %.3f p95 %.3f p99 %.3f max %.3f ms\n",
+                      stats.table.c_str(), use == 0 ? "prefill" : "decode", (unsigned long long)u.stages,
+                      (unsigned long long)u.requestedRows, (unsigned long long)u.uniqueRows,
+                      (unsigned long long)u.hitRows, (unsigned long long)u.readRows,
+                      u.stage.count ? u.stage.totalMilliseconds / u.stage.count : 0.0, u.stage.p50Milliseconds,
+                      u.stage.p95Milliseconds, u.stage.p99Milliseconds, u.stage.maximumMilliseconds);
+        }
+        std::printf("table %s reads: %llu bytes, %llu prefetched rows; a row's read p50 %.3f p95 %.3f p99 %.3f ms\n",
+                    stats.table.c_str(), (unsigned long long)stats.readBytes,
+                    (unsigned long long)stats.prefetchReadRows, stats.read.p50Milliseconds, stats.read.p95Milliseconds,
+                    stats.read.p99Milliseconds);
+      }
       for (uint32_t index = 0; index < widths; ++index)
         executor.end(lanes[index].id);
       return 0;

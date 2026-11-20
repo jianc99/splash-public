@@ -983,7 +983,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
         ops::Vision::scratchBytes(model.vision.tensors.layout,
                                   span.gridHeight * span.gridWidth) +
         span.pixelBytes() +
-        uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
+        uint64_t{span.grid().mergedTokens()} *
             model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t) +
         states.layout().laneBytes();
     fault.remainingBytes = attemptBytes - 1;
@@ -1191,7 +1191,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   }
   const ImageSpan &miss = mixed.images.back();
   const uint64_t missingImageBytes = miss.pixelBytes() +
-      uint64_t{ops::Vision::embeddingRows({miss.gridHeight, miss.gridWidth})} *
+      uint64_t{miss.grid().mergedTokens()} *
           model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t);
   require(executor.begin(mixed.modelView()).granted() &&
               executor.telemetry().imageEmbeddingReuses == reusedBeforeMixed + 1 &&
@@ -2295,6 +2295,220 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   std::cout << "decode_capture=PASS\n";
 }
 
+// `length` tokens of `chat`, repeated as far as they need.
+std::vector<uint32_t> repeatedChat(std::span<const uint32_t> chat, uint32_t length) {
+  std::vector<uint32_t> tokens(length);
+  for (uint32_t index = 0; index < length; ++index)
+    tokens[index] = chat[index % chat.size()];
+  return tokens;
+}
+
+// A request's first decode cycle (from a prompt prefilled in one chunk on
+// lane 0): the rows it retained, its output, whether it ended the request and
+// the state it captured at a page when given one. `limit` is its output
+// limit; `ignoreEnd` lets it pass the target's stop tokens. The caller ends
+// the request.
+struct FirstCycle final {
+  uint32_t retained = 0;
+  std::vector<uint32_t> output;
+  bool finished = false;
+  std::vector<std::shared_ptr<const CompositeState>> captured;
+};
+
+FirstCycle runFirstCycle(model::Runtime &executor, const model::QwenStateStorage &states, uint64_t id,
+                         std::span<const uint32_t> tokens, uint32_t limit, bool ignoreEnd,
+                         std::optional<uint32_t> boundary, const std::vector<uint32_t> &pages) {
+  const auto length = static_cast<uint32_t>(tokens.size());
+  EngineRequest request = makeRequest(id, {tokens.begin(), tokens.end()}, limit);
+  if (ignoreEnd)
+    request.flags = RequestIgnoreEndOfSequence;
+  beginCold(executor, request, 0);
+  executor.setDraftContextPlan(id, planDraftContext(0, length, {}));
+  const ModelStepResult prefilled = prefillChunk(executor, id, 0, tokens, pages);
+  require(prefilled.failure.empty() && prefilled.outputTokens.empty(),
+          "a first cycle's prompt ended right after prefill");
+  const BatchPlan plan{.kind = WorkKind::Decode, .items = {{id, 0}}, .decodeStage = DecodeStage::Regular};
+  ModelBatchItem item = withRevision({id, length, 0, pages});
+  if (boundary) {
+    metal::AllocationFailure refusal;
+    item.stateCaptures.push_back({*boundary, executor.reserveState(id, *boundary, refusal)});
+    require(item.stateCaptures.back().reservation != nullptr, "the buffers of a decode capture were refused");
+  }
+  std::vector<ModelStepResult> results = executor.decode(plan, std::span<const ModelBatchItem>(&item, 1));
+  require(results.size() == 1 && results[0].failure.empty(), "a first cycle failed");
+  return {static_cast<uint32_t>(states.metadata(0).lengths.targetTokens - length),
+          std::move(results[0].outputTokens), results[0].finished, std::move(results[0].capturedStates)};
+}
+
+// A prompt of 88 to 126 tokens whose first cycle, a draft's block of rows,
+// retains a path that crosses the next page with at least two rows before it:
+// the prompt's length and its page. The caller forces the cycles' rows.
+std::pair<uint32_t, uint32_t> promptCrossingAPage(model::Runtime &executor, const model::QwenStateStorage &states,
+                                                  std::span<const uint32_t> chat, uint64_t firstId,
+                                                  const std::vector<uint32_t> &pages) {
+  for (const uint32_t page : {96U, 128U})
+    for (uint32_t length = page - 2; length + 8 >= page; --length) {
+      const FirstCycle cycle =
+          runFirstCycle(executor, states, firstId + length, repeatedChat(chat, length), 64, true, std::nullopt, pages);
+      executor.end(firstId + length);
+      if (length + cycle.retained > page)
+        return {length, page};
+    }
+  return {0, 0};
+}
+
+// A decode capture at a page strictly inside the path its cycle retained
+// holds the bytes a capture at that page holds where the cycle retained
+// exactly the rows before it (its codes, or with --cached-states exact the
+// running format): the fold takes the path's first rows, whatever the path
+// holds past them. That cycle is the same prompt's under an output limit
+// that leaves it no more rows; requireDecodeCaptureMatchesTheLane holds such
+// a capture to the lane's own state at its page.
+void requireCaptureInsideItsPathMatchesExactRows(model::Runtime &executor, model::QwenStateStorage &states,
+                                                 std::span<const uint32_t> chat) {
+  if (!executor.capturesInDecode()) {
+    std::cout << "decode_capture_inside_path=SKIP (the target writes auxiliary state with its retained rows)\n";
+    return;
+  }
+  const std::vector<uint32_t> pages = pageRange(100, 5);
+  model::RuntimeInstrumentation::forceStepRows(executor, model::ExecutionLimits::draftQueryRows);
+  const auto [length, page] = promptCrossingAPage(executor, states, chat, 2400, pages);
+  require(length != 0, "no prompt of 88 to 126 tokens had a first cycle that crossed a page");
+  const std::vector<uint32_t> tokens = repeatedChat(chat, length);
+  const FirstCycle crossing = runFirstCycle(executor, states, 2500, tokens, 64, true, page, pages);
+  executor.end(2500);
+  require(length + crossing.retained > page && crossing.captured.size() == 1,
+          "the cycle that crossed its page did so no longer, or sealed no capture");
+  // The output limit counts the first token prefill selected.
+  FirstCycle exact;
+  for (const uint32_t limit : {page - length + 1, page - length}) {
+    exact = runFirstCycle(executor, states, 2501, tokens, limit, true, page, pages);
+    executor.end(2501);
+    if (length + exact.retained == page)
+      break;
+  }
+  model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+  require(length + exact.retained == page && exact.captured.size() == 1,
+          "no output limit left the cycle exactly the rows before its page");
+  require(std::ranges::equal(std::span(crossing.output).first(exact.retained),
+                             std::span(exact.output).first(exact.retained)),
+          "the limited cycle kept another path than the one that crossed its page");
+  std::vector<uint32_t> probe = tokens;
+  probe.insert(probe.end(), crossing.output.begin(), crossing.output.begin() + (page - length));
+  probe.push_back(chat[page % chat.size()]);
+  const StateBytes inside = restoredBytes(executor, states, 2502, 2, probe, page, crossing.captured.front());
+  const StateBytes atEnd = restoredBytes(executor, states, 2503, 2, probe, page, exact.captured.front());
+  const auto differing = [](const std::vector<uint8_t> &left, const std::vector<uint8_t> &right) {
+    require(left.size() == right.size(), "two captures' restores differ in size");
+    uint64_t count = 0;
+    for (size_t index = 0; index < left.size(); ++index)
+      count += left[index] != right[index];
+    return count;
+  };
+  const uint64_t cell = differing(inside.cell, atEnd.cell), window = differing(inside.window, atEnd.window);
+  std::cout << "decode_capture_inside_path prompt=" << length << " page=" << page << " rows=" << page - length
+            << " retained=" << crossing.retained << " cell_bytes_differing=" << cell
+            << " window_bytes_differing=" << window << '\n';
+  require(cell == 0 && window == 0,
+          "a capture inside its cycle's path differs from one whose cycle retained exactly the rows before its page");
+  std::cout << "decode_capture_inside_path=PASS\n";
+}
+
+// A prompt of 961 tokens prefilled cold, and again from the state its
+// prefill captured at 960, restored from RAM and read back from the disk
+// tier: the last row's logits. A state read back from the disk restores what
+// the RAM copy restores, logit for logit. With --cached-states exact a hit
+// is the cold prefill's arithmetic, which splits there too, logit for logit;
+// through the codes (the default) its next token is the cold one's and its
+// distribution within `kBound` of the cold one's (KL divergence of the hit's
+// softmax from the cold one's). The bound is the p99 KL of the release
+// logits check's noise floor on Qwen3.8-27B GGUF (1.2e-3); measured on an M5
+// Max, the codes' hit left 3.2e-5 on Qwen3.8-27B MLX and 1.8e-6 on
+// Qwen3.6-35B-A3B GGUF, and a restore that left the lane's GDN state
+// unrestored 0.14 and 0.15.
+void requireCacheHitMatchesCold(model::Runtime &executor, std::span<const uint32_t> chat, uint32_t vocabulary,
+                                bool exact) {
+  // One token past the state, so that the next token's distribution rests on the state rather than on rows
+  // prefilled after it.
+  constexpr uint32_t kLength = 961, kBoundary = 960;
+  constexpr double kBound = 1.2e-3;
+  const std::vector<uint32_t> prompt = repeatedChat(chat, kLength);
+  const std::span<const uint32_t> tokens(prompt);
+  const std::vector<uint32_t> coldPages = pageRange(0, kLength / kv::kPageTokens + 1);
+  const auto hitPages = [&](uint32_t first) {
+    std::vector<uint32_t> result(coldPages.begin(), coldPages.begin() + kBoundary / kv::kPageTokens);
+    for (uint32_t page = 0; page < 2; ++page)
+      result.push_back(first + page);
+    return result;
+  };
+  const auto lastLogits = [&] {
+    const std::span<const float> logits = model::RuntimeInstrumentation::lastLogits(executor, 0);
+    require(logits.size() >= vocabulary, "the last row's logits are narrower than the vocabulary");
+    return std::vector<float>(logits.begin(), logits.begin() + vocabulary);
+  };
+  beginCold(executor, makeRequest(2800, prompt, 1), 0);
+  const std::array<uint32_t, 1> boundary{kBoundary};
+  executor.setDraftContextPlan(2800, planDraftContext(0, kLength, boundary));
+  ModelStepResult first = prefillChunk(executor, 2800, 0, tokens.first(kBoundary), coldPages, {}, boundary);
+  require(first.failure.empty() && first.capturedStates.size() == 1, "the cold prefill captured no state");
+  const std::shared_ptr<const CompositeState> state = first.capturedStates.front();
+  prefillChunk(executor, 2800, kBoundary, tokens.subspan(kBoundary), coldPages);
+  const std::vector<float> cold = lastLogits();
+  executor.end(2800);
+
+  beginCold(executor, makeRequest(2801, prompt, 1), 1);
+  restoreActivePrefix(executor, 2801, kLength, kBoundary, state);
+  prefillChunk(executor, 2801, kBoundary, tokens.subspan(kBoundary), hitPages(40));
+  const std::vector<float> fromRam = lastLogits();
+  executor.end(2801);
+
+  std::unique_ptr<StateOffload> write = state->offload({});
+  require(write != nullptr, "the disk tier admitted no state");
+  while (!write->ready())
+    std::this_thread::yield();
+  require(write->finish(), "a state's write to the disk tier failed");
+  const std::shared_ptr<const CompositeState> disk = write->state();
+  write.reset();
+  beginCold(executor, makeRequest(2802, prompt, 1), 2);
+  std::unique_ptr<StateRestore> read = executor.beginRestore(2802, kBoundary, disk, true, {});
+  require(read != nullptr, "a restore from the disk tier returned no read");
+  while (!read->ready())
+    std::this_thread::yield();
+  require(read->finish(), "a restore from the disk tier failed");
+  read.reset();
+  executor.setDraftContextPlan(2802, planDraftContext(kBoundary, kLength, {}));
+  prefillChunk(executor, 2802, kBoundary, tokens.subspan(kBoundary), hitPages(44));
+  const std::vector<float> fromDisk = lastLogits();
+  executor.end(2802);
+
+  const auto top = [](const std::vector<float> &logits) {
+    return static_cast<uint32_t>(std::max_element(logits.begin(), logits.end()) - logits.begin());
+  };
+  const auto logSoftmax = [](const std::vector<float> &logits) {
+    const double most = *std::max_element(logits.begin(), logits.end());
+    double sum = 0.0;
+    for (const float logit : logits)
+      sum += std::exp(logit - most);
+    std::vector<double> result(logits.size());
+    for (size_t index = 0; index < logits.size(); ++index)
+      result[index] = logits[index] - most - std::log(sum);
+    return result;
+  };
+  const std::vector<double> p = logSoftmax(cold), q = logSoftmax(fromRam);
+  double divergence = 0.0;
+  for (size_t index = 0; index < p.size(); ++index)
+    divergence += std::exp(p[index]) * (p[index] - q[index]);
+  std::cout << "cache_hit_cold cached_states=" << (exact ? "exact" : "codes") << " cold_top=" << top(cold)
+            << " hit_top=" << top(fromRam) << " kl=" << divergence
+            << " disk_equal=" << (fromDisk == fromRam) << " exact_equal=" << (fromRam == cold) << '\n';
+  require(top(fromRam) == top(cold) && divergence <= kBound,
+          "a cache hit's next token or distribution left the cold prefill's bound");
+  if (exact)
+    require(fromRam == cold, "an exact cached state's hit gave other logits than the cold prefill");
+  require(fromDisk == fromRam, "a state read back from the disk tier restored other logits than its RAM copy");
+  std::cout << "cache_hit_cold=PASS\n";
+}
+
 // Fills every byte of a lane's GDN recurrent state, the half of the cell its
 // next transition reads, with 0xFF: NaN in either format, which the
 // recurrence carries into every row the lane computes. Non-finite KV would
@@ -3165,7 +3379,7 @@ void requireRefusedStartKeepsItsRows(model::Runtime &executor,
   const uint64_t laneBytes = states.layout().laneBytes();
   const auto imageBytes = [&](const ImageSpan &span) {
     return span.pixelBytes() +
-           uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
+           uint64_t{span.grid().mergedTokens()} *
                model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t);
   };
   std::vector<uint32_t> prompt(128);
@@ -3250,7 +3464,7 @@ void requirePoolReleaseTakesOneUnit(model::Runtime &executor,
   releaseIdle(executor);
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const auto rowBytes = [&](const ImageSpan &span) {
-    return uint64_t{ops::Vision::embeddingRows({span.gridHeight, span.gridWidth})} *
+    return uint64_t{span.grid().mergedTokens()} *
            model.vision.tensors.layout.outputHiddenSize * sizeof(uint16_t);
   };
   std::vector<uint32_t> prompt(128);
@@ -3490,7 +3704,11 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
       tokens[index] = seed[(index + 11 * request) % seed.size()];
     return tokens;
   };
-  const auto pages = [](uint32_t request) { return pageRange(40 + 6 * request, 6); };
+  // Held for the check's lifetime: an item's page table is a view.
+  std::vector<std::vector<uint32_t>> pageTables;
+  for (uint32_t request = 0; request < model::ExecutionLimits::maximumBatchWidth; ++request)
+    pageTables.push_back(pageRange(40 + 6 * request, 6));
+  const auto pages = [&](uint32_t request) -> const std::vector<uint32_t> & { return pageTables[request]; };
   // A batch's tokens per request and cycle, and each request's committed
   // state.
   struct Batch final {
@@ -4103,20 +4321,82 @@ void requireGrammarChainsAreVerified(model::Runtime &executor, const model::Mode
   std::cout << "grammar_chains_verified=PASS\n";
 }
 
-// A lane whose retained path branches commits what decoding its tokens one
-// row a cycle, a chain, commits. Two, three and four constrained greedy lanes
-// end their prompts two tokens before a page boundary and decode a step of
-// sixteen rows a lane: each lane's masks force its selections down its
-// tree's path through a row's second child, as deep as the tree goes, so the
-// path branches and the path commit moves its rows' K/V across the boundary;
-// each lane captures its state at the boundary where the target captures in
-// decode (Runtime::capturesInDecode). Each lane's tokens are then decoded
-// again alone, one row a cycle, each selection forced to the same token,
-// capturing at the boundary too. A cycle of a row a lane more, and the first
-// selection of a request restored from each capture, give each lane's logits
-// within `bound` (cosine) of the chain's.
-void requireBranchedPathsMatchChains(model::Runtime &executor, const model::ModelDescriptor &descriptor,
-                                     std::span<const uint32_t> seed, double bound) {
+// Every attention layer's K/V in the slot of `position` of a lane's pages, as
+// stored: of each KV head its keys, values, and with INT8 pages the key and
+// value scales of its row, layer by layer.
+std::vector<uint8_t> slotBytes(const kv::PageStorage &pages, std::span<const uint32_t> pageTable, uint64_t position) {
+  const kv::Layout layout = pages.layout();
+  require(position / kv::kPageTokens < pageTable.size(), "a K/V slot past its lane's pages");
+  const auto token = static_cast<uint32_t>(position % kv::kPageTokens);
+  const uint32_t dimension = layout.headDimension;
+  const uint64_t element = layout.format == kv::Format::Int8 ? 1 : sizeof(uint16_t);
+  std::vector<uint8_t> bytes;
+  for (uint32_t layer = 0; layer < layout.attentionLayers; ++layer) {
+    const std::array<std::span<std::byte>, 4> spans =
+        pages.layerSpans(pageTable[position / kv::kPageTokens], layer);
+    const auto append = [&](uint32_t tensor, uint64_t at, uint64_t count) {
+      const auto *data = reinterpret_cast<const uint8_t *>(spans[tensor].data()) + at;
+      bytes.insert(bytes.end(), data, data + count);
+    };
+    for (uint32_t head = 0; head < layout.kvHeads; ++head) {
+      append(SPLASH_KV_KEYS, splash_kv_key_element(head, token, 0, dimension) * element, dimension * element);
+      for (uint32_t at = 0; at < dimension; ++at)
+        append(SPLASH_KV_VALUES,
+               (layout.valuesTokenMajor ? splash_kv_key_element(head, token, at, dimension)
+                                        : splash_kv_value_element(head, token, at, dimension)) *
+                   element,
+               element);
+      if (layout.format == kv::Format::Int8)
+        for (const uint32_t scales : {SPLASH_KV_KEY_SCALES, SPLASH_KV_VALUE_SCALES})
+          append(scales, splash_kv_scale_element(head, token) * sizeof(float), sizeof(float));
+    }
+  }
+  return bytes;
+}
+
+// A lane whose retained path branches commits what its step stored for the
+// path's rows and what decoding its tokens one row a cycle, a chain, commits.
+// Two, three and four constrained greedy lanes end their prompts two tokens
+// before a page boundary and decode a step of sixteen rows a lane: each
+// lane's masks force its selections down its tree's path through a row's
+// second child, as deep as the tree goes, so the path branches and the path
+// commit moves its rows' K/V across the boundary; each lane captures its
+// state at the boundary where the target captures in decode
+// (Runtime::capturesInDecode). The same; run first: each lane's path the
+// tree's first children from its root (a branch-free twin of the same rows in
+// the same widths).
+// The K/V, bit for bit: the path commit copies a path's rows with their int8
+// scales as stored, so the slot of each depth of the path holds what the
+// step's verify stored for the path's row there. A reference step before
+// each, the same lanes from the same cold starts, retains each lane's anchor
+// alone, which leaves every row the verify stored in its own slot; the two
+// steps' trees must be one tree. A commit skipped, one that moves the wrong
+// rows or a row's codes without its scales differs there by a whole row, which
+// a bound on logits cannot see: a skipped commit put Qwen3.8-27B MLX 4-bit's
+// next logits at 2.72 times the twin's distance from the chain's, inside the
+// 0.22 to 2.78 times of legitimate runs (11-17), and moves no row's best token
+// there.
+// The logits, for what the pages do not hold (the GDN state's fold of the
+// path, the draft's rings and the captured states): each lane's tokens are
+// decoded again alone, one row a cycle, each selection forced to the same
+// token, capturing at the boundary too. A cycle of a row a lane more, and the
+// first selection of a request restored from each capture, give each lane's
+// logits within its paths' rounding (cosine) of the chain's. The bound is a
+// distance from 1 kMargin times the twin's largest. Both sides' largest are
+// the extremes of 18 rows (9 where the target captures nothing in decode) of
+// a heavy-tailed rounding, whose medians agreed within 2.2 times on six
+// models, so the largest differ by chance: the check's was 0.22 to 2.78 times
+// its twin's in seven runs (11-17, the 2.78 Qwen3.8-27B UD-Q4_K_M on the
+// 16-core M5 Pro), and kMargin is a margin on that ratio, which the check
+// prints. A twin further than kControl from its chain fails as a control off,
+// so that a broken build does not set its own bound. The staged decode tiles
+// of a step's rows and the column tile of a chain's one row sum in different
+// orders, which int8 K/V at one scale a row and head carries to every code
+// near a half step (Qwen3.8-27B UD-Q4_K_M's branched logits kept a cosine of
+// 0.998385 to its chain's on the 16-core M5 Pro, under 1.7.0 too).
+void requireBranchedPathsMatchChains(model::Runtime &executor, const kv::PageStorage &pages,
+                                     const model::ModelDescriptor &descriptor, std::span<const uint32_t> seed) {
+  constexpr double kControl = 0.95, kMargin = 5.0;
   constexpr uint32_t kBoundary = kv::kPageTokens, kPrompt = kBoundary - 2, kBudget = 32;
   const uint32_t maskWords = targetTokens->maskWords();
   const bool captures = executor.capturesInDecode();
@@ -4238,14 +4518,52 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
     require(logits.size() == 1, "branched paths: a restored request's selection copied no logits");
     return std::move(logits.front());
   };
+  double twinLeast = 1.0, least = 1.0;
+  uint64_t comparedRows = 0, movedRows = 0;
+  for (const bool twin : {true, false})
   for (const uint32_t width : {2U, 3U, 4U}) {
-    const std::string label = "branched paths B" + std::to_string(width);
+    const std::string label = (twin ? "branch-free twin B" : "branched paths B") + std::to_string(width);
+    // Each lane's tree as its mask request gave it: its rows' tokens and
+    // parents.
+    using Tree = std::pair<std::vector<uint32_t>, std::vector<uint32_t>>;
+    std::vector<Tree> trees(width), referenceTrees(width);
+    // The reference step: the same lanes from the same cold starts in the same
+    // step, each lane's row 0 selecting none of its children's tokens, so that
+    // its path is its anchor alone, the commit moves nothing and slot kPrompt
+    // + r keeps the K/V the verify stored for row r. A verify's rows depend on
+    // the lane's state and tree alone; masks act on the selection after it.
+    std::vector<std::vector<std::vector<uint8_t>>> stored(width);
+    {
+      std::vector<Lane> reference;
+      for (uint32_t index = 0; index < width; ++index)
+        reference.push_back(start(1000 + index, index, index, pageRange(100 + 4 * index, 2)));
+      model::RuntimeInstrumentation::forceStepRows(executor, width * model::ExecutionLimits::targetVerifyRows);
+      cycle(reference, false, [&](const Lane &lane, const ModelMaskRequest &request) {
+        referenceTrees[lane.index] = {request.simulationTokens, request.parents};
+        std::vector<uint32_t> words = admitting(request.simulationTokens.size() + 1);
+        for (uint32_t row = 1; row < request.parents.size(); ++row)
+          if (request.parents[row] == 0) {
+            const uint32_t token = request.simulationTokens[row];
+            words[maskWords + token / 32] &= ~(1U << (token % 32));
+          }
+        return words;
+      });
+      model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+      for (uint32_t lane = 0; lane < width; ++lane) {
+        require(model::RuntimeInstrumentation::lastRetainedRows(executor, lane) == 1,
+                label + ": lane " + std::to_string(lane) + " of the reference step retained more than its anchor");
+        for (uint32_t row = 0; row < referenceTrees[lane].first.size(); ++row)
+          stored[lane].push_back(slotBytes(pages, reference[lane].pages, kPrompt + row));
+        executor.end(reference[lane].id);
+      }
+    }
     std::vector<Lane> branched;
     for (uint32_t index = 0; index < width; ++index)
       branched.push_back(start(1000 + index, index, index, pageRange(100 + 4 * index, 2)));
     std::vector<uint32_t> forcedPaths(width);
     model::RuntimeInstrumentation::forceStepRows(executor, width * model::ExecutionLimits::targetVerifyRows);
     cycle(branched, true, [&](const Lane &lane, const ModelMaskRequest &request) {
+      trees[lane.index] = {request.simulationTokens, request.parents};
       const std::vector<uint32_t> &parents = request.parents;
       const auto rows = static_cast<uint32_t>(request.simulationTokens.size());
       std::vector<std::vector<uint32_t>> children(rows);
@@ -4255,6 +4573,11 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
       // descendants down its first children, short of a stop token.
       const auto stop = [&](uint32_t row) { return row && stops.contains(request.simulationTokens[row]); };
       std::vector<uint32_t> path;
+      if (twin)
+        for (uint32_t row = 0;; row = children[row].front()) {
+          path.push_back(row);
+          if (children[row].empty() || stop(children[row].front())) break;
+        }
       for (uint32_t branch = 0; branch < rows && path.empty(); ++branch) {
         std::vector<uint32_t> up;
         for (uint32_t row = branch;; row = parents[row]) {
@@ -4275,18 +4598,43 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
       }
       require(!path.empty(),
               label + ": a lane's tree of " + std::to_string(rows) + " rows does not branch short of a stop token");
-      // Each path row selects the next one's token; the last selects freely.
+      // Each path row selects the next one's token; the last selects freely
+      // but none of its children's, so that the path ends where it was
+      // forced (on Qwen3.6-35B-A3B a row whose first child is a stop token
+      // selected its later child's).
       std::vector<uint32_t> words = admitting(rows + 1);
       for (size_t at = 0; at + 1 < path.size(); ++at) force(words, 1 + path[at], request.simulationTokens[path[at + 1]]);
+      for (const uint32_t child : children[path.back()]) {
+        const uint32_t token = request.simulationTokens[child];
+        words[(1 + path.back()) * maskWords + token / 32] &= ~(1U << (token % 32));
+      }
       for (const uint32_t row : path) forcedPaths[lane.index] |= 1U << row;
       return words;
     });
     model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
     for (uint32_t lane = 0; lane < width; ++lane) {
       const uint32_t retained = model::RuntimeInstrumentation::lastRetainedRows(executor, lane);
-      require(retained == forcedPaths[lane] && retained != test::chainPath(std::popcount(retained)) &&
-                  (branched[lane].capture || !captures) && branched[lane].position >= kBoundary,
-              label + ": a lane did not retain its branched path across the boundary, or did not capture there");
+      require(retained == forcedPaths[lane] && (twin || retained != test::chainPath(std::popcount(retained))),
+              label + ": lane " + std::to_string(lane) + " retained rows " + std::to_string(retained) +
+                  ", not its forced path's " + std::to_string(forcedPaths[lane]));
+      require(branched[lane].position >= kBoundary && (branched[lane].capture || !captures),
+              label + ": lane " + std::to_string(lane) + " ended at " + std::to_string(branched[lane].position) +
+                  (branched[lane].capture ? "" : " without a capture") + ", short of the boundary at " +
+                  std::to_string(kBoundary) + " or of its capture there");
+      // The commit copies stored rows as they are: the slot of each depth of
+      // the path holds the K/V the verify stored for the path's row there,
+      // byte for byte, codes and scales of every layer and KV head.
+      require(trees[lane] == referenceTrees[lane],
+              label + ": lane " + std::to_string(lane) + "'s tree is not the reference step's: not the same step");
+      uint32_t depth = 0;
+      for (uint32_t path = forcedPaths[lane]; path; path &= path - 1, ++depth) {
+        const auto row = static_cast<uint32_t>(std::countr_zero(path));
+        require(slotBytes(pages, branched[lane].pages, kPrompt + depth) == stored[lane].at(row),
+                label + ": lane " + std::to_string(lane) + "'s K/V at depth " + std::to_string(depth) +
+                    " is not its path's row " + std::to_string(row) + " as the step stored it");
+        ++comparedRows;
+        movedRows += row != depth;
+      }
     }
     const std::vector<std::vector<float>> branchedNext = nextLogits(branched);
     for (const Lane &lane : branched) executor.end(lane.id);
@@ -4315,13 +4663,19 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
       executor.end(chain.id);
       const double restored =
           captures ? cosine(restoredLogits(original, 1020), restoredLogits(chain, 1021)) : 1.0;
-      require(next > bound && restored > bound,
-              label + ": lane " + std::to_string(original.index) + "'s next logits are at cosine " +
-                  std::to_string(next) + " and its restored capture's at " + std::to_string(restored) +
-                  " of the chain's");
+      (twin ? twinLeast : least) = std::min({twin ? twinLeast : least, next, restored});
     }
   }
-  std::cout << "branched_paths_match_chains=PASS widths=2,3,4" << (captures ? "" : " (no decode captures)") << '\n';
+  require(twinLeast > kControl, "branched paths: the control is off, a branch-free twin's logits at cosine " +
+                                    std::to_string(twinLeast) + " of its chain's");
+  const double bound = 1.0 - kMargin * (1.0 - twinLeast);
+  const double ratio = (1.0 - least) / std::max(1.0 - twinLeast, 1e-9);
+  require(least > bound, "branched paths: a lane's logits are at cosine " + std::to_string(least) +
+                             " of its chain's, " + std::to_string(ratio) + " times its twin's distance (least cosine " +
+                             std::to_string(twinLeast) + "; bound " + std::to_string(bound) + ")");
+  std::cout << "branched_paths_match_chains=PASS widths=2,3,4" << (captures ? "" : " (no decode captures)")
+            << " kv_rows=" << comparedRows << " kv_moved=" << movedRows << " least_cosine=" << least << " twin_least=" << twinLeast << " ratio=" << ratio << " bound=" << bound
+            << '\n';
 }
 
 // A step whose lanes take different rows at the lane cap of 16 computes each
@@ -4337,14 +4691,30 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const model::Mode
 // step's rows and in another state lane, and each alone in a step of its
 // rows. Each row's raw logits in the reversed step are the step's in order
 // (a cosine of 1 within 1e-6: the same rows, routed alike); alone, within
-// `aloneBound` (cosine), which takes the rounding of a step of other rows:
-// of its projections' tiles, and of a MoE target's expert tiles, which a
-// lane alone fills with its rows alone. The step is one command in two
+// `aloneBound` (cosine), which takes the rounding of a step of other rows,
+// of its projections' tiles. A routed (sparse MoE) target has no such bound:
+// a lane alone fills its experts' tiles with its rows alone, whose tile kinds
+// sum a row in other orders (moe_expert_slab.h), and expert routes at near
+// ties multiply that rounding, so its lanes alone sit 0.953 to 0.998 from
+// their rows in the step (least cosine of 8 prompts a cell, 48 GB M5 Pro,
+// 11-19: Qwen3.8-Flash-Next MLX 4-bit 0.9533-0.9916, Q2_0 GGUF 0.9788-0.9966,
+// Qwen3.6-35B-A3B MLX 0.9951-0.9983), by the prompt; the first layer's values
+// differ by 1.2e-3 to 3.2e-3 relative, rounding alone. The check prints
+// them, and the largest gap of a lane alone's best token below the step's
+// best, in logits. A routed target's lanes are held apart exactly elsewhere:
+// by the reversed step here, by gguf-moe's lanes (each lane's row of the MoE
+// block bitwise the all-rows step's where its routes run the same tile
+// kinds) and by the dense targets' lanes alone, which share every other
+// operator and the lanes' wiring. Nothing holds a dependence of a lane's rows
+// on the set of the other lanes' rows that is symmetric (the reversed step
+// leaves it alike), lies outside the MoE block and arises on routed targets
+// alone. The step is one command in two
 // parts, its draft's and its target's (Runtime::decodeAsync), which gives
 // every row the bits the command built whole and then submitted gives, in
 // one command buffer more.
 void requireMixedStepMatchesLanesAlone(model::Runtime &executor, metal::MetalBackend &backend,
-                                       std::span<const uint32_t> seed, uint32_t vocabulary, double aloneBound) {
+                                       std::span<const uint32_t> seed, uint32_t vocabulary,
+                                       std::optional<double> aloneBound) {
   constexpr std::array<uint32_t, 4> kRows{16, 5, 9, 12}, kFirstForced{0, 3, 4, 1};
   constexpr uint32_t kStepRows = 16 + 5 + 9 + 12;
   // The thinking end's words, before the token that closes thinking. A
@@ -4435,21 +4805,36 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, metal::MetalBac
               " command buffers, does not give the bits of its command submitted whole, of " +
               std::to_string(commandBuffers));
   const std::vector<std::vector<float>> reversed = decode(kReversed, 1110, kStepRows);
+  // The largest gap of a row alone's best token below the step's row's best.
+  const auto largestGap = [&](const std::vector<float> &step, const std::vector<float> &alone, uint32_t rows) {
+    float largest = 0.0F;
+    for (uint64_t row = 0; row < rows; ++row) {
+      const std::span<const float> left(step.data() + row * vocabulary, vocabulary),
+          right(alone.data() + row * vocabulary, vocabulary);
+      const auto best = std::ranges::max_element(left), aloneBest = std::ranges::max_element(right);
+      largest = std::max(largest, *best - left[static_cast<size_t>(aloneBest - right.begin())]);
+    }
+    return largest;
+  };
   double reversedLeast = 1.0, aloneLeast = 1.0;
+  float gap = 0.0F;
   std::string byLane;
   for (uint32_t index = 0; index < lanes.size(); ++index) {
     reversedLeast = std::min(reversedLeast, leastCosine(mixed[index], reversed[index], kRows[index]));
     const std::array<uint32_t, 1> alone{index};
-    const double least = leastCosine(mixed[index], decode(alone, 1120 + index, kRows[index])[index], kRows[index]);
+    const std::vector<float> aloneLogits = decode(alone, 1120 + index, kRows[index])[index];
+    const double least = leastCosine(mixed[index], aloneLogits, kRows[index]);
+    gap = std::max(gap, largestGap(mixed[index], aloneLogits, kRows[index]));
     aloneLeast = std::min(aloneLeast, least);
     byLane += (index ? "," : "") + std::to_string(least);
   }
   std::cout << "mixed_step rows=16,5,9,12 command_buffers=" << partsBuffers << " reversed_least_cosine="
-            << reversedLeast << " alone_least_cosine=" << byLane << '\n';
+            << reversedLeast << " alone_least_cosine=" << byLane << " alone_largest_gap=" << gap
+            << " alone_bound=" << (aloneBound ? std::to_string(*aloneBound) : "none (routed)") << '\n';
   require(reversedLeast > 1.0 - 1e-6,
           "mixed step: a lane's logits are at cosine " + std::to_string(reversedLeast) +
               " of its in the step of its lanes reversed");
-  require(aloneLeast > aloneBound,
+  require(!aloneBound || aloneLeast > *aloneBound,
           "mixed step: a lane's logits are at cosine " + std::to_string(aloneLeast) + " of its alone");
   std::cout << "mixed_step_matches_lanes_alone=PASS\n";
 }
@@ -4459,50 +4844,64 @@ void requireMixedStepMatchesLanesAlone(model::Runtime &executor, metal::MetalBac
 // temperature, whose draft rows each draw one child (the others' weights
 // underflow), and output budgets of 6 tokens, which hold a tree to 6 rows
 // under --verify-rows auto (under all a tree is a draft's block whatever the
-// output left), in a forced step of 8 rows a lane. Each lane holds the rows
-// its tree grew, as a step of exactly the lanes' rows lays them out from the
-// same states, commits a well formed cycle, and its rows' logits are within
-// `bound` (cosine) of that step's, whose projections' tiles hold other rows.
-// So does
-// a step at a floor (VerifyRowsParams), whose lanes hold their trees' rows
-// estimated at least the floor and leave the others to no lane: of greedy
-// lanes with output budgets of 12 tokens, whose trees fill a draft's block
-// with rows of four children each (children's estimates sum to at most
-// their parent's, so no floor passes a whole tree), at floors of 0.1, 0.25,
-// 0.5 and 0.75, one at least of which leaves out some of the trees' rows
-// past their anchors and not all; and at a floor over every estimate, which
-// leaves each lane its anchor alone.
-void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> seed, uint32_t vocabulary,
-                         double bound) {
+// output left), in a forced step of 8 rows a lane; and steps at a floor
+// (VerifyRowsParams), whose lanes hold their trees' rows estimated at least
+// the floor and leave the others to no lane: of greedy lanes with output
+// budgets of 12 tokens, whose trees fill a draft's block with rows of four
+// children each (children's estimates sum to at most their parent's, so no
+// floor passes a whole tree), at floors of 0.1, 0.25, 0.5 and 0.75, one at
+// least of which leaves out some of the trees' rows past their anchors and
+// not all, and at a floor over every estimate, which leaves each lane its
+// anchor alone.
+// No kernel reads the rows of no lane, bit for bit: each step runs twice from
+// the same states, once after a step of every lane's whole tree from the
+// lanes' prompts and once after one from other prompts, which leave other
+// contents in the step's packed rows past the lanes' and in the lanes' K/V
+// slots past their rows; each lane holds the same rows and its rows' raw
+// logits are the same both times. The two steps before differ in every row
+// they hold, or the second run would prove nothing. A step of exactly the
+// lanes' rows rounds differently, as its projections' tiles hold other rows
+// (Qwen3.8-27B MLX 4-bit's logits at a cosine of 0.998346 on the 20-core M5
+// Pro), so its logits are not compared; it checks the rows alone: each lane
+// holds the rows its tree grew, as a step of exactly the lanes' rows lays
+// them out from the same states, and commits a well formed cycle.
+void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> seed) {
   constexpr uint32_t kLanes = 3, kOutput = 6, kGreedyOutput = 12, kStepRows = 8 * kLanes;
   struct Lane final {
     EngineRequest request;
+    // The lane's prompt, and the other prompt of the step before a run.
+    std::array<std::vector<uint32_t>, 2> prompts;
     std::vector<uint32_t> pages;
   };
   std::array<Lane, kLanes> lanes;
   for (uint32_t index = 0; index < kLanes; ++index) {
     Lane &lane = lanes[index];
-    std::vector<uint32_t> prompt(36 + 11 * index);
-    for (uint32_t at = 0; at < prompt.size(); ++at) prompt[at] = seed[(at + 5 * index) % seed.size()];
-    lane.request = makeRequest(0, std::move(prompt), kOutput);
+    for (uint32_t set = 0; set < 2; ++set) {
+      lane.prompts[set].resize(36 + 11 * index);
+      for (uint32_t at = 0; at < lane.prompts[set].size(); ++at)
+        lane.prompts[set][at] = seed[(at + 5 * index + 17 * set) % seed.size()];
+    }
+    lane.request = makeRequest(0, lane.prompts[0], kOutput);
     lane.request.flags = RequestIgnoreEndOfSequence;
     lane.request.sampling = {.temperature = 0.05F, .topP = 1.0F, .topK = 0, .seed = 5303 + index};
     lane.pages = pageRange(100 + 4 * index, 4);
   }
   // The lanes in one forced step of `rows` rows at `floor`, each request an
   // id of its own from `firstId`, sampled as above or `greedy` with the
-  // longer budget: each lane's rows and their raw logits.
+  // longer budget, from prompts `set`: each lane's rows and their raw logits.
   struct Step final {
     std::array<uint32_t, kLanes> rows{};
     std::vector<std::vector<float>> logits;
   };
-  const auto decode = [&](uint64_t firstId, uint32_t rows, float floor = 0.0F, bool greedy = false) {
+  const auto decode = [&](uint64_t firstId, uint32_t rows, float floor = 0.0F, bool greedy = false,
+                          uint32_t set = 0) {
     BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
     std::vector<ModelBatchItem> items;
     const uint32_t budget = greedy ? kGreedyOutput : kOutput;
     for (uint32_t index = 0; index < kLanes; ++index) {
       Lane &lane = lanes[index];
       lane.request.id = firstId + index;
+      lane.request.prompt = lane.prompts[set];
       lane.request.maxNewTokens = budget;
       lane.request.sampling.temperature = greedy ? 0.0F : 0.05F;
       beginCold(executor, lane.request, index);
@@ -4535,88 +4934,92 @@ void requireRowsOfNoLane(model::Runtime &executor, std::span<const uint32_t> see
     require(step.logits.size() == kLanes, "rows of no lane: a step copied no logits");
     return step;
   };
-  // The least cosine of the rows `step`'s lanes hold to those of `exact`, a
-  // step of exactly their rows.
-  const auto leastCosine = [&](const Step &step, const Step &exact) {
-    double least = 1.0;
-    for (uint32_t index = 0; index < kLanes; ++index) {
-      require(exact.rows[index] == step.rows[index], "rows of no lane: a lane held other rows in a step of its rows");
-      for (uint32_t row = 0; row < step.rows[index]; ++row) {
-        SimilarityAccumulator accumulator;
-        for (uint64_t at = uint64_t{row} * vocabulary; at < uint64_t{row + 1} * vocabulary; ++at)
-          accumulator.add(step.logits[index][at], exact.logits[index][at]);
-        least = std::min(least, accumulator.result().cosine);
-      }
-    }
-    return least;
+  // The steps before a run: every lane's whole tree, from either set of
+  // prompts; they differ in every row they hold.
+  const auto before = [&](uint32_t set) { return decode(1290, kStepRows, 0.0F, true, set); };
+  {
+    const Step first = before(0), second = before(1);
+    for (uint32_t index = 0; index < kLanes; ++index)
+      for (uint32_t row = 0; row < std::min(first.rows[index], second.rows[index]); ++row)
+        require(!std::equal(first.logits[index].begin() + uint64_t{row} * (first.logits[index].size() / first.rows[index]),
+                            first.logits[index].begin() + uint64_t{row + 1} * (first.logits[index].size() / first.rows[index]),
+                            second.logits[index].begin() + uint64_t{row} * (second.logits[index].size() / second.rows[index])),
+                "rows of no lane: the steps before the runs left lane " + std::to_string(index) + "'s row " +
+                    std::to_string(row) + " alike, so the runs would see the same rows of no lane");
+  }
+  // A step run after either step before: the same rows and logits both times.
+  const auto twice = [&](uint64_t firstId, uint32_t rows, float floor, bool greedy, const std::string &label) {
+    static_cast<void>(before(0));
+    const Step first = decode(firstId, rows, floor, greedy);
+    static_cast<void>(before(1));
+    const Step second = decode(firstId, rows, floor, greedy);
+    require(first.rows == second.rows, "rows of no lane: " + label + ": a lane held other rows after other contents "
+                                       "of the rows of no lane");
+    for (uint32_t index = 0; index < kLanes; ++index)
+      require(first.logits[index] == second.logits[index],
+              "rows of no lane: " + label + ": lane " + std::to_string(index) +
+                  "'s logits changed with the contents of the rows of no lane");
+    return first;
   };
-  const Step wide = decode(1200, kStepRows);
+  // Each lane holds in `step` the rows it holds in a step of exactly them.
+  const auto sameRows = [&](const Step &step, const Step &exact, const std::string &label) {
+    require(exact.rows == step.rows, "rows of no lane: " + label + ": a lane held other rows in a step of its rows");
+  };
+  const Step wide = twice(1200, kStepRows, 0.0F, false, "the sampled step");
   const uint32_t held = std::accumulate(wide.rows.begin(), wide.rows.end(), 0U);
-  double least = leastCosine(wide, decode(1210, held));
-  std::cout << "rows_of_no_lane held=" << held << " of " << kStepRows << " least_cosine=" << least << '\n';
-  require(least > bound, "rows of no lane: a lane's logits are at cosine " + std::to_string(least) +
-                             " of a step of exactly the lanes' rows");
+  sameRows(wide, decode(1210, held), "the sampled step");
+  std::cout << "rows_of_no_lane held=" << held << " of " << kStepRows << " logits_equal=1\n";
   const Step full = decode(1220, kStepRows, 0.0F, true);
   const uint32_t filled = std::accumulate(full.rows.begin(), full.rows.end(), 0U);
   std::string floors;
   bool some = false;
   uint64_t firstId = 1230;
   for (const float floor : {0.1F, 0.25F, 0.5F, 0.75F, 1.5F}) {
-    const Step floored = decode(firstId, kStepRows, floor, true);
+    const std::string label = "at a floor of " + std::to_string(floor);
+    const Step floored = twice(firstId, kStepRows, floor, true, label);
     const uint32_t taken = std::accumulate(floored.rows.begin(), floored.rows.end(), 0U);
     for (uint32_t index = 0; index < kLanes; ++index)
       require(floored.rows[index] <= full.rows[index], "rows of no lane: a floor gave a lane rows");
-    least = leastCosine(floored, decode(firstId + 10, taken, 0.0F, true));
-    require(least > bound, "rows of no lane: at a floor of " + std::to_string(floor) + " a lane's logits are at cosine " +
-                               std::to_string(least) + " of a step of exactly the lanes' rows");
+    sameRows(floored, decode(firstId + 10, taken, 0.0F, true), label);
     floors += (floors.empty() ? "" : ",") + std::to_string(taken);
     some = some || (taken > kLanes && taken < filled);
     require(floor < 1.0F || taken == kLanes, "rows of no lane: a floor over every estimate left the lanes " +
                                                  std::to_string(taken) + " rows, not their anchors alone");
     firstId += 20;
   }
-  std::cout << "rows_of_no_lane floors=0.1,0.25,0.5,0.75,1.5 held=" << floors << " of " << filled << '\n';
+  std::cout << "rows_of_no_lane floors=0.1,0.25,0.5,0.75,1.5 held=" << floors << " of " << filled
+            << " logits_equal=1\n";
   require(some, "rows of no lane: no floor of 0.1 to 0.75 left out some of the trees' " + std::to_string(filled) +
                     " rows past their anchors and not all (the lanes held " + floors + ")");
   std::cout << "rows_of_no_lane=PASS\n";
 }
 
 // What requireArgmaxChain compared: the tokens, those the target ranked
-// first, and the largest gap below the target's best of one it did not.
+// first, and each token's gap below the one-row path's best logit.
 struct ArgmaxChain final {
   uint32_t tokens = 0;
   uint32_t first = 0;
-  float gap = 0.0F;
+  std::vector<float> gaps;
 };
 
 // A greedy lane's `tokens`, which it emitted after `request`'s prompt, are
-// the target's argmax chain. The request again, in state lane `stateLane` on
-// `pages`, decodes one row a cycle (a forced step of one row: the target's
-// own decode, which verifies its anchor alone and so takes none of the
-// draft's trees, the step costs' rows and lane caps, the layout's packing or
-// the acceptance's walk), teacher-forced along the tokens by a thinking
-// budget of no tokens whose end they are (an end's rows select it whatever
-// their logits), and each token must be the largest of the raw logits of the
-// row that selected it (RuntimeInstrumentation::captureTargetLogits) among
-// the tokens a lane that ignores end-of-sequence admits, or within
-// kNearTie of it. A step of other rows rounds a row's logits otherwise (a
-// lane's logits alone and in a step of other rows keep cosines of 0.9996 to
-// 0.9999, requireMixedStepMatchesLanesAlone), which may order two nearly
-// equal tokens either way (the largest gaps of such ties this check found,
-// of about 500 tokens a run, were 0.08, 0.11 and 0.24 on Qwen3.6-35B-A3B
-// and 0.0015 on Qwen3.8-27B); a token the target ranks half a logit or more
-// below its best, twice the largest of them, is no rounding but a wrong
-// token, or one computed from a wrong history (a token emitted out of its
-// path's order, or an auto step's K/V committed along another path, lay
-// 10.8 and 11.0 below on the 35B). Forcing the
-// lane's own tokens keeps every later token checked
-// past such a tie. The end closes with a token the lane did not emit, the
-// only one that ends its thinking (ThinkingBudget::unusable), so that the
-// tokens may hold </think> anywhere; the check ends before the close.
+// the target's argmax chain within the rounding of its paths. The request
+// again, in state lane `stateLane` on `pages`, decodes one row a cycle (a
+// forced step of one row: the target's own decode, which verifies its anchor
+// alone and so takes none of the draft's trees, the step costs' rows and lane
+// caps, the layout's packing or the acceptance's walk), teacher-forced along
+// the tokens by a thinking budget of no tokens whose end they are (an end's
+// rows select it whatever their logits); each token's gap below the largest
+// of the raw logits of the row that selected it
+// (RuntimeInstrumentation::captureTargetLogits), among the tokens a lane that
+// ignores end-of-sequence admits, is its chain's (gaps), which the caller
+// bounds (requireNearTies). The end closes with a token the lane did not
+// emit, the only one that ends its thinking (ThinkingBudget::unusable), so
+// that the tokens may hold </think> anywhere; the decode ends before the
+// close.
 ArgmaxChain requireArgmaxChain(model::Runtime &executor, const ops::StopTokens &stops, EngineRequest request,
                                uint32_t stateLane, const std::vector<uint32_t> &pages,
                                std::span<const uint32_t> checked) {
-  constexpr float kNearTie = 0.5F;
   require(!checked.empty(), "a greedy lane emitted no token to check");
   uint32_t close = 0;
   while (std::ranges::find(checked, close) != checked.end() || stops.contains(close)) ++close;
@@ -4636,13 +5039,12 @@ ArgmaxChain requireArgmaxChain(model::Runtime &executor, const ops::StopTokens &
     for (uint32_t id = 0; id < logits.size(); ++id)
       if (!stops.contains(id) && !test::unselectableLogit(logits[id])) best = std::max(best, logits[id]);
     const float gap = best - logits.at(token);
-    require(!stops.contains(token) && !test::unselectableLogit(logits[token]) && gap <= kNearTie,
-            "a greedy lane's token " + std::to_string(at) + " (" + std::to_string(token) + ") lies " +
-                std::to_string(gap) + " below the target's best logit, past a near tie's " +
-                std::to_string(kNearTie));
+    require(!stops.contains(token) && !test::unselectableLogit(logits[token]),
+            "a greedy lane's token " + std::to_string(at) + " (" + std::to_string(token) +
+                ") is a stop token or one no lane may select");
     ++chain.tokens;
     chain.first += gap <= 0.0F;
-    chain.gap = std::max(chain.gap, gap);
+    chain.gaps.push_back(gap);
   };
   model::RuntimeInstrumentation::captureTargetLogits(executor, true);
   model::RuntimeInstrumentation::forceStepRows(executor, 1);
@@ -4661,6 +5063,29 @@ ArgmaxChain requireArgmaxChain(model::Runtime &executor, const ops::StopTokens &
   model::RuntimeInstrumentation::captureTargetLogits(executor, false);
   executor.end(request.id);
   return chain;
+}
+
+// A greedy chain's tokens lie within the rounding of its two paths, the
+// lanes' steps and the one-row decode, below the one-row path's best: each
+// gap at most kBound. Measured (make test-real's first run, 11-17), the
+// chains' largest gaps were 0.0015 on Qwen3.8-27B MLX 4-bit and 0.040 on its
+// UD-Q4_K_M (36 GB M5 Max), 0.20 on Flint mixed-3-4bit and 0.35-0.56 on Flint
+// UD-Q4_K_XL (64 GB M5 Pro), whose gaps reached 0.80 in other runs, and the
+// mixed-3-4bit's 1.50 with bf16 K/V: its routed experts' tiles and its
+// attention carry a step's rounding further than the Qwen models'. Errors lie
+// far past kBound: a step's K/V committed along no accepted path put a token
+// 9.2 below the best on Qwen3.8-27B MLX 4-bit and 29.5 on Flint UD-Q4_K_XL, a
+// lane's tokens emitted out of order 17.5 and 28.8 (10.8 and 11.0 on
+// Qwen3.6-35B-A3B before). It does not guard precision
+// (dev/benchmarks/logit_compare.py does).
+void requireNearTies(const ArgmaxChain &chains) {
+  constexpr float kBound = 2.0F;
+  require(!chains.gaps.empty(), "the greedy chains checked no token");
+  const auto largest = std::ranges::max_element(chains.gaps);
+  require(*largest <= kBound, "a greedy lane's token lies " + std::to_string(*largest) +
+                                  " below the target's best logit, past " + std::to_string(kBound));
+  std::cout << "budgeted_greedy_chain=PASS tokens=" << chains.tokens << " target_first=" << chains.first
+            << " largest_gap=" << *largest << " bound=" << kBound << '\n';
 }
 
 // Under --verify-rows auto a decode cycle's rows follow the step costs the
@@ -4858,15 +5283,13 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
     const Lane &lane = lanes[index];
     EngineRequest direct = lane.request;
     direct.id = 820 + index;
-    const ArgmaxChain chain =
-        requireArgmaxChain(executor, stops, direct, lane.stateLane, lane.pages,
-                           std::span(lane.tokens).first(std::min<size_t>(lane.tokens.size(), 256)));
+    ArgmaxChain chain = requireArgmaxChain(executor, stops, direct, lane.stateLane, lane.pages,
+                                           std::span(lane.tokens).first(std::min<size_t>(lane.tokens.size(), 256)));
     chains.tokens += chain.tokens;
     chains.first += chain.first;
-    chains.gap = std::max(chains.gap, chain.gap);
+    chains.gaps.insert(chains.gaps.end(), chain.gaps.begin(), chain.gaps.end());
   }
-  std::cout << "budgeted_greedy_chain=PASS tokens=" << chains.tokens << " target_first=" << chains.first
-            << " largest_gap=" << chains.gap << '\n';
+  requireNearTies(chains);
 
   // One lane's steps of every row count from 1 to a verify block's, those
   // of 9 to 15 rows at the cap of 16.
@@ -6239,9 +6662,12 @@ int main(int argc, char **argv) {
     for (uint32_t extent = 0; extent < pageCount / extentPages; ++extent)
       require(static_cast<bool>(pages.allocateExtent(extent)),
               "oracle KV extent is unavailable");
-    model::QwenStateStorage states(backend,
-                                    admission,
-                                    model.stateLayout(stateFormat, !exactCachedStates), nullptr);
+    // A disk tier of two states' slots, which a state read back from the
+    // disk restores through (requireCacheHitMatchesCold).
+    const uint64_t stateSlotBytes = model::SlotFile::slotBytesFor(stateLayout.cachedBytes());
+    model::QwenStateStorage states(
+        backend, admission, model.stateLayout(stateFormat, !exactCachedStates),
+        std::make_shared<model::SlotFile>(stateSlotBytes, std::make_shared<model::DiskBudget>(2 * stateSlotBytes)));
     model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
     // The checks compare runs of one schedule bit for bit, which a draft's
     // block a lane (--verify-rows all) keeps comparable on a MoE target: the
@@ -6450,6 +6876,9 @@ int main(int argc, char **argv) {
     requireStatesCapturedInsideCommands(executor, backend, pages, states, aneFfn.get(), samplingSeedTokens);
     requireCapturesOutliveTheirItems(executor, states, samplingSeedTokens);
     requireDecodeCaptureMatchesTheLane(executor, states, samplingSeedTokens);
+    requireCaptureInsideItsPathMatchesExactRows(executor, states, samplingSeedTokens);
+    requireCacheHitMatchesCold(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize,
+                               exactCachedStates);
     requirePrefillGroupMatchesItsChunks(executor, pages, states, samplingSeedTokens,
                                         model.descriptor.hasVision());
     requirePrefillPassesMatchWhole(executor, pages, states, samplingSeedTokens, model.descriptor.hasVision());
@@ -6541,13 +6970,12 @@ int main(int argc, char **argv) {
               << partitionedPending.acceptedDraftTokens << '\n';
     executor.end(50);
     executor.end(51);
-    requireBranchedPathsMatchChains(executor, model.descriptor, samplingSeedTokens, bound);
-    // A lane alone in a MoE target's step routes its rows to expert tiles of
-    // its own rows, which sum in another order: Qwen3.8-Flash-Next's lanes
-    // alone keep a cosine of 0.988 to their rows in the step of 42 rows.
+    requireBranchedPathsMatchChains(executor, pages, model.descriptor, samplingSeedTokens);
+    // A routed target's lanes alone have no bound (requireMixedStepMatchesLanesAlone).
     requireMixedStepMatchesLanesAlone(executor, backend, samplingSeedTokens,
-                                      model.descriptor.capabilities.vocabularySize, sparseMoe ? 0.98 : bound);
-    requireRowsOfNoLane(executor, samplingSeedTokens, model.descriptor.capabilities.vocabularySize, bound);
+                                      model.descriptor.capabilities.vocabularySize,
+                                      sparseMoe ? std::nullopt : std::optional<double>(bound));
+    requireRowsOfNoLane(executor, samplingSeedTokens);
 
     // A reusable composite state contains no final hidden. A fresh
     // consumer must replay at least one complete input token; that replay
@@ -8386,10 +8814,19 @@ int main(int argc, char **argv) {
     require(!aneFfnFault || (aneFfn && aneFfn->retired() && historicalTelemetry.aneFfnReruns == 1),
             "an armed fault did not stop the split once");
     // --verify-rows auto's cycles, on a runtime of their own admitted in the
-    // main one's place, whose decode warmups measure their step costs and
-    // remember them; then a start that recalls them, which measures nothing.
+    // main one's place, whose decode warmups measure every lane count's step
+    // costs and remember those whose replays were steady; then a start that
+    // recalls them, which measures only the lane counts it did not recall.
+    // Which lane counts a start keeps is the runtime's decision by its replays'
+    // spread (StepCosts::kSteadySpread), a timing: the checks hold the
+    // mechanism, each lane count remembered at most once and only where
+    // measured, and print how many were kept. The 64 GB M5 Pro's
+    // Qwen3.6-35B-A3B read four lanes' replays 23.4% apart inside one oracle
+    // run (11-19), where an idle start reads them within 13%.
+    constexpr uint32_t kWidths = model::ExecutionLimits::maximumBatchWidth;
     std::unordered_map<uint32_t, std::string> remembered;
-    uint32_t remembers = 0;
+    // The times each lane count was remembered since the last start.
+    std::unordered_map<uint32_t, uint32_t> remembers;
     context.verifyRows = model::VerifyRows::Auto;
     context.recallStepCosts = [&](uint32_t lanes) -> std::optional<std::string> {
       const auto found = remembered.find(lanes);
@@ -8397,7 +8834,14 @@ int main(int argc, char **argv) {
     };
     context.rememberStepCosts = [&](uint32_t lanes, std::string_view line) {
       remembered[lanes] = line;
-      ++remembers;
+      ++remembers[lanes];
+    };
+    // Whether the runtime holds a cost of every point of a lane count's
+    // steps: measured, or recalled from a line of costs.
+    const auto measured = [&](uint32_t lanes) {
+      const std::vector<model::StepCosts::Point> points = model::RuntimeInstrumentation::stepPoints(*runtime, lanes);
+      return !points.empty() &&
+             std::ranges::all_of(points, [](const model::StepCosts::Point &p) { return p.milliseconds > 0.0; });
     };
     const auto budgeted = [&] {
       runtime.reset();
@@ -8408,45 +8852,67 @@ int main(int argc, char **argv) {
     budgeted();
     const bool streamed = model.expertStore() != nullptr;
     requireBudgetedCyclesAreWellFormed(*runtime, states, model.descriptor, samplingSeedTokens, streamed);
-    requireRowsOfNoLane(*runtime, samplingSeedTokens, model.descriptor.capabilities.vocabularySize, bound);
+    requireRowsOfNoLane(*runtime, samplingSeedTokens);
     // A target whose experts stream measures no table: its cycles' cost line
     // prices its steps (model::CostLine).
     if (streamed) {
-      require(remembers == 0 && model::RuntimeInstrumentation::stepPoints(*runtime, 1).empty(),
+      require(remembered.empty() && model::RuntimeInstrumentation::stepPoints(*runtime, 1).empty(),
               "a target whose experts stream measured a step table");
       std::cout << "streamed_cost_line=PASS\n";
     }
-    require(streamed || (remembers == model::ExecutionLimits::maximumBatchWidth &&
-                         remembered.size() == model::ExecutionLimits::maximumBatchWidth),
-            "the decode warmups did not remember each lane count's measured step costs");
-    // A start that recalls its table measures nothing (none to recall where
-    // its experts stream).
+    for (uint32_t lanes = 1; lanes <= kWidths && !streamed; ++lanes)
+      require(measured(lanes) && remembers[lanes] <= 1,
+              "the decode warmups did not measure " + std::to_string(lanes) +
+                  " lanes' step costs, or remembered them more than once");
+    if (!streamed)
+      std::cout << "remembered_step_costs=" << remembered.size() << " of " << kWidths << '\n';
+    // A start that recalls its table measures only the lane counts it did not
+    // recall (none to recall where its experts stream).
     if (!streamed) {
       const std::unordered_map<uint32_t, std::string> first = remembered;
+      remembers.clear();
       budgeted();
+      // Each lane count's points as the start recalled them.
+      std::array<std::vector<model::StepCosts::Point>, kWidths + 1> recalled;
+      for (uint32_t lanes = 1; lanes <= kWidths; ++lanes) {
+        recalled[lanes] = model::RuntimeInstrumentation::stepPoints(*runtime, lanes);
+        require(measured(lanes) == first.contains(lanes),
+                "a start did not recall exactly the lane counts remembered (" + std::to_string(lanes) + " lanes)");
+      }
       const auto recalledStarted = std::chrono::steady_clock::now();
-      for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+      for (uint32_t width = 1; width <= kWidths; ++width)
         static_cast<void>(runtime->warmupDecodeBatch(width));
       const double recalledSeconds =
           std::chrono::duration<double>(std::chrono::steady_clock::now() - recalledStarted).count();
-      require(remembers == model::ExecutionLimits::maximumBatchWidth && remembered == first,
-              "a start that recalled its step costs measured them again");
+      const auto same = [](const model::StepCosts::Point &a, const model::StepCosts::Point &b) {
+        return a.first == b.first && a.last == b.last && a.cap == b.cap && a.milliseconds == b.milliseconds &&
+               a.rises == b.rises;
+      };
+      for (uint32_t lanes = 1; lanes <= kWidths; ++lanes) {
+        const std::vector<model::StepCosts::Point> points = model::RuntimeInstrumentation::stepPoints(*runtime, lanes);
+        if (first.contains(lanes))
+          require(std::ranges::equal(points, recalled[lanes], same) && !remembers[lanes] &&
+                      remembered.at(lanes) == first.at(lanes),
+                  "a start that recalled " + std::to_string(lanes) + " lanes' step costs measured them again");
+        else
+          require(measured(lanes) && remembers[lanes] <= 1,
+                  "a start that recalled no step costs of " + std::to_string(lanes) +
+                      " lanes did not measure them, or remembered them more than once");
+      }
       // That start's runtime has served no cycle: its cost of history is none.
       requireServedCyclesTeachHistoryCost(*runtime, samplingSeedTokens);
       // A remembered line of a point at no cost, or of points another build's
       // classes made: a start measures the lane count again and keeps its line.
       for (const std::string_view stale : {std::string_view("2:8:-1"), std::string_view("8:8:20 16:16:30")}) {
         remembered[1] = stale;
+        remembers.clear();
         budgeted();
-        for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+        for (uint32_t width = 1; width <= kWidths; ++width)
           static_cast<void>(runtime->warmupDecodeBatch(width));
-        const std::vector<model::StepCosts::Point> points = model::RuntimeInstrumentation::stepPoints(*runtime, 1);
-        require(remembered[1] != stale && !points.empty() &&
-                    std::ranges::all_of(points, [](const model::StepCosts::Point &p) { return p.milliseconds > 0.0; }),
-                "a start that recalled a line of no step's cost did not measure it again");
+        require(measured(1) && remembers[1] <= 1 && (remembered[1] == stale) == !remembers[1],
+                "a start that recalled a line of no step's cost did not measure it again, or remembered "
+                "what it did not keep");
       }
-      require(remembers == model::ExecutionLimits::maximumBatchWidth + 2,
-              "the starts that recalled lines of no step's cost did not remember what they measured");
       std::cout << "recalled_step_costs=PASS decode_warmups_seconds=" << recalledSeconds << '\n';
     }
     std::cout << "model_runtime_oracle_test: PASS\n";
