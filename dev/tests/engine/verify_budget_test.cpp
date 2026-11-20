@@ -20,6 +20,7 @@
 // is a draft's block a lane; a table's line recalls its costs, and a line of
 // another table's points none.
 #include "TestChecks.hpp"
+#include "model/Model.hpp"
 #include "model/StepCosts.hpp"
 #include "model/VerifyBudget.hpp"
 
@@ -291,8 +292,8 @@ void invalidInputs() {
   VerifyBudget budget;
   const VerifyBudget::Lane lane;
   rejects([&] { budget.observe({}); }, "invalid verify budget cycle", "an empty cycle was observed");
-  const std::vector<VerifyBudget::Lane> five(5, lane);
-  rejects([&] { budget.observe(five); }, "invalid verify budget cycle", "five lanes were observed");
+  const std::vector<VerifyBudget::Lane> tooMany(VerifyBudget::kLanes + 1, lane);
+  rejects([&] { budget.observe(tooMany); }, "invalid verify budget cycle", "more lanes than a step holds were observed");
   for (const VerifyBudget::Label &label : {VerifyBudget::Label{kPositions, 0.0F, true}, {0, NAN, true}}) {
     VerifyBudget::Lane bad = lane;
     bad.labels = {label};
@@ -484,7 +485,7 @@ void choiceOverTheTable() {
       return cost(laneCount, p.last, p.cap);
     });
     const StepCosts::Choice got = costs.choose(spansOf(curves));
-    const uint32_t most = std::min(lanes * kBlock, mostRows), narrow = lanes * kNarrow;
+    const uint32_t most = std::min(lanes * kBlock, mostRows), narrow = std::min(lanes * kNarrow, most);
     std::vector<uint32_t> starts(std::begin(kClasses), std::end(kClasses));
     starts.push_back(narrow + 1);
     std::ranges::sort(starts);
@@ -847,6 +848,7 @@ struct LineSamples final {
 // rows (ExecutionPlans::decodeRowClasses on an Apple10 GPU): steps of 1, 2,
 // 3, 4 to 8, 9 to 15, 16, 17 to 24 and 25 to 32 rows.
 constexpr uint32_t kStreamedClasses[] = {1, 2, 3, 4, 9, 16, 17, 25};
+constexpr uint32_t kStreamedRound = 32;
 
 // 1.6.2's cost line, as a streamed-expert target's cycles fit it: a lane
 // count's decayed sums of the rows its cycles' lanes verified and of their
@@ -867,13 +869,14 @@ void costLineFitsTheSamples() {
               std::fabs(CostLine::seed(4, 12) - 0.57) < 1e-12,
           "the cost line's seed is not 1.6.2's");
   for (uint32_t lanes = 1; lanes <= CostLine::kLanes; ++lanes) {
-    CostLine costs(kStreamedClasses);
+    CostLine costs(kStreamedClasses, kStreamedRound);
     // The seed's floor: 0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15 and 0.6 / 2.8 at
-    // one to four lanes.
+    // one to four lanes, and four lanes' 0.6 / 2.8 past them (their seed).
     const double seedSlope = (1.0 - CostLine::seed(lanes, lanes)) / (7.0 * lanes);
     const double seedFloor = seedSlope * lanes / CostLine::seed(lanes, lanes);
     require(!costs.line(lanes, false) && std::fabs(costs.floor(lanes, false) - seedFloor) <= 1e-12 &&
-                std::fabs(seedFloor - std::array{0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15, 0.6 / 2.8}[lanes - 1]) <= 1e-12,
+                std::fabs(seedFloor - std::array{0.4 / 4.2, 0.5 / 3.5, 0.55 / 3.15, 0.6 / 2.8}[std::min(lanes, 4U) - 1]) <=
+                    1e-12,
             std::to_string(lanes) + " lanes: before a sample the cost line had a fit, or its floor is not the seed's");
     std::mt19937_64 random(0xc057 + lanes);
     std::uniform_int_distribution<uint32_t> rowsOf(lanes, lanes * CostLine::kBlockRows);
@@ -902,7 +905,7 @@ void costLineFitsTheSamples() {
     // line's slope puts its intercept below nothing, and the floor is the
     // cycles' tokens a row, 1, which a row the target is certain to accept
     // passes.
-    CostLine cold(kStreamedClasses);
+    CostLine cold(kStreamedClasses, kStreamedRound);
     LineSamples start;
     for (uint32_t cycle = 0; cycle < 6; ++cycle) {
       const uint32_t rows = cycle ? lanes : lanes * CostLine::kBlockRows;
@@ -927,7 +930,7 @@ void costLineFitsTheSamples() {
 // passes, one under it does not), no more of a lane's than a draft's block
 // nor than it holds, or a draft's block of rows in all where they are fewer
 // (one lane's step is a draft's block whatever its chances), and the step no
-// more than a draft's block a lane. The
+// more than a draft's block a lane nor than the store's round of 32 rows. The
 // choice weighs no expected tokens and no cost. A cycle counts at most twice
 // the larger of its line's price and the mean: a stall moves the line as a
 // cycle of that time does.
@@ -936,7 +939,7 @@ void costLineChoosesItsSteps() {
   // The last rows of the class of a step of `rows` rows.
   const auto classEnd = [](uint32_t rows) {
     const auto next = std::upper_bound(std::begin(kStreamedClasses), std::end(kStreamedClasses), rows);
-    return next == std::end(kStreamedClasses) ? CostLine::kLanes * kNarrow : *next - 1;
+    return next == std::end(kStreamedClasses) ? kStreamedRound : *next - 1;
   };
   // The step of `chances` at `floor`, for lanes holding `holds`.
   const auto stepOf = [&](const std::vector<std::vector<float>> &chances, const std::vector<uint32_t> &holds,
@@ -962,13 +965,15 @@ void costLineChoosesItsSteps() {
       return made;
     };
     const splash::ops::StepRows block = StepCosts::block(holds);
+    // The most rows a step takes: a draft's block a lane within the round.
+    const uint32_t most = std::min(block.rows, kStreamedRound);
     const std::vector<std::vector<float>> none(lanes);
-    CostLine costs(kStreamedClasses);
+    CostLine costs(kStreamedClasses, kStreamedRound);
     // Before a sample, at the seed's floor: certain chances take a draft's
     // block a lane, and chances of 0.05 or none a draft's block of rows.
     const auto seedFloor = static_cast<float>(costs.floor(lanes, false));
     for (const auto &[chances, rows] :
-         {std::pair{curves(1.0F), block.rows}, std::pair{curves(0.05F), kNarrow}, std::pair{none, kNarrow}}) {
+         {std::pair{curves(1.0F), most}, std::pair{curves(0.05F), kNarrow}, std::pair{none, kNarrow}}) {
       const StepCosts::Choice first = costs.choose(spansOf(chances), holds, false);
       require(first.step.lanes == lanes && first.step.rows == rows && first.step.laneCap == kNarrow &&
                   first.floor == seedFloor && seedFloor > 0.05F && first.expected == 0.0 && first.milliseconds == 0.0,
@@ -1013,8 +1018,8 @@ void costLineChoosesItsSteps() {
     // Certain chances past a verify block's rows: a draft's block a lane, no
     // more than each lane holds.
     const std::vector<std::vector<float>> wide(lanes, std::vector<float>(StepCosts::kWideCap - 1, 1.0F));
-    require(costs.choose(spansOf(wide), holds, false).step.rows == block.rows,
-            label + "certain chances did not take a draft's block a lane, no more than each lane holds");
+    require(costs.choose(spansOf(wide), holds, false).step.rows == most,
+            label + "certain chances did not take a draft's block a lane, no more than each lane holds nor the round");
     // Every step the chances fill, drawn at random among lanes that hold 1
     // to a verify block's rows.
     std::mt19937_64 random(0xf100 + lanes);
@@ -1042,7 +1047,7 @@ void costLineChoosesItsSteps() {
     // their own.
     cycleOf(lanes);
     const StepCosts::Choice explored = costs.choose(spansOf(none), holds, false);
-    require(explored.step.rows == block.rows && explored.floor == 0.0F,
+    require(explored.step.rows == most && explored.floor == 0.0F,
             label + "the 32nd cycle did not explore a draft's block a lane at no floor");
     for (uint32_t cycle = 0; cycle < 5; ++cycle)
       costs.observe(lanes, true, lanes + cycle, lanes, 30.0);
@@ -1107,16 +1112,21 @@ void invalidSteps() {
   // Four lanes of four rows hold their anchors alone.
   rejects([&] { StepCosts costs(kClasses, StepCosts::kLanes, false); }, "hold nothing past its lanes' anchors",
           "a table of the anchors alone was made");
-  // The startup runway's 64 pages from page 5 hold four lanes of 26 points,
-  // not of 27; a class every row makes 61 at four lanes, while a MoE
-  // target's table of kClasses fits.
-  require(5 + 4 * StepCosts::lanePages(26) <= 64 && 5 + 4 * StepCosts::lanePages(27) > 64,
-          "the runway holds other lanes than a measurement lays");
+  // The startup runway of a runtime's lanes holds each lane count's
+  // measurement from page 5 (ExecutionLimits::runwayPages): four lanes' 64
+  // pages hold four lanes of 14 points, a MoE target's most today, eight
+  // lanes' 128 eight lanes of 14 at 128 rows a step; a table of a class every
+  // row makes runs past eight lanes' and is refused.
+  using splash::model::ExecutionLimits;
+  static_assert(ExecutionLimits::runwayPages(32, 1) == 64 && ExecutionLimits::runwayPages(32, 4) == 64 &&
+                ExecutionLimits::runwayPages(32, 8) == 128 && ExecutionLimits::runwayPages(128, 5) == 128);
   std::vector<uint32_t> everyRow;
-  for (uint32_t row = 1; row <= 64; ++row) everyRow.push_back(row);
-  rejects([&] { StepCosts(everyRow, 64, false).requireRunway(5, 64); }, "more pages than the startup runway",
+  for (uint32_t row = 1; row <= 128; ++row) everyRow.push_back(row);
+  const StepCosts every(everyRow, 128, false), moe(kClasses, 128, true), four(kClasses, 64, true);
+  rejects([&] { every.requireRunway(5, ExecutionLimits::runwayPages(128, 8), 8); }, "startup runway",
           "a table whose measurement runs past the startup runway was taken");
-  StepCosts(kClasses, 64, true).requireRunway(5, 64);
+  moe.requireRunway(5, ExecutionLimits::runwayPages(32, 8), 8);
+  four.requireRunway(5, ExecutionLimits::runwayPages(32, 4), 4);
   StepCosts costs(kClasses, 64, false);
   const size_t points = costs.points(2).size();
   for (const std::vector<std::vector<double>> &replays :
@@ -1125,7 +1135,7 @@ void invalidSteps() {
         {std::vector<double>(points, NAN)}})
     rejects([&] { costs.measure(2, replays); }, "invalid step replays", "impossible replays were measured");
   require(!costs.measured(2), "refused replays measured a lane count");
-  for (const uint32_t lanes : {0U, 5U}) {
+  for (const uint32_t lanes : {0U, StepCosts::kLanes + 1}) {
     rejects([&] { static_cast<void>(costs.points(lanes)); }, "invalid step lane count",
             "points of an impossible lane count were given");
     rejects([&] { costs.measure(lanes, std::vector<std::vector<double>>{std::vector<double>(points, 1.0)}); },
@@ -1141,8 +1151,8 @@ void invalidSteps() {
   // lane counts outside a batch.
   for (const std::vector<uint32_t> &classes :
        {std::vector<uint32_t>{}, std::vector<uint32_t>{3, 9}, std::vector<uint32_t>{1, 9, 3}})
-    rejects([&] { CostLine line(classes); }, "invalid step classes", "impossible classes made a cost line");
-  CostLine line(kStreamedClasses);
+    rejects([&] { CostLine line(classes, kStreamedRound); }, "invalid step classes", "impossible classes made a cost line");
+  CostLine line(kStreamedClasses, kStreamedRound);
   for (const auto &[rows, tokens, milliseconds] :
        {std::tuple{1U, 2U, 10.0}, std::tuple{17U, 2U, 10.0}, std::tuple{4U, 1U, 10.0}, std::tuple{4U, 5U, 10.0},
         std::tuple{4U, 2U, 0.0}, std::tuple{4U, 2U, double(NAN)}})
@@ -1152,7 +1162,7 @@ void invalidSteps() {
   const std::vector<std::vector<float>> two(2);
   rejects([&] { static_cast<void>(line.choose(spansOf(two), std::vector<uint32_t>{8}, false)); },
           "a step's lanes hold no rows of their own", "lanes that hold no rows of their own took a step");
-  for (const uint32_t lanes : {0U, 5U}) {
+  for (const uint32_t lanes : {0U, StepCosts::kLanes + 1}) {
     rejects([&] { static_cast<void>(line.floor(lanes, false)); }, "invalid cost line lane count",
             "an impossible lane count had a floor");
     rejects([&] { line.observe(lanes, false, 4, 4, 10.0); }, "invalid cost line lane count",

@@ -231,7 +231,9 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # automatic budget's unwired tenth, the start ending its warmups and a state at
 # a prompt's head.
 # 30,673: +1 for forgetting a lane count's remembered step costs.
-ENGINE_LINE_BUDGET = 30_673
+# 30,685: +12 for a runtime's lanes in its memory plan, warmups, scheduler
+# and /status.
+ENGINE_LINE_BUDGET = 30_685
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(

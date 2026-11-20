@@ -14,10 +14,14 @@
 // The int8 prefill tile's activation group is the MLX weight group of 64
 // inputs (GGUF_PREFILL_INT8_GROUP).
 #define GGUF_TILE_COLUMNS 64u
-// Decode tile of the staged kernels, which runs plans of up to 64 rows, a
-// decode step's or a prompt chunk's alike: two simdgroups, each staging its
-// own GGUF_STAGED_COLUMNS columns GGUF_STAGED_STEP inputs at a time over 8,
-// 16, 32, 48 or 64 rows.
+// Decode tile of the staged kernels, which runs plans of up to
+// GGUF_STAGED_ROWS rows, a decode step's or a prompt chunk's alike: two
+// simdgroups, each staging its own GGUF_STAGED_COLUMNS columns
+// GGUF_STAGED_STEP inputs at a time over 8, 16, 32, 48 or 64 rows
+// (GGUF_ROW_GROUP_ROWS); a plan of more rows runs two row groups of the tile of
+// half its rows in one dispatch, grid.z (ops::stagedRowGroups).
+#define GGUF_ROW_GROUP_ROWS 64u
+#define GGUF_STAGED_ROWS (2u * GGUF_ROW_GROUP_ROWS)
 #define GGUF_STAGED_COLUMNS 32u
 #define GGUF_STAGED_STEP 32u
 #define GGUF_STAGED_THREADS (GGUF_TILE_COLUMNS / GGUF_STAGED_COLUMNS * 32u)

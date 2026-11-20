@@ -564,8 +564,8 @@ off` loads every expert, as a SIZE that holds them all does.
   experts go first), and reads them from their
   files into a staging of a decode cycle's experts on the engine's SSD
   readers, and a repack kernel writes them into their slots before the expert
-  passes over them run. A load of at most 32 rows (a decode step's of so
-  few, four lanes of 8, or a prompt chunk's) is one such round; a longer
+  passes over them run. A load of at most 32 rows (a decode step's, which
+  never takes more at any lanes, or a prompt chunk's) is one such round; a longer
   command's loads take as many rounds as its rows may route experts,
   each staging half of the staging while the other half is read ahead. The
   kernels find every routed expert through a table of its slot and the

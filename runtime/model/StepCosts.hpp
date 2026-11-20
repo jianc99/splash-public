@@ -138,9 +138,9 @@ public:
   // (Runtime::measureDecodeSteps), or of a level check's kReplays steps:
   // its prompt's token, a verify block a point and one more.
   static uint32_t lanePages(size_t points);
-  // Throws where a lane count's measurement, its lanes laid from page
-  // `first`, runs past the `runway` pages it is measured on.
-  void requireRunway(uint32_t first, uint32_t runway) const;
+  // Throws where the measurement of a lane count up to `lanes`, its lanes laid
+  // from page `first`, runs past the `runway` pages it is measured on.
+  void requireRunway(uint32_t first, uint32_t runway, uint32_t lanes) const;
   // A lane count's points' costs from its steps' replays: `replays[r][p]`
   // the wall milliseconds of replay r of point p's step.
   void measure(uint32_t lanes, std::span<const std::vector<double>> replays);
@@ -306,8 +306,11 @@ public:
   static constexpr double kPriorCycles = 5.0;
 
   // Over `classes`, the fewest rows of each class of a decode step's kernels
-  // (ops::ExecutionPlans::decodeRowClasses).
-  explicit CostLine(std::span<const uint32_t> classes);
+  // (ops::ExecutionPlans::decodeRowClasses), up to `mostRows`, the store's
+  // round (ExpertStore::cycleRows), which bounds every step: at eight lanes of
+  // Qwen3.6-35B-A3B on a 10-core M4, a step past it, which loads its experts
+  // in two rounds, took 11.05 ms a token where steps within it took 8.15.
+  CostLine(std::span<const uint32_t> classes, uint32_t mostRows);
 
   // The shape of a cycle's cost by its rows (a cycle of every row costs 1),
   // whose slope the line's shrinks toward.
@@ -328,7 +331,8 @@ public:
   // floor: the last rows of the class that holds the lanes' anchors and
   // their chances the floor passes, or a draft's block of rows where they
   // are fewer, at most a draft's block a lane; without a floor, a draft's
-  // block a lane. It weighs no expected tokens and no cost.
+  // block a lane; and never more than the store's round. It weighs no
+  // expected tokens and no cost.
   [[nodiscard]] StepCosts::Choice choose(std::span<const std::span<const float>> chances,
                                          std::span<const uint32_t> holds, bool constrained) const;
   // A cycle of `lanes` lanes, constrained or not, that committed, whose lanes
@@ -356,6 +360,7 @@ private:
   [[nodiscard]] const Cost &table(uint32_t lanes, bool constrained) const;
 
   std::vector<uint32_t> classes_;
+  uint32_t mostRows_;
   std::array<std::array<Cost, kLanes>, 2> tables_{};
   std::array<std::array<uint64_t, kLanes>, 2> cycles_{};
 };
