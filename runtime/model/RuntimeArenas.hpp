@@ -72,6 +72,9 @@ struct RuntimeGeometry final {
   bool streamedExperts = false;
   // The step scratch the target keeps itself beside the arenas.
   QwenTargetScratchBytes targetScratch{};
+  // The target's layout, whose family sizes what its own operators take
+  // (qwenTargetAttentionWorkspace).
+  TargetLayout layout{};
 
   // The geometry of `model` as it loaded, or with `parts` streaming
   // whatever streams of it as it loaded (plannedRuntimeMemory). Only a
@@ -143,6 +146,7 @@ struct RuntimeGeometry final {
       throw std::invalid_argument("invalid model runtime geometry");
     }
     // Sized from the geometry, once it is valid.
+    result.layout = descriptor.target;
     result.targetScratch = std::visit(
         [&](const auto &layout) {
           return qwenTargetScratchBytes(layout, result.target, result.prefillChunks, parts.tableRowBytes);
