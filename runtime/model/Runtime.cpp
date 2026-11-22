@@ -4861,6 +4861,22 @@ std::span<const uint16_t> RuntimeInstrumentation::lastCapturedRows(const Runtime
   return {contents<uint16_t>(captured, "captured target rows"), captured.sizeBytes() / sizeof(uint16_t)};
 }
 
+// The draft's layout of no layers names the layers its target captures
+// (DFlashDraftLayout::targetLayerIds), which the runtime's geometry takes
+// (RuntimeGeometry::from); nothing else reads it without a draft. The
+// model's descriptor states the same layout, as every model's does
+// (ModelFactory.cpp requireCompatibleModel).
+void RuntimeInstrumentation::captureLayers(LoadedModel &model, std::span<const uint32_t> layers) {
+  DFlashDraftLayout &draft = model.draft.layout;
+  if (draft.present() || layers.size() > draft.targetLayers.size() ||
+      std::ranges::adjacent_find(layers, std::ranges::greater_equal{}) != layers.end())
+    throw std::invalid_argument("captured layers are a model's without a draft, ascending, at most a draft's");
+  std::ranges::fill(draft.targetLayers, 0u);
+  std::ranges::copy(layers, draft.targetLayers.begin());
+  draft.targetLayerCount = static_cast<uint32_t>(layers.size());
+  model.descriptor.draft = draft;
+}
+
 uint32_t RuntimeInstrumentation::lastVerifyRows(const Runtime &runtime, uint32_t lane) {
   return runtime.impl_->laneRows(lane).rows;
 }

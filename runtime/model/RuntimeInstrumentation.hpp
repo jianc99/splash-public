@@ -34,6 +34,14 @@ public:
   // values each, in their order), the captured rows in the order the draft's
   // context plan captured them (a cold prompt's first command: its rows).
   [[nodiscard]] static std::span<const uint16_t> lastCapturedRows(const Runtime &runtime, uint32_t chunk);
+  // Makes `model`, which has no draft, capture the output rows of the
+  // target layers `layers` (ascending, at most a draft's
+  // ExecutionLimits::maximumDraftTargetLayers) as a draft reading them would
+  // have them captured, into the rows lastCapturedRows returns: set on the
+  // loaded model (its draft's layout and its descriptor's alike) before a
+  // Runtime of it is made, again for another set. For checking a target's
+  // layers one by one against a reference (teacher-logits --capture-layers).
+  static void captureLayers(LoadedModel &model, std::span<const uint32_t> layers);
   // The rows batch lane `lane` of the last decode step verified, its rows of
   // the step as its selector laid them out (ops::DraftSelector::
   // addVerifyRows), until the next command that selects.

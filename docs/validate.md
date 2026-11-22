@@ -336,12 +336,15 @@ token, in `OUTPUT-END.f32`, and prints how well they predict the true ids. It
 also takes `--kv-format`, `--state-format`, `--activations`,
 `--expert-memory` and `--ple-memory`, and, with `--captures yes`, writes the
 output rows of the target layers the model's draft reads (its
-`target_layer_ids`) at the positions a window's prefill computed, in one
-command, to `OUTPUT-END.captures.f32` (fp32, a row per position of each
-layer's hidden values in the draft's layer order), which a reference's
-residuals after those layers compare with (`dev/tools/flint_reference.py`
-writes Flint's, `residuals.npy`): a draft of the layers to compare, such as a
-test draft whose `fc` reads them, makes them its captures.
+`target_layer_ids`) at the positions of the prefill's last command that a
+cold prompt's draft context holds, which it prints, to
+`OUTPUT-END.captures.f32` (fp32, a row per position of each layer's hidden
+values in the draft's layer order), which a reference's residuals after those
+layers compare with (`dev/tools/flint_reference.py` writes Flint's,
+`residuals.npy`): a draft of the layers to compare, such as a test draft whose
+`fc` reads them, makes them its captures. For a model without a draft,
+`--capture-layers LAYER,LAYER...` names the layers to capture, at most as many
+as a draft reads and ascending, and writes them the same way.
 
 `benchmark-backend` lists the contexts the memory plan cannot hold in its
 report. Its cache checks reuse each context's cached prefix, so they need that

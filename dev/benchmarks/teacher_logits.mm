@@ -4,6 +4,7 @@
 //   teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS [--window END:ROWS...]
 //                  [--kv-format int8|bf16] [--state-format fp32|bf16] [--activations auto|bf16]
 //                  [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]
+//                  [--capture-layers LAYER,LAYER...]
 //
 // TOKENS holds little-endian uint32 token ids, read as they are: no BOS, no
 // chat template. For each window a cold request prefills ids [0, END - ROWS)
@@ -16,12 +17,16 @@
 // logits for positions END - ROWS - 1 .. END - 1, position p's predicting
 // id p + 1: the row of the prefill's final position, then the verify rows,
 // which RuntimeInstrumentation::lastLogits reads after each command. With
-// --captures yes, OUTPUT-END.captures.f32 receives, of a window whose prefill
-// is one command, the output rows of the target layers the model's draft
-// reads (its target_layer_ids) at positions 0 .. END - ROWS - 1, as the draft
-// captures them (RuntimeInstrumentation::lastCapturedRows), in fp32: a row
-// per position of each layer's hidden values in the draft's layer order,
-// which a reference's residuals after those layers compare with.
+// --captures yes, OUTPUT-END.captures.f32 receives the output rows of the
+// target layers the model's draft reads (its target_layer_ids) at the
+// positions of the prefill's last command that a cold prompt's draft context
+// captures (its last ExecutionLimits::draftContextTokens), which it prints, as
+// the draft captures them (RuntimeInstrumentation::lastCapturedRows), in fp32:
+// a row per position of each layer's hidden values in the draft's layer
+// order, which a reference's residuals after those layers compare with.
+// --capture-layers names those layers for a model without a draft (at most a
+// draft's, ascending; RuntimeInstrumentation::captureLayers) and writes them
+// as --captures yes does: a target's layers checked one by one.
 
 #include "engine/MemoryGovernor.hpp"
 #include "engine/Types.hpp"
@@ -85,6 +90,23 @@ Window parseWindow(std::string_view text) {
     throw std::invalid_argument("a window's ROWS must be a multiple of " + std::to_string(kRows) +
                                 " below its END");
   return window;
+}
+
+// LAYER,LAYER...: target layers from 0, as --capture-layers names them.
+std::vector<uint32_t> parseLayers(std::string_view text) {
+  std::vector<uint32_t> layers;
+  for (size_t begin = 0; begin <= text.size();) {
+    const size_t end = std::min(text.find(',', begin), text.size());
+    uint32_t layer = 0;
+    const auto result = std::from_chars(text.data() + begin, text.data() + end, layer);
+    if (begin == end)
+      throw std::invalid_argument("--capture-layers takes LAYER,LAYER... without an empty entry (a trailing comma)");
+    if (result.ec != std::errc{} || result.ptr != text.data() + end)
+      throw std::invalid_argument("--capture-layers takes LAYER,LAYER...");
+    layers.push_back(layer);
+    begin = end + 1;
+  }
+  return layers;
 }
 
 std::vector<uint32_t> readTokens(const std::filesystem::path &path) {
@@ -160,8 +182,10 @@ void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Windo
   WindowLogits logits(window.rows + 1, vocabulary);
   const auto started = std::chrono::steady_clock::now();
   const uint32_t chunk = executor.commandLimits().commandRows;
+  uint32_t lastCommand = 0;
   for (uint32_t offset = 0; offset < start;) {
     const uint32_t count = std::min(chunk, start - offset);
+    lastCommand = offset;
     BatchPlan plan{.kind = WorkKind::Prefill, .items = {{id, count, offset}}, .decodeStage = DecodeStage::Regular};
     ModelBatchItem item{id, offset, count, pages, 1};
     item.inputTokens = prompt.subspan(offset, count);
@@ -173,15 +197,18 @@ void runWindow(model::Runtime &executor, std::span<const uint32_t> tokens, Windo
       require(results[0].firstToken == forced[0], "the prefill did not select the first forced id");
   }
   if (captureWidth) {
-    require(start <= chunk, "--captures takes a window whose prefill is one command");
+    const uint32_t first =
+        std::max(lastCommand, start - std::min(start, model::ExecutionLimits::draftContextTokens));
     const std::span<const uint16_t> captured = model::RuntimeInstrumentation::lastCapturedRows(executor, 0);
-    require(captured.size() >= uint64_t{start} * captureWidth, "the prefill captured fewer rows than its prompt");
-    std::vector<float> rows(uint64_t{start} * captureWidth);
+    require(captured.size() >= uint64_t{start - first} * captureWidth,
+            "the prefill captured fewer rows than its last command's");
+    std::vector<float> rows(uint64_t{start - first} * captureWidth);
     std::ranges::transform(captured.first(rows.size()), rows.begin(), model::widenBfloat16);
     const std::string path = output + "-" + std::to_string(window.end) + ".captures.f32";
     std::ofstream file(path, std::ios::binary);
     file.write(reinterpret_cast<const char *>(rows.data()), static_cast<std::streamsize>(rows.size() * sizeof(float)));
     require(static_cast<bool>(file), "cannot write " + path);
+    std::printf("captures of positions %u .. %u -> %s\n", first, start - 1, path.c_str());
   }
   logits.put(0, model::RuntimeInstrumentation::lastLogits(executor, 0).first(vocabulary), forced[0]);
   const double prefillSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
@@ -224,11 +251,13 @@ int main(int argc, char **argv) {
       if (argc < 5) {
         std::cerr << "usage: teacher-logits METALLIB MODEL_ROOT TOKENS OUTPUT --window END:ROWS "
                      "[--window END:ROWS...] [--kv-format int8|bf16] [--state-format fp32|bf16] "
-                     "[--activations auto|bf16] [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes]\n";
+                     "[--activations auto|bf16] [--expert-memory SIZE] [--ple-memory SIZE] [--captures yes] "
+                     "[--capture-layers LAYER,LAYER...]\n";
         return 2;
       }
       std::vector<Window> windows;
       bool captures = false;
+      std::vector<uint32_t> captureLayers;
       ops::Int8Activations int8Activations = ops::Int8Activations::On;
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -243,6 +272,9 @@ int main(int argc, char **argv) {
         else if (option == "--captures") {
           if (value != "yes")
             throw std::invalid_argument("--captures takes yes");
+          captures = true;
+        } else if (option == "--capture-layers") {
+          captureLayers = parseLayers(value);
           captures = true;
         }
         else if (option == "--kv-format") {
@@ -274,9 +306,14 @@ int main(int argc, char **argv) {
       // Streamed weights read on a pool of SSD readers, as the engine's do.
       loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
       model::LoadedModel model = model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
+      if (!captureLayers.empty()) model::RuntimeInstrumentation::captureLayers(model, captureLayers);
       ops::ExecutionPlans operators(backend.capabilities(), int8Activations);
       const uint32_t vocabulary =
           std::visit([](const auto &layout) { return layout.vocabularySize; }, model.descriptor.target);
+      // A captured row: each captured layer's hidden values.
+      const uint32_t captureWidth =
+          model.draft.layout.targetLayerCount *
+          std::visit([](const auto &layout) { return layout.hiddenSize; }, model.descriptor.target);
       for (const uint32_t token : tokens)
         require(token < vocabulary, "TOKENS holds an id outside the vocabulary");
 
@@ -308,7 +345,7 @@ int main(int argc, char **argv) {
                   tokens.size());
       for (size_t index = 0; index < windows.size(); ++index)
         runWindow(executor, tokens, windows[index], index + 1, pageTable, vocabulary, argv[4],
-                  captures ? model.draft.layout.targetHiddenSize() : 0);
+                  captures ? captureWidth : 0);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "teacher-logits: " << error.what() << '\n';
