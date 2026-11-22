@@ -57,6 +57,14 @@ void RoPE::addTables(
     targetCosine = draftCosine;
     targetSine = draftSine;
   }
+  // Without draft rows (a model without a draft) it reads no draft buffer:
+  // the target's stand in their places.
+  if (!rows.draft_rows) {
+    draftPositions = targetPositions;
+    draftInverseFrequencies = targetInverseFrequencies;
+    draftCosine = targetCosine;
+    draftSine = targetSine;
+  }
   const uint64_t elements =
       std::max<uint64_t>(uint64_t{rows.target_rows} * targetPairs,
                          uint64_t{rows.draft_rows} * SPLASH_DRAFT_ROPE_PAIRS);

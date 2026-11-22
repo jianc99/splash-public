@@ -5541,6 +5541,136 @@ void requireNearTies(const ArgmaxChain &chains) {
             << " largest_gap=" << *largest << " bound=" << kNearTieGap << '\n';
 }
 
+// A model without a draft (--no-draft): its lanes keep no draft rings and no
+// context window, and a cycle verifies its anchor and its host chain alone,
+// every proposal it counts a chain's: two greedy lanes, one whose prompt
+// repeats a run of the seed, which its lookup chains follow, and one of the
+// seed in order, decode together; some cycle verifies a lookup chain, and
+// the greedy lanes' tokens are the target's argmax chain within the rounding
+// of its paths (requireArgmaxChain). On a runtime whose step costs are
+// measured (`measured`, --verify-rows auto), the start's decode warmups have
+// measured every lane count's costs, and a forced step of each row count
+// from one to a verify block's is verified whole: a lane without a draft
+// fills it with its anchor's successors (Runtime's proposeChain), as a
+// draft's trees fill the steps the start measures.
+void requireCyclesWithoutADraft(model::Runtime &executor, const model::QwenStateStorage &states,
+                                const model::ModelDescriptor &descriptor, std::span<const uint32_t> seed,
+                                bool measured) {
+  constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
+  require(!descriptor.draft.present(), "--no-draft's model has a draft");
+  struct Lane final {
+    EngineRequest request;
+    uint32_t stateLane = 0;
+    std::vector<uint32_t> pages;
+    std::vector<uint32_t> tokens;
+    bool finished = false;
+  };
+  constexpr uint32_t kPrompt = 96, kBudget = 64;
+  const uint32_t lanePages = (kPrompt + kBudget + kRows + kv::kPageTokens - 1) / kv::kPageTokens;
+  std::vector<Lane> lanes(2);
+  for (uint32_t index = 0; index < lanes.size(); ++index) {
+    Lane &lane = lanes[index];
+    std::vector<uint32_t> prompt(kPrompt);
+    for (uint32_t token = 0; token < prompt.size(); ++token)
+      prompt[token] = seed[token % (index ? seed.size() : 24)];
+    lane.request = makeRequest(860 + index, std::move(prompt), kBudget);
+    lane.request.flags = RequestIgnoreEndOfSequence;
+    lane.stateLane = index;
+    lane.pages = pageRange(index * lanePages, lanePages);
+    beginCold(executor, lane.request, lane.stateLane);
+    require(states.draft(lane.stateLane).empty() && !states.window(lane.stateLane),
+            "a lane of a model without a draft holds draft rings or a context window");
+    require(prefillChunk(executor, lane.request.id, 0, lane.request.prompt, lane.pages).outputTokens.empty(),
+            "a lane without a draft emitted a token at its prompt's end");
+  }
+  uint32_t chained = 0, alone = 0;
+  for (bool active = true; active;) {
+    BatchPlan plan{.kind = WorkKind::Decode, .decodeStage = DecodeStage::Regular};
+    std::vector<ModelBatchItem> items;
+    std::vector<Lane *> decoding;
+    for (Lane &lane : lanes) {
+      if (lane.finished || lane.tokens.size() == lane.request.maxNewTokens)
+        continue;
+      plan.items.push_back({lane.request.id, 0});
+      items.push_back(withRevision({.requestId = lane.request.id,
+                                    .logicalPosition = lane.request.prompt.size() + lane.tokens.size(),
+                                    .pageTable = lane.pages}));
+      decoding.push_back(&lane);
+    }
+    active = !decoding.empty();
+    if (!active)
+      break;
+    const std::vector<ModelStepResult> results = executor.decode(plan, items);
+    require(results.size() == decoding.size(), "a cycle without a draft lost a lane");
+    for (uint32_t index = 0; index < decoding.size(); ++index) {
+      Lane &lane = *decoding[index];
+      const ModelStepResult &result = results[index];
+      const auto remaining = static_cast<uint32_t>(lane.request.maxNewTokens - lane.tokens.size());
+      const uint32_t rows = model::RuntimeInstrumentation::lastVerifyRows(executor, index);
+      const size_t retained = result.outputTokens.size() - result.outputTokensWithoutKv;
+      require(result.failure.empty() && rows >= 1 && rows <= kRows &&
+                  result.draftedTokens == std::min(rows, remaining) - 1 &&
+                  result.acceptedDraftTokens <= result.draftedTokens && retained >= 1 && retained <= rows &&
+                  states.metadata(lane.stateLane).lengths.targetTokens == items[index].logicalPosition + retained,
+              "a cycle without a draft verified other rows than its anchor and its chain, or counted them wrong");
+      lane.tokens.insert(lane.tokens.end(), result.outputTokens.begin(), result.outputTokens.end());
+      lane.finished = result.finished;
+      chained += rows > 1;
+      alone += rows == 1;
+    }
+  }
+  require(chained > 0, "no cycle of a lane without a draft verified a lookup chain");
+  for (const Lane &lane : lanes)
+    executor.end(lane.request.id);
+  const ops::StopTokens stops = std::visit([](const auto &layout) { return layout.stopTokens; }, descriptor.target);
+  ArgmaxChain chains;
+  for (const Lane &lane : lanes) {
+    // A budget past the lane's, whose last token its decode would emit as
+    // the budget's end, without a cycle of its own.
+    EngineRequest direct = lane.request;
+    direct.id += 10;
+    direct.maxNewTokens = kBudget + 1;
+    ArgmaxChain chain = requireArgmaxChain(executor, stops, direct, lane.stateLane, lane.pages, lane.tokens);
+    chains.tokens += chain.tokens;
+    chains.first += chain.first;
+    chains.gaps.insert(chains.gaps.end(), chain.gaps.begin(), chain.gaps.end());
+  }
+  requireNearTies(chains);
+  if (measured) {
+    for (uint32_t width = 1; width <= executor.commandLimits().lanes; ++width) {
+      const std::vector<model::StepCosts::Point> points = model::RuntimeInstrumentation::stepPoints(executor, width);
+      require(!points.empty() && std::ranges::all_of(points, [](const auto &p) { return p.milliseconds > 0.0; }),
+              "the decode warmups of a model without a draft did not measure " + std::to_string(width) +
+                  " lanes' step costs");
+    }
+    Lane filled = lanes.front();
+    filled.request.id = 880;
+    filled.request.maxNewTokens = kRows * kRows + 1;
+    filled.tokens.clear();
+    filled.pages = pageRange(0, (kPrompt + filled.request.maxNewTokens + kRows + kv::kPageTokens - 1) /
+                                    kv::kPageTokens);
+    beginCold(executor, filled.request, filled.stateLane);
+    static_cast<void>(prefillChunk(executor, filled.request.id, 0, filled.request.prompt, filled.pages));
+    for (uint32_t rows = 1; rows <= kRows; ++rows) {
+      model::RuntimeInstrumentation::forceStepRows(executor, rows);
+      BatchPlan plan{.kind = WorkKind::Decode, .items = {{filled.request.id, 0}}, .decodeStage = DecodeStage::Regular};
+      const std::vector<ModelStepResult> results = executor.decode(
+          plan, std::vector<ModelBatchItem>{withRevision(
+                    {.requestId = filled.request.id,
+                     .logicalPosition = filled.request.prompt.size() + filled.tokens.size(),
+                     .pageTable = filled.pages})});
+      require(results.size() == 1 && results[0].failure.empty() &&
+                  model::RuntimeInstrumentation::lastVerifyRows(executor, 0) == rows,
+              "a forced step of " + std::to_string(rows) + " rows of a lane without a draft was not verified whole");
+      filled.tokens.insert(filled.tokens.end(), results[0].outputTokens.begin(), results[0].outputTokens.end());
+    }
+    model::RuntimeInstrumentation::forceStepRows(executor, std::nullopt);
+    executor.end(filled.request.id);
+  }
+  std::cout << "no_draft_cycles=PASS measured=" << measured << " chained_cycles=" << chained
+            << " anchor_only_cycles=" << alone << '\n';
+}
+
 // Under --verify-rows auto a decode cycle's rows follow the step costs the
 // start measured on this machine and the acceptance the verify budget
 // learns from the cycles before them, so that runs need not repeat one
@@ -6843,6 +6973,12 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 int main(int argc, char **argv) {
   try {
     bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false, siblingsOnly = false;
+    // --no-draft: MODEL_ROOT's model with its draft left out, as an
+    // installation of a family that names none holds it: its cycles without a
+    // draft on the runtime of these checks and on one whose step costs its
+    // decode warmups measure (requireCyclesWithoutADraft), a cache hit
+    // against its cold prefill (requireCacheHitMatchesCold), then stop.
+    bool noDraft = false;
     SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -6883,7 +7019,7 @@ int main(int argc, char **argv) {
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--lanes N] [--spill-tokens N] [--spill-window PAGES] "
            "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only | "
-           "--siblings-only]");
+           "--siblings-only | --no-draft]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
@@ -6891,6 +7027,7 @@ int main(int argc, char **argv) {
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
       else if (option == "--spill-only") spillOnly = true;
       else if (option == "--siblings-only") siblingsOnly = true;
+      else if (option == "--no-draft") noDraft = true;
       else if ((option == "--spill-tokens" || option == "--spill-window" || option == "--spill-buffers") &&
                i + 1 < argc) {
         const char *value = argv[++i];
@@ -6954,7 +7091,15 @@ int main(int argc, char **argv) {
     const uint64_t hostReserveBytes =
         EngineMemoryPolicy::hostAvailableReserveBytes(device.physicalMemoryBytes);
     const std::filesystem::path modelRoot(argv[2]);
-    const auto descriptor = model::servedFor(model::inspectModelRoot(modelRoot), maxContext);
+    model::ModelDescriptor inspected = model::inspectModelRoot(modelRoot);
+    if (noDraft) {
+      // The same sources, so the target's images are the installation's.
+      const std::string sources = inspected.sourceIdentity;
+      inspected = model::makeModelDescriptor(inspected.name, inspected.target, {}, inspected.vision,
+                                             inspected.targetSource, inspected.visionSource);
+      inspected.sourceIdentity = sources;
+    }
+    const auto descriptor = model::servedFor(inspected, maxContext);
     targetTokens = &oracleTokens(descriptor);
     // Production's weight byte count with a different bound. Production checks
     // it only against the Metal hard budget, then guards host headroom at every
@@ -7236,6 +7381,36 @@ int main(int argc, char **argv) {
     require(static_cast<bool>(pages.allocateExtent(0)),
             "warmup runway fixture failed to recover its KV extent");
     while (states.releaseOneIdle(false)) {
+    }
+    if (noDraft) {
+      // The warmups a start runs, in its order (engine/Bootstrap.mm): the
+      // prefill of the most rows and of each class, the decode of each lane
+      // count, and the restore of a cached state; every pipeline a start
+      // prepares, without a draft.
+      static_cast<void>(executor.warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
+      for (const uint32_t rows : executor.prefillRowClasses())
+        static_cast<void>(executor.warmupPrefill(rows));
+      for (uint32_t width = 1; width <= lanes; ++width)
+        static_cast<void>(executor.warmupDecodeBatch(width));
+      require(executor.warmupCompositeStateRestore().wallSeconds > 0.0,
+              "the restore warmup of a model without a draft did not complete");
+      std::cout << "no_draft_warmups=PASS prefill_classes=" << executor.prefillRowClasses().size() << '\n';
+      requireCyclesWithoutADraft(executor, states, model.descriptor, targetTokens->samplingSeed, false);
+      requireCacheHitMatchesCold(executor, targetTokens->samplingSeed, model.descriptor.capabilities.vocabularySize,
+                                 exactCachedStates);
+      context.verifyRows = model::VerifyRows::Auto;
+      runtime.reset();
+      require(static_cast<bool>(governedFor(governor, "the measured runtime's arenas")(
+                  arenaBytes, [&] { runtime.emplace(context); })),
+              "the measured runtime's arenas exceed the oracle Metal budget");
+      for (uint32_t width = 1; width <= lanes; ++width)
+        static_cast<void>(runtime->warmupDecodeBatch(width));
+      requireCyclesWithoutADraft(*runtime, states, model.descriptor, targetTokens->samplingSeed,
+                                 model.expertStore() == nullptr);
+      std::cout << "PASS model-runtime-oracle scope=no-draft model=" << model.name()
+                << " (a model without a draft keeps no draft state, verifies its anchors and host chains alone, "
+                   "decodes the target's argmax chain, restores a cached state, and measures its steps filled)\n";
+      return 0;
     }
     if (siblingsOnly) {
       requirePathsIgnoreTheirSiblings(executor, backend, pages, model.descriptor, targetTokens->samplingSeed, states);

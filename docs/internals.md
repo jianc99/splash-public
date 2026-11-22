@@ -446,10 +446,12 @@ GPU, so in a chunk it takes their last FFN rounds as the GPU's alone. On a
 16-core M5 Pro this takes about 2% off the 35B's prefill of 8K tokens.
 
 A decode step's rows are laid out on the GPU by its draft's selector
-(`ops::DraftSelector::addVerifyRows`): each lane's first row among the step's
-packed rows and its row count (`SplashLaneRows`, `DecodeTensor::LaneLayout`),
-the best rows of the lanes' trees that the step holds, every one of which the
-lane verifies. The host fixes only the step's rows and a lane's most
+(`ops::DraftSelector::addVerifyRows`), from the trees the draft grew or, for
+a model without a draft, from those the host wrote of the lanes' anchors and
+host chains ([Drafts](models.md#drafts)): each lane's first row among the
+step's packed rows and its row count (`SplashLaneRows`,
+`DecodeTensor::LaneLayout`), the best rows of the lanes' trees that the step
+holds, every one of which the lane verifies. The host fixes only the step's rows and a lane's most
 (`ops::StepRows`, `ops::verifyLaneCap`), which the grids span; where the
 trees hold fewer rows than the step, its rows past the lanes' belong to no
 lane, which no kernel selects, attends, retains or routes through the MoE
