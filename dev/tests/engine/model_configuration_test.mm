@@ -39,7 +39,7 @@ using test::require;
 namespace test_gguf = test::gguf;
 
 // An upstream model as its assembly records it: model.json, the target's
-// config.json and the draft's.
+// config.json and the draft's, none for an assembly without a draft.
 struct SourceModel final {
   std::string record, config, draft;
 
@@ -85,10 +85,12 @@ constexpr std::string_view kLargeMoeGgufConfig =
 // The descriptor inspection makes of model's assembly.
 model::ModelDescriptor inspect(const SourceModel &model) {
   const test::TemporaryDirectory root("splash-source-model");
-  std::filesystem::create_directory(root.path() / "draft");
   test::writeFile(root.path() / "model.json", model.record);
   test::writeFile(root.path() / "config.json", model.config);
-  test::writeFile(root.path() / "draft" / "config.json", model.draft);
+  if (!model.draft.empty()) {
+    std::filesystem::create_directory(root.path() / "draft");
+    test::writeFile(root.path() / "draft" / "config.json", model.draft);
+  }
   return model::inspectModelRoot(root.path());
 }
 
@@ -1054,6 +1056,40 @@ void testFlint(const std::filesystem::path &fixtures) {
           "a Flint config under text_config was accepted");
 }
 
+// An assembly without draft/ is a model without a draft: its descriptor is
+// valid, with the draft layout of no layers, whose rings and window hold no
+// bytes, so a lane and a cached state hold the target's state alone. That
+// holds for a family whose drafts choose its mask token too (Flint), which
+// then holds none. A layout of layers that reads no target layer is no draft
+// and is refused.
+void testNoDraft(const std::filesystem::path &fixtures) {
+  for (const std::string_view family : {"qwen3.8-27b", "qwen3.6-35b-a3b"}) {
+    SourceModel model = mlxModel(fixtures, family);
+    const model::ModelDescriptor drafted = inspect(model);
+    model.draft.clear();
+    const model::ModelDescriptor descriptor = inspect(model);
+    const model::CompositeStateLayout &state = descriptor.stateLayout;
+    require(descriptor.valid() && !descriptor.draft.present() && descriptor.draft == model::DFlashDraftLayout{} &&
+                descriptor.target == drafted.target && state.target == drafted.stateLayout.target &&
+                state.draft == model::DraftStateLayout{} && state.valid() &&
+                state.laneBytes() == model::CompositeStateLayout::kLaneGdnCells * state.target.cellBytes() &&
+                state.cachedBytes() == state.target.cachedCellBytes(),
+            "a " + std::string(family) + " assembly without a draft made another descriptor");
+  }
+  SourceModel flint = mlxModel(fixtures, "flint").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")");
+  flint.draft.clear();
+  const model::ModelDescriptor undrafted = inspect(flint);
+  require(undrafted.valid() && !undrafted.draft.present() && undrafted.family() == "Flint" &&
+              !undrafted.stateLayout.cachedBytes(),
+          "a Flint assembly without a draft made another descriptor");
+  model::DFlashDraftLayout unread = test::qwen3_8Draft();
+  unread.targetLayerCount = 0;
+  require(!model::makeModelDescriptor("unread", model::Qwen3_8Layout{}, unread, test::qwen3_8Vision(),
+                                      model::TargetSource::Safetensors, model::VisionSource::None)
+               .valid(),
+          "a draft that reads no target layer was valid");
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
@@ -1066,6 +1102,7 @@ int main(int argc, char **argv) {
     testConfigurationCheck(argv[1]);
     testYarn(argv[1]);
     testFlint(argv[1]);
+    testNoDraft(argv[1]);
     std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
                  "experts, the installer's check, YaRN, Flint PASS\n";
   } catch (const std::exception &error) {

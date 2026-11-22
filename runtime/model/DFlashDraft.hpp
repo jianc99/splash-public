@@ -72,7 +72,10 @@ private:
 // them (ModelDescriptor.mm readDraftLayout): every draft's attention widths
 // and selector are those the kernels are built for; its layers, intermediate
 // size, rotary base and the target layers it reads are its own, and its
-// hidden size and vocabulary its target's.
+// hidden size and vocabulary its target's. A model without a draft (an
+// installation that holds none, ModelDescriptor.mm inspectModelRoot) has the
+// layout of no layers, every size zero: it loads, keeps and runs nothing of a
+// draft, and its target captures no layer for one.
 struct DFlashDraftLayout final {
   uint32_t layers = 0;
   uint32_t hiddenSize = 0;
@@ -90,6 +93,9 @@ struct DFlashDraftLayout final {
   std::array<uint32_t, ExecutionLimits::maximumDraftTargetLayers> targetLayers{};
   uint32_t targetLayerCount = 0;
 
+  // Whether the model has a draft: the one predicate of what only a draft
+  // needs where none of it is zero (its weights, its steps, its commits).
+  [[nodiscard]] constexpr bool present() const noexcept { return layers != 0; }
   [[nodiscard]] constexpr DraftStateLayout stateLayout() const noexcept {
     return {layers, kvHeads, attentionHeadDimension, hiddenSize};
   }

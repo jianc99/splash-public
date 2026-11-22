@@ -1075,6 +1075,58 @@ void testAccountingAcrossCapturesAndRestores(metal::MetalBackend &backend) {
   }
 }
 
+// A model without a draft keeps rings and a window of no bytes: a lane holds
+// its GDN cells alone, a state its cached cell alone, and a state goes to the
+// disk and comes back, and a RAM state restores, with every byte of the
+// lane's cell and no window, its lengths kept as a drafted model's are.
+void testNoDraft(metal::MetalBackend &backend) {
+  constexpr model::CompositeStateLayout layout{kTargetState, {}};
+  require(layout.valid() && !layout.draft.ringBytes() && !layout.draft.windowBytes() &&
+              layout.laneBytes() == 2 * kTargetState.cellBytes() &&
+              layout.cachedBytes() == kTargetState.cachedCellBytes(),
+          "a model without a draft keeps draft state");
+  MemoryGovernor governor(backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,
+                          queryHostMemory, 0);
+  const test::ClaimScope start(governor, ClaimClass::Floor);
+  const uint64_t slotBytes = model::SlotFile::slotBytesFor(layout.cachedBytes());
+  model::QwenStateStorage storage(
+      backend, governor.allocationAdmission(), layout,
+      std::make_shared<model::SlotFile>(slotBytes, std::make_shared<model::DiskBudget>(slotBytes)));
+  require(static_cast<bool>(storage.tryActivateLane(0, 7)), "a lane without a draft was not activated");
+  require(storage.draft(0).empty() && !storage.window(0) &&
+              storage.actualAllocatedBytes() >= layout.laneBytes() &&
+              storage.actualAllocatedBytes() < layout.laneBytes() + kDraftState.windowBytes(),
+          "a lane without a draft holds draft rings or a window");
+  const model::GdnParityBuffers &gdn = storage.current(0);
+  fillState(gdn, kTargetState, 3);
+  const auto images = restoredImage(storage, 0);
+  storage.updateLengths(0, published(4096));
+  auto source = storage.snapshot(0);
+  auto write = source->offload({});
+  require(write != nullptr, "a state without a window was not offloaded");
+  auto disk = write->state();
+  source.reset();
+  releaseAllIdle(storage, false);
+  require(finishWhenReady(*write), "a state without a window was not written");
+  write.reset();
+  word(gdn.stateBase) = 0;
+  storage.updateLengths(0, {});
+  auto read = storage.beginRestore(0, *disk, true, {}, [] {});
+  require(read && finishWhenReady(*read), "a state without a window was not read");
+  require(stateImage(storage, 0) == images && storage.metadata(0).lengths.hasCompleteDraftWindow(2048),
+          "a state without a window did not come back whole");
+  auto promoted = read->snapshot();
+  require(promoted && promoted->residentBytes() == layout.cachedBytes(),
+          "a state without a window was not promoted with its cell alone");
+  read.reset();
+  word(gdn.stateBase) = 0;
+  require(!storage.beginRestore(0, *promoted, true, {}, [] {}) && stateImage(storage, 0) == images,
+          "a RAM state without a window did not restore");
+  disk.reset();
+  promoted.reset();
+  storage.releaseLane(0, 7);
+}
+
 void run(const std::string &metallib) {
   using model::QwenCompositeState;
   using model::QwenLogicalLengths;
@@ -1094,6 +1146,7 @@ void run(const std::string &metallib) {
   testAttentionOnlyTarget(backend);
   testKeptLaneBesideALaneInService(backend);
   testAccountingAcrossCapturesAndRestores(backend);
+  testNoDraft(backend);
   testStartBytes(backend);
   MemoryGovernor governor(
       backend, backend.capabilities().recommendedMaxWorkingSetBytes, 1, 1,

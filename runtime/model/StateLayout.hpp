@@ -113,9 +113,12 @@ struct DraftStateLayout final {
   uint32_t headDimension = 0;
   uint32_t contextWidth = 0;
 
+  // Every dimension is set with draft layers and zero without: a model
+  // without a draft keeps rings and a window of no bytes.
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && headDimension && contextWidth &&
-           contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0;
+    const std::array dimensions{kvHeads, headDimension, contextWidth};
+    const auto set = [&](uint32_t dimension) { return !dimension == !layers; };
+    return std::ranges::all_of(dimensions, set) && contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0;
   }
   [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
     return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
@@ -134,7 +137,8 @@ struct DraftStateLayout final {
 // A lane holds two GDN cells, its draft rings and their context window; a
 // cached state one cached cell (GdnStateLayout::cachedCellBytes) and the
 // window, from which a restore that needs the rings computes them again. A
-// cell of no bytes takes no memory (QwenGdnCell).
+// cell, rings or a window of no bytes take no memory (QwenGdnCell,
+// DFlashDraftRing, DFlashContextWindow).
 struct CompositeStateLayout final {
   static constexpr uint32_t kLaneGdnCells = 2;
 

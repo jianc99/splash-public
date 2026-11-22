@@ -829,6 +829,15 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
   loaded.vision.actualAllocatedBytes = 0;
   loaded.descriptor.visionSource = model::VisionSource::None;
   requireLoadedModel(loaded);
+  // So the draft category: a model with a draft whose loader produced no
+  // draft bytes stops here, and one without a draft has none to produce.
+  require(loaded.descriptor.draft.present(), "the test model has no draft");
+  const uint64_t draftBytes = std::exchange(loaded.draft.actualAllocatedBytes, 0);
+  rejects([&] { requireLoadedModel(loaded); }, "loaded model has incomplete allocation accounting",
+          "a model without loaded draft weights was accepted");
+  loaded.descriptor.draft = {};
+  requireLoadedModel(loaded);
+  loaded.draft.actualAllocatedBytes = draftBytes;
 }
 
 // Resource assembly names the step it fails at, at its real throw site: a

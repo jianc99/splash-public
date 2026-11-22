@@ -18,8 +18,8 @@ public:
 };
 
 // A model root serve-native cannot serve: MODEL_DIRECTORY names no directory
-// holding the model's target/ and draft/, or one whose model
-// model::inspectModelRoot refuses.
+// holding the model's target/, or one whose model model::inspectModelRoot
+// refuses (a root with a draft/ it cannot read among them).
 class ModelRootError final : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;

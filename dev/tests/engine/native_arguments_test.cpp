@@ -30,18 +30,21 @@ using splash::test::require;
 std::filesystem::path modelConfigs;
 
 // A model directory the engine accepts: the target and draft directories and
-// the assembly's record and configurations of an MLX Qwen3.8-27B.
+// the assembly's record and configurations of an MLX Qwen3.8-27B, or without
+// `drafted` its target alone, as an installation without a draft holds it.
 class ModelDirectory final {
 public:
-  ModelDirectory() {
-    for (const char *directory : {"target", "draft"})
-      std::filesystem::create_directory(path() / directory);
+  explicit ModelDirectory(bool drafted = true) {
+    std::filesystem::create_directory(path() / "target");
     test::writeFile(path() / "model.json",
                     R"({"version":1,"model":"mlx-community/Qwen3.8-27B-4bit",)"
                     R"("target_format":"mlx-affine","vision_format":"none"})");
     const std::filesystem::path configs = modelConfigs / "qwen3.8-27b";
     std::filesystem::copy_file(configs / "config.json", path() / "config.json");
-    std::filesystem::copy_file(configs / "draft" / "config.json", path() / "draft" / "config.json");
+    if (drafted) {
+      std::filesystem::create_directory(path() / "draft");
+      std::filesystem::copy_file(configs / "draft" / "config.json", path() / "draft" / "config.json");
+    }
   }
 
   [[nodiscard]] const std::filesystem::path &path() const noexcept {
@@ -400,7 +403,13 @@ void testRefusals() {
                  "MODEL_DIRECTORY must name an existing directory");
   const test::TemporaryDirectory empty("splash-native-arguments-empty");
   commandRefused({"serve-native", empty.path().string(), "auto", "auto"},
-                 "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
+                 "MODEL_DIRECTORY must hold the model's target/ directory");
+  // A model without a draft holds its target alone, and is served without one.
+  const ModelDirectory undrafted(false);
+  const NativeArguments read = parse(undrafted, {"auto", "auto"});
+  require(read.model.valid() && !read.model.draft.present() &&
+              read.modelRoot == std::filesystem::canonical(undrafted.path()),
+          "a model directory without a draft was not read as a model without one");
 }
 
 } // namespace

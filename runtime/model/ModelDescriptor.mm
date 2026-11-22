@@ -828,9 +828,9 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   else if (visionFormat == "safetensors") visionSource = VisionSource::Safetensors;
   else if (visionFormat == "gguf") visionSource = VisionSource::Gguf;
   else throw std::invalid_argument("unsupported vision source format: " + std::string(visionFormat));
-  // Without a draft config the descriptor names the family but has no draft
-  // (inspectSourceConfiguration), and is not valid; a model root always
-  // holds its draft's.
+  // Without a draft config the model has no draft (DFlashDraftLayout): an
+  // installation that holds none, or a check before its draft is chosen
+  // (inspectSourceConfiguration).
   DFlashDraftLayout dflashLayout;
   std::visit([&](auto &layout) {
     validateTextConfig(text, layout, targetSource);
@@ -892,13 +892,22 @@ bool ModelDescriptor::valid() const noexcept {
       !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
-      stateLayout.draft != draft.stateLayout() ||
-      vision.outputHiddenSize != draft.hiddenSize) {
+      stateLayout.draft != draft.stateLayout()) {
     return false;
   }
   return std::visit(
       [&](const auto &layout) {
+        // A draft reads 1 to maximumDraftTargetLayers of its target's layers
+        // in its target's width, and a family whose drafts choose the mask
+        // token holds its draft's; a model without a draft has none of them.
+        const bool drafted =
+            layout.hiddenSize == draft.hiddenSize && draft.targetLayerCount &&
+            draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
+            draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+            (!layout.draftChoosesMaskToken() ||
+             (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken));
         return layout.vocabularySize == capabilities.vocabularySize &&
+               vision.outputHiddenSize == layout.hiddenSize &&
                layout.servedContextTokens(ropeScaling) ==
                    capabilities.maximumContextTokens &&
                // YaRN stretches the native window, at most to the family's
@@ -908,12 +917,7 @@ bool ModelDescriptor::valid() const noexcept {
                  capabilities.maximumContextTokens <= layout.yarnContextTokens)) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
-               layout.hiddenSize == draft.hiddenSize &&
-               draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
-               // A family whose drafts choose the mask token holds its draft's.
-               (!layout.draftChoosesMaskToken() ||
-                (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
+               (!draft.present() || drafted) &&
                layout.kvLayout() == targetKvLayout &&
                layout.gdnStateLayout() == stateLayout.target;
       },
@@ -963,10 +967,11 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // Every family decodes with its DFlash2 draft, in draft/.
-    if (!std::filesystem::exists(root / "draft"))
-      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
-    NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
+    // Its DFlash2 draft, in draft/, where the installation holds one (a
+    // family that names none, without --draft-model, has none).
+    NSDictionary *draft = std::filesystem::exists(root / "draft")
+                              ? readObject(root / "draft" / "config.json", "draft config")
+                              : nil;
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");

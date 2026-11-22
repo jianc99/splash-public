@@ -31,7 +31,8 @@ namespace {
 using splash::test::require;
 
 // The draft each family's values are taken with: the one
-// dev/tests/fixtures/model-configs describes for it (TestDrafts.hpp).
+// dev/tests/fixtures/model-configs describes for it (TestDrafts.hpp), or none
+// for a family released without one.
 model::DFlashDraftLayout draftOf(std::string_view family) {
   if (family == model::Qwen3_8Layout{}.family)
     return test::qwen3_8Draft();
@@ -43,7 +44,7 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flashNextDraft();
   if (family == model::FlintLayout{}.family)
     return test::flintDraft();
-  throw std::logic_error(std::string(family) + " has no draft to take its values with");
+  return {};
 }
 
 // Pools of a few pages to a million, around the extent sizes.
@@ -63,13 +64,14 @@ std::string familyValues() {
     if (target.draftChoosesMaskToken()) target.maskToken = target.firstDraftMaskToken;
     const model::ModelDescriptor model =
         model::makeModelDescriptor(std::string(family.family), target, draft,
-                                   {.outputHiddenSize = draft.hiddenSize}, model::TargetSource::Gguf,
+                                   {.outputHiddenSize = family.hiddenSize}, model::TargetSource::Gguf,
                                    model::VisionSource::None);
     require(model.valid(), std::string(family.family) + "'s descriptor is not valid");
     const kv::Layout &kv = model.targetKvLayout;
     const model::FamilyFacts &own = facts.at(index++);
     require(own.family == family.family, std::string(family.family) + "'s facts are another family's");
     out << "family " << family.family << '\n'
+        << (draft.present() ? "" : "draft none\n")
         << "facts experts " << own.experts << " recurrent-state " << own.recurrentState << " ple-table "
         << own.pleTable << " sparse-kv " << own.sparseKv << " dense-ffn " << own.denseFfn << " context "
         << own.contextTokens << ".." << own.maximumContextTokens << '\n'

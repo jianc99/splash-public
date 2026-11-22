@@ -135,9 +135,11 @@ struct RuntimeGeometry final {
     if (!result.target.valid() || !result.draft.stateLayout().valid() ||
         (parts.kv && !result.target.kvLayout.spillable()) ||
         result.target.contextTokens() != descriptor.capabilities.maximumContextTokens ||
-        result.target.hiddenSize != result.draft.hiddenSize ||
-        result.target.vocabularySize != result.draft.vocabularySize ||
-        result.target.capturedHiddenSize() != result.draft.targetHiddenSize()) {
+        // A draft's width and vocabulary are its target's, and it reads the
+        // rows its target captures.
+        (result.draft.present() && (result.target.hiddenSize != result.draft.hiddenSize ||
+                                    result.target.vocabularySize != result.draft.vocabularySize ||
+                                    result.target.capturedHiddenSize() != result.draft.targetHiddenSize()))) {
       throw std::invalid_argument("invalid model runtime geometry");
     }
     // Sized from the geometry, once it is valid.
@@ -151,6 +153,29 @@ struct RuntimeGeometry final {
 
   [[nodiscard]] uint32_t draftRotaryPairs() const noexcept {
     return draft.attentionHeadDimension / 2;
+  }
+  // The shapes of the draft's projections, output by input, whose plans the
+  // arenas' scratch and the draft step's storage rows hold: its context
+  // projections (target rows to its width, and its width to its context keys
+  // and values), its block's own, and its FFN's gate and up projection. None
+  // without a draft: no plan takes a projection of no sizes.
+  struct DraftProjections final {
+    std::vector<ops::ProjectionShape> context;
+    std::vector<ops::ProjectionShape> block;
+    std::vector<ops::ProjectionShape> gateUp;
+  };
+  [[nodiscard]] DraftProjections draftProjections() const {
+    const DFlashDraftLayout &d = draft;
+    if (!d.present())
+      return {};
+    return {.context = {{d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}},
+            .block = {{d.dynamicSize, d.hiddenSize},
+                      {d.qkvSize, d.hiddenSize},
+                      {d.hiddenSize, d.attentionSize},
+                      {d.intermediateSize, d.hiddenSize},
+                      {d.hiddenSize, d.intermediateSize},
+                      {d.selectorRank, d.hiddenSize}},
+            .gateUp = {{d.intermediateSize, d.hiddenSize}}};
   }
   [[nodiscard]] uint32_t maskWords() const noexcept {
     return maskWordsPerToken(target.vocabularySize);
@@ -480,19 +505,22 @@ public:
     if (chunks_ > 1) groupCell_ = groupCellBuffers(backend, get(PrefillTensor::GroupCell), geometry.target.stateLayout);
     if (cursor != bytes_)
       throw std::logic_error("prefill arena mismatch");
-    auto *target = static_cast<float *>(
-        get(PrefillTensor::TargetInverseFrequencies).contents());
-    auto *draft = static_cast<float *>(
-        get(PrefillTensor::DraftInverseFrequencies).contents());
-    if (!target || !draft)
-      throw std::logic_error("RoPE frequencies are not CPU-visible");
-    rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
-                             geometry.target.ropeScaling,
-                             {target, geometry.target.rotaryPairs});
-    for (uint32_t dim = 0; dim < geometry.draftRotaryPairs(); ++dim) {
-      draft[dim] = std::pow(geometry.draft.rotaryTheta,
-                            -static_cast<float>(dim) / geometry.draftRotaryPairs());
-    }
+    // Each table of rotary pairs: none for a target without RoPE or a model
+    // without a draft, which have no pairs.
+    const auto frequencies = [&](PrefillTensor tensor, uint32_t pairs) -> float * {
+      if (!pairs)
+        return nullptr;
+      auto *table = static_cast<float *>(get(tensor).contents());
+      if (!table)
+        throw std::logic_error("RoPE frequencies are not CPU-visible");
+      return table;
+    };
+    if (float *target = frequencies(PrefillTensor::TargetInverseFrequencies, geometry.target.rotaryPairs))
+      rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
+                               geometry.target.ropeScaling, {target, geometry.target.rotaryPairs});
+    if (float *draft = frequencies(PrefillTensor::DraftInverseFrequencies, geometry.draftRotaryPairs()))
+      for (uint32_t dim = 0; dim < geometry.draftRotaryPairs(); ++dim)
+        draft[dim] = std::pow(geometry.draft.rotaryTheta, -static_cast<float>(dim) / geometry.draftRotaryPairs());
     // Split projections return their counters to zero; they start there.
     if (const metal::MetalBuffer counters = get(PrefillTensor::LinearCounters))
       std::memset(counters.contents(), 0, counters.sizeBytes());
@@ -821,8 +849,9 @@ public:
     // present), over a step's rows, and the always-dense DFlash draft, over
     // its block's. Sparse target FFNs use their own route-major arena tensors,
     // but must not remove the draft's scratch.
-    const uint64_t draft = operators.gateUpWorkspace({geometry.draft.intermediateSize, geometry.draft.hiddenSize},
-                                                     geometry.target.lanes * kDraftRows);
+    uint64_t draft = 0;
+    for (const auto &p : geometry.draftProjections().gateUp)
+      draft = std::max(draft, operators.gateUpWorkspace(p, geometry.target.lanes * kDraftRows));
     uint64_t target = 0;
     for (const auto &p : geometry.target.gateUpProjections)
       target = std::max(target, operators.gateUpWorkspace(p, geometry.target.stepRows()));

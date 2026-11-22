@@ -480,8 +480,9 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 } // namespace
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
+  // A model without a draft, as one without vision, loads no such weights.
   if (!loaded.targetActualAllocatedBytes() ||
-      !loaded.draft.actualAllocatedBytes ||
+      (loaded.descriptor.draft.present() && !loaded.draft.actualAllocatedBytes) ||
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {

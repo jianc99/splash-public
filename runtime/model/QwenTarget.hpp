@@ -191,8 +191,9 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
             convolutionDimension, packedGdnWidth, gdnSigmoidGate};
   }
   // The layout itself was checked by requireQwenLayout when the target
-  // loaded. The draft reads 1 to ExecutionLimits::maximumDraftTargetLayers
-  // of its layers, ascending. A target without GDN layers has no GDN shape.
+  // loaded. A draft reads 1 to ExecutionLimits::maximumDraftTargetLayers of
+  // its layers, ascending, and a model without one none. A target without GDN
+  // layers has no GDN shape.
   // The projection lists hold every projection the weights dispatch, which
   // each have sizes; a target with dense FFNs, a MoE target's leading layers
   // too, holds their gate and up projections.
@@ -203,9 +204,10 @@ struct QwenTargetGeometry final : QwenTargetDimensions {
       });
     };
     const auto captured = [&] {
-      if (!captureLayerCount || captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
+      if (captureLayerCount > ExecutionLimits::maximumDraftTargetLayers) return false;
       const auto ids = captureLayers();
-      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() && ids.back() < layers;
+      return std::ranges::adjacent_find(ids, std::ranges::greater_equal{}) == ids.end() &&
+             (ids.empty() || ids.back() < layers);
     };
     const bool dense = intermediateSize && sized(gateUpProjections);
     return captured() && stateLayout.layers + kvLayout.attentionLayers == layers &&

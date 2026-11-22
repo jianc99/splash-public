@@ -42,12 +42,13 @@ void clear(const MetalBuffer &buffer, const char *name) {
 
 // What a state file slot holds of a state: the first `cellBytes` of the
 // buffer that holds its cached cell, unless the cell has no bytes, then its
-// context window.
+// context window, unless it has none (a model without a draft).
 std::vector<std::span<std::byte>> stateSpans(const MetalBuffer &cell, uint64_t cellBytes, const MetalBuffer &window) {
   std::vector<std::span<std::byte>> spans;
   if (cellBytes)
     spans.emplace_back(static_cast<std::byte *>(writableContents(cell, "state IO")), cellBytes);
-  spans.emplace_back(static_cast<std::byte *>(writableContents(window, "state IO")), window.sizeBytes());
+  if (window)
+    spans.emplace_back(static_cast<std::byte *>(writableContents(window, "state IO")), window.sizeBytes());
   return spans;
 }
 
@@ -624,9 +625,9 @@ QwenStateStorage::snapshotToDisk(uint32_t index, std::function<void()> completio
       file_, staging_,
       [&](std::span<std::byte> staged) {
         code(true, current(index), cachedCellBuffers(backend_, staging_->buffer, layout_.target));
-        const MetalBuffer &from = window(index);
-        std::memcpy(staged.data() + layout_.target.cachedCellBytes(), writableContents(from, "context window"),
-                    from.sizeBytes());
+        if (const MetalBuffer &from = window(index))
+          std::memcpy(staged.data() + layout_.target.cachedCellBytes(), writableContents(from, "context window"),
+                      from.sizeBytes());
       },
       layout_, source.metadata.lengths, std::move(completion));
 }
