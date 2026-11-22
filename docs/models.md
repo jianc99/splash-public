@@ -29,9 +29,10 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
-`runtime/model/`) is an architecture, whose code its families share, and each
-family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp`,
+`Inkling2Loop.hpp` in `runtime/model/`) is an architecture, whose code its
+families share, and each family is a value of it in one list,
+`model::kFamilies` (`ModelDescriptor.hpp`):
 another size of an architecture is one more value there, built by the
 constructor from a `QwenHybridLayout` its layout type gains with its second
 family (as `Qwen3_6MoeLayout`'s builds `kQwen3_5_122BLayout`), its draft in
@@ -46,6 +47,19 @@ reads only for a model type whose configs are flat (a layout type's
 Flint's values key by key (its widths, router, window, `layer_types`,
 `no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
 `rope_theta` and the rest where it states them).
+Inkling 2's layout states the dimensions the shared runtime runs on as the
+layers a step runs, one per layer application (48: its 24 weight layers, the
+loop's twelve three times), and keeps its weight layers, its loop and the
+mapping of an application to its weight layer in its own members
+(`Inkling2LoopSchedule`); its layers attend through its own operator, not the
+shared attention (a layout type's `sharedAttention`), so the kernel tests'
+attention shapes leave it out. It is served up to Splash's serving ceiling,
+1,010,000 tokens, below its own window of 1,048,576. It loads from a GGUF
+alone; its configuration, under `text_config`, is held to its values key by
+key (its weight layers, its own window at `model_max_length`,
+`unpadded_vocab_size`, `local_layer_ids`, `loop_config`, its experts' width;
+the relative bias, clips, softcaps, routing and the rest where it states
+them), its clip and log-scaling alpha as F32 values.
 An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.

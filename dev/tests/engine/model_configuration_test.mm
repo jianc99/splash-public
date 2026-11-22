@@ -1090,6 +1090,45 @@ void testNoDraft(const std::filesystem::path &fixtures) {
           "a draft that reads no target layer was valid");
 }
 
+// Inkling-2-Mini's config, nested in text_config: its release's config.json
+// and the one the installer derives from its GGUF (the release's keys the
+// header holds, and max_position_embeddings, num_experts and eos_token_id in
+// text_config), each a GGUF target without a draft, of its family's layout:
+// 24 weight layers its steps run as 48 applications. Its clip is held as an
+// F32, as its header states it; another loop, another layer count or a
+// safetensors source is refused by name.
+void testInkling2(const std::filesystem::path &fixtures) {
+  const SourceModel release{
+      R"({"version":1,"model":"community/fine-tune","target_format":"gguf","vision_format":"none"})",
+      text(fixtures / "inkling-2-mini" / "config.json"), {}};
+  const model::ModelDescriptor descriptor = inspect(release);
+  const auto *layout = std::get_if<model::Inkling2LoopLayout>(&descriptor.target);
+  require(layout && *layout == model::Inkling2LoopLayout{} && descriptor.family() == "Inkling-2-Mini" &&
+              descriptor.targetSource == model::TargetSource::Gguf && descriptor.valid() &&
+              layout->weightLayers == 24 && layout->layers == 48 && descriptor.targetKvLayout.attentionLayers == 48 &&
+              descriptor.stateLayout.target.auxiliaryBytes == 1'916'928,
+          "the release's Inkling-2-Mini config made another descriptor");
+  const SourceModel derived = release
+                                  .with(&SourceModel::config, R"("qk_l2_clip_threshold": 22.627416997969522)",
+                                        R"("qk_l2_clip_threshold": 22.627417)")
+                                  .with(&SourceModel::config, R"("model_max_length": 1048576,)",
+                                        R"("model_max_length": 1048576, "max_position_embeddings": 1048576,)"
+                                        R"( "num_experts": 128, "eos_token_id": 200006,)");
+  require(inspect(derived).target == descriptor.target, "the derived Inkling-2-Mini config made another descriptor");
+  refuses(derived.with(&SourceModel::config, R"("num_experts": 128, "eos_token_id": 200006)",
+                       R"("num_experts": 128, "eos_token_id": 200007)"),
+          "text config eos_token_id mismatch", "another stop token was accepted");
+  refuses(release.with(&SourceModel::config, R"("qk_l2_clip_threshold": 22.627416997969522)",
+                       R"("qk_l2_clip_threshold": 22.7)"),
+          "text config qk_l2_clip_threshold mismatch", "another query clip was accepted");
+  refuses(release.with(&SourceModel::config, R"("core_end": 18)", R"("core_end": 12)"),
+          "text config loop_config core_end mismatch", "another loop was accepted");
+  refuses(release.with(&SourceModel::config, R"("num_hidden_layers": 24)", R"("num_hidden_layers": 48)"),
+          "text config num_hidden_layers", "its applications as its layers were accepted");
+  refuses(release.with(&SourceModel::record, R"("gguf")", R"("mlx-affine")"), "Inkling-2-Mini loads from a GGUF",
+          "a safetensors Inkling-2-Mini was accepted");
+}
+
 int main(int argc, char **argv) {
   try {
     if (argc != 2) throw std::invalid_argument("usage: model-configuration FIXTURES");
@@ -1103,8 +1142,9 @@ int main(int argc, char **argv) {
     testYarn(argv[1]);
     testFlint(argv[1]);
     testNoDraft(argv[1]);
+    testInkling2(argv[1]);
     std::cout << "model configuration: every family, sources, one rule per value, quantization, vision, pruned "
-                 "experts, the installer's check, YaRN, Flint PASS\n";
+                 "experts, the installer's check, YaRN, Flint, no draft, Inkling-2-Mini PASS\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;
