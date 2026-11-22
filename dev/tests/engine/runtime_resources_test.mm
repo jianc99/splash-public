@@ -612,8 +612,8 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
       }
     }
   }
-  // Without a ceiling, or with one above this Mac's budget, which only a
-  // notice names, the start reaches the loader.
+  // Without a ceiling, or with one above the most it can set on this Mac,
+  // which a notice names, the start reaches the loader.
   for (const uint64_t ceiling : {uint64_t{0}, 1024 * kGiB}) {
     config.maximumMemoryBytes = ceiling;
     const std::string log = test::capturedStderr([&] {
@@ -621,9 +621,9 @@ void testWeightBudgetBeforeLoading(const char *metallibPath) {
                                 "a sufficient weight budget did not reach the "
                                 "model loader");
     });
-    require((log.find("--max-memory ignored: its 1024.0 GiB exceed this Mac's Metal budget of ") !=
+    require((log.find("--max-memory capped: its 1024.0 GiB exceed the most it can set on this Mac, ") !=
              std::string::npos) == (ceiling != 0),
-            "a ceiling above the budget was ignored without a notice, or no ceiling was named");
+            "a ceiling above the budget was capped without a notice, or no ceiling was named");
   }
 }
 
@@ -723,10 +723,10 @@ void testHostMemoryProbeIsRequired(const char *metallibPath) {
 
 // The 27B under a budget half a GiB above its weights: the weights alone fit,
 // but not with what the runtime needs beside them. Startup refuses it before
-// any weight is loaded, against the bound that binds: --max-memory, or this
-// Mac's Metal budget where that is lower (a 16 GB Mac's 10.8 GiB), which
-// --max-memory can only lower. There, a --max-memory half a GiB below the
-// Metal budget binds instead.
+// any weight is loaded, against the bound that binds: --max-memory, or the
+// most it can set on this Mac where that is lower, the recommended working
+// set less its margin (a 16 GB Mac's 10.8 GiB). There, a --max-memory half a
+// GiB below that binds instead.
 void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
   const test::TemporaryDirectory root("splash-budget");
   RuntimeResourcesConfig config = budgetConfig(metallibPath, root.path());
@@ -734,8 +734,9 @@ void testModelBeyondBudgetIsRefusedBeforeLoading(const char *metallibPath) {
                                             test::qwen3_8Vision(), model::TargetSource::Safetensors,
                                             model::VisionSource::Safetensors);
   writeCheckpoints(root.path(), config.model);
-  const uint64_t device =
-      EngineMemoryPolicy::hardBudgetBytes(metal::probeDeviceCapabilities().recommendedMaxWorkingSetBytes, 0);
+  const DeviceCapabilities capabilities = metal::probeDeviceCapabilities();
+  const uint64_t device = EngineMemoryPolicy::hardBudgetBytes(capabilities.recommendedMaxWorkingSetBytes,
+                                                              UINT64_MAX, capabilities.physicalMemoryBytes);
   const uint64_t above = model::streamableWeights(root.path(), config.model, {}).loadedBytes + kGiB / 2;
   std::vector<uint64_t> limits{above};
   if (above >= device)
@@ -1080,7 +1081,7 @@ void testARestoreAfterTheOtherWarmupsCreatesNothing(const char *metallibPath) {
           "the runtime's arenas were refused");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1112,7 +1113,7 @@ void testALongRequestAfterTheWarmupsCreatesNothing(const char *metallibPath) {
           "the runtime's arenas were refused");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1172,7 +1173,7 @@ void testAReplyCaptureAfterTheWarmupsCreatesNothing(const char *metallibPath) {
   require(runtime->capturesInDecode(), "the reply capture's model captures no state in decode");
   const KvPool::RunwayHold runway(resources->kvPool());
   static_cast<void>(runtime->warmupPrefill(model::ExecutionLimits::prefillTokenBudget));
-  for (const uint32_t rows : resources->modelContext().operators.prefillRowClasses())
+  for (const uint32_t rows : runtime->prefillRowClasses())
     static_cast<void>(runtime->warmupPrefill(rows));
   static_cast<void>(runtime->warmupDecodeBatch(1));
   metal::MetalBackend &backend = resources->backend();
@@ -1345,6 +1346,8 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
   RuntimeResourcesConfig config = loadableConfig(metallibPath, root.path(), "automatic-test");
   config.diskVolume = reading(localVolume(500 * kGiB));
   uint64_t minimumRequired = 0;
+  // The status's off_reason of the last start.
+  std::string offReason;
   const auto start = [&](uint32_t requestedContextTokens, uint32_t &contextTokens,
                          bool &tier) {
     return test::capturedStderr([&] {
@@ -1352,6 +1355,7 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
       contextTokens = resources->memoryPlan().maximumContextTokens();
       minimumRequired = resources->memoryPlan().breakdown().minimumRequiredBytes;
       tier = resources->cache().snapshot().kvTier.capacityBytes != 0;
+      offReason = resources->cache().snapshot().kvTier.offReason;
     });
   };
   uint32_t without = 0, with = 0, yielded = 0;
@@ -1365,13 +1369,14 @@ void testAutomaticTierYieldsToTheContext(const char *metallibPath) {
   require(!tier && without, "a start without the SSD cache had one, or no context");
   config.cacheDisk = {.automatic = true};
   static_cast<void>(start(0, with, tier));
-  require(tier && with < without,
+  require(tier && with < without && offReason.empty(),
           "the automatic tier did not start, or its staging cost the plan no context");
   const std::string off = start(without, yielded, tier);
-  require(!tier && yielded == without &&
-              off.find("SSD cache off: the memory plan cannot hold a " + std::to_string(without) +
-                       "-token context beside its state staging") != std::string::npos,
-          "the automatic tier kept staging the requested context needs");
+  const std::string reason =
+      "the memory plan cannot hold a " + std::to_string(without) + "-token context beside its state staging";
+  require(!tier && yielded == without && off.find("SSD cache off: " + reason) != std::string::npos &&
+              offReason == reason,
+          "the automatic tier kept staging the requested context needs, or its status did not say why");
 }
 
 // The automatic tier's staging is decided by memory alone, so a start serves
@@ -1388,7 +1393,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
     uint32_t context = 0, planContext = 0;
     uint64_t staging = 0, minimumRequired = 0;
     bool tier = false, persistent = false;
-    std::string log;
+    std::string log, offReason;
   };
   const auto start = [&] {
     Started started;
@@ -1401,6 +1406,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
       const CacheSnapshot cache = resources->cache().snapshot();
       started.tier = cache.kvTier.capacityBytes != 0;
       started.persistent = cache.persistent;
+      started.offReason = cache.kvTier.offReason;
     });
     return started;
   };
@@ -1420,7 +1426,7 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
   config.diskVolume = reading(localVolume(500 * kGiB));
   const Started room = start();
   require(!off.tier && room.tier && room.staging == config.model.stateLayout.cachedBytes() &&
-              room.context == room.planContext && room.context < off.context,
+              room.context == room.planContext && room.context < off.context && room.offReason.empty(),
           "the automatic tier did not start beside its staging, or the staging cost no context");
   // A cached state in the running format (--cached-states exact) stages and
   // counts as a lane's cell and window, more than its codes.
@@ -1444,9 +1450,10 @@ void testAutomaticContextIgnoresTheVolume(const char *metallibPath) {
     config.diskVolume = reading(volume);
     const Started refused = start();
     require(!refused.tier && refused.staging == room.staging && refused.context == room.context &&
-                refused.planContext == room.planContext && offOnce(refused, reason),
+                refused.planContext == room.planContext && offOnce(refused, reason) &&
+                refused.offReason.find(reason) == 0,
             "a volume without room changed the automatic context, or did not leave the tier off "
-            "once (" + reason + ")");
+            "once, saying why in its status (" + reason + ")");
   }
   // A persistent cache's root without room leaves the tier temporary files;
   // with no room for those either, it is off.
