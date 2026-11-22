@@ -378,7 +378,7 @@ def parse_args(argv=None):
         "--draft-model",
         type=parse_draft_model,
         help="the DFlash2 draft's repository or local directory, in place of the "
-        "family's released one",
+        "family's released one, or for a family released without one",
     )
     parser.add_argument(
         "--language-only",

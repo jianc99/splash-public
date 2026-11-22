@@ -72,7 +72,8 @@ class UpstreamTest(unittest.TestCase):
         return output.getvalue(), warnings.getvalue()
 
     def test_every_family_names_its_own_draft_repository(self):
-        repos = [family.draft_repo for family in families.FAMILIES]
+        # Of the families released with one (ModelFamily.draft_repo).
+        repos = [family.draft_repo for family in families.FAMILIES if family.draft_repo]
         for repo in repos:
             with self.subTest(repo=repo):
                 self.assertEqual(models.validate_repo_id(repo), repo)
@@ -186,13 +187,13 @@ class UpstreamTest(unittest.TestCase):
                 "mlx-affine", "none", self.root / "changed/config.json"
             )
 
-    def test_a_family_without_a_known_draft_is_refused(self):
+    def test_a_family_this_release_does_not_serve_is_refused(self):
         config = mlx_target(self.root / "target", MOE) / "config.json"
         with (
             mock.patch.object(families, "FAMILIES", (DENSE,)),
             self.assertRaisesRegex(
                 models.ModelError,
-                "no DFlash2 draft is known for the Qwen3.6-35B-A3B family",
+                "this release serves no family named Qwen3.6-35B-A3B",
             ),
         ):
             upstream.check_model("mlx-affine", "none", config)
@@ -1953,9 +1954,10 @@ class UpstreamTest(unittest.TestCase):
         self.assertEqual(self.remove(first), 0)
         self.assertEqual(blob_bytes(self.cache, MODEL), size)
 
-    def test_an_installations_vocabulary_is_its_drafts(self):
+    def test_an_installations_vocabulary_is_its_targets(self):
         """The server builds its grammars' table of it before the engine is
-        Ready (server.main)."""
+        Ready (server.main): its target's, which its draft's equals, under
+        text_config or at the root of a flat config (Flint's)."""
         fake_hub(self, self.cache)
         chosen = selection(self.root)
         self.prepare(chosen)
@@ -1964,12 +1966,73 @@ class UpstreamTest(unittest.TestCase):
             family_config(DENSE, "draft/config.json")["vocab_size"],
         )
         broken = self.root / "broken"
-        (broken / "draft").mkdir(parents=True)
-        for config in ("{", "{}", '{"vocab_size": "248320"}', '{"vocab_size": 0}'):
+        broken.mkdir()
+        (broken / "config.json").write_text('{"vocab_size": 150144}')
+        self.assertEqual(assembly.vocabulary(broken), 150144)
+        for config in (
+            "{",
+            "{}",
+            '{"text_config": {}}',
+            '{"vocab_size": "248320"}',
+            '{"text_config": {"vocab_size": 0}}',
+        ):
             with self.subTest(config=config):
-                (broken / "draft/config.json").write_text(config)
+                (broken / "config.json").write_text(config)
                 with self.assertRaises(models.ModelError):
                     assembly.vocabulary(broken)
+
+    def test_a_family_released_without_a_draft_installs_none(self):
+        # A family that names no draft (ModelFamily.draft_repo): its
+        # installation asks the Hub for the target alone, links no draft/ and
+        # records no draft source, and a start of it again changes nothing.
+        undrafted = dataclasses.replace(DENSE, draft_repo=None)
+        with mock.patch.object(families, "FAMILIES", (undrafted, MOE)):
+            fake = fake_hub(self, self.cache)
+            chosen = selection(self.root)
+            output, _ = self.prepare(chosen)
+            self.assertIn(f"as {DENSE.name} (mlx-affine); draft none;", output)
+            self.assertEqual(
+                assembly.verify(chosen.link)["sources"],
+                {"target": {"repo": MODEL, "revision": "a" * 40}},
+            )
+            self.assertFalse((chosen.link / "draft").exists())
+            self.assertFalse(
+                any(name.startswith(DENSE.draft_repo + "/") for name in fake.downloads)
+            )
+            self.assertEqual(pins(self.cache), ["a" * 40])
+            fake.requests.clear(), fake.downloads.clear()
+            output, _ = self.prepare(chosen)
+            self.assertEqual(fake.requests, [(MODEL, None)])
+            self.assertEqual(fake.downloads, [])
+            self.assertIn("is already installed", output)
+
+    def test_a_family_released_without_a_draft_takes_a_named_one(self):
+        # --draft-model gives such a family's installation a DFlash2 draft,
+        # checked and installed as a released one is.
+        undrafted = dataclasses.replace(DENSE, draft_repo=None)
+        with mock.patch.object(families, "FAMILIES", (undrafted, MOE)):
+            fake = fake_hub(self, self.cache)
+            fake.publish("someone/draft", "c" * 40, lambda p: draft_dir(p, DENSE))
+            chosen = selection(self.root, draft_model="someone/draft")
+            self.prepare(chosen)
+        self.assertEqual(
+            assembly.verify(chosen.link)["sources"]["draft"],
+            {"repo": "someone/draft", "revision": "c" * 40},
+        )
+        self.assertTrue((chosen.link / "draft/config.json").is_file())
+
+    def test_an_installation_whose_family_drops_its_draft_reassembles_without(self):
+        fake_hub(self, self.cache)
+        chosen = selection(self.root)
+        self.prepare(chosen)
+        undrafted = dataclasses.replace(DENSE, draft_repo=None)
+        with mock.patch.object(families, "FAMILIES", (undrafted, MOE)):
+            output, _ = self.prepare(chosen)
+        self.assertIn("it has no draft", output)
+        self.assertNotIn("draft", assembly.verify(chosen.link)["sources"])
+        self.assertFalse((chosen.link / "draft").exists())
+        # Its draft's pin is retired with the assembly that linked it.
+        self.assertEqual(pins(self.cache), ["a" * 40])
 
     def test_a_recorded_path_that_climbs_out_of_its_snapshot_is_never_freed(self):
         fake = fake_hub(self, self.cache)
@@ -2212,7 +2275,8 @@ class UpstreamTest(unittest.TestCase):
             "family": DENSE.name,
             "target_format": "mlx-affine",
             "vision_format": "none",
-            "sources": {"target": local, "draft": local},
+            # It links no draft, so its sources name none.
+            "sources": {"target": local},
             "files": {"weight": assembly.file_record(source)},
         }
         (built / "model.json").write_text(json.dumps(record))

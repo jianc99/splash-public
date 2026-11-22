@@ -72,14 +72,14 @@ wall-clock instants on `system_clock`.
 ## Installation
 
 `install/upstream.py` installs a model from its upstream repository: it
-inspects the target, pairs the draft trained for it and decides when to follow
-the Hub. The result is an assembly, a local directory of links to the sources'
-Hub snapshots, published atomically. The other installer modules each own one
+inspects the target, pairs the draft trained for it where its family has one
+and decides when to follow the Hub. The result is an assembly, a local
+directory of links to the sources' Hub snapshots, published atomically. The other installer modules each own one
 part: `hub.py` the sources, the Hub cache and its pins; `assembly.py` the
 assembly layout, its build, verification and garbage collection, and the
-metadata derived from a GGUF; `families.py` each family's draft repository;
-`local.py` the assembly of local files ([Local model files](models.md#local-model-files)),
-which inspects them and publishes them as `upstream.py` does a repository's;
+metadata derived from a GGUF; `families.py` each family's draft repository,
+or none; `local.py` the assembly of local files
+([Local model files](models.md#local-model-files)), which inspects them and publishes them as `upstream.py` does a repository's;
 and `models.py` model IDs, selections, the
 installation lock, the command line (`install/models.py --model ID
 prepare|verify|link|remove`, where `link` prints the selection link) and

@@ -1,5 +1,5 @@
-"""The model families Splash serves, the DFlash2 draft released for each and
-the chat format the server reads and writes each one's output in.
+"""The model families Splash serves, the DFlash2 draft released for each, if
+any, and the chat format the server reads and writes each one's output in.
 
 A target's family is the one the engine finds its configuration to describe,
 by the rules it holds every start to (upstream.check_model), never its
@@ -55,8 +55,11 @@ class ModelFamily:
     name: str
     # The repository of the DFlash2 draft released for the family, as its
     # release publishes it (config.json and BF16 safetensors). Installations
-    # follow its default branch as they follow the target's.
-    draft_repo: str
+    # follow its default branch as they follow the target's. None for a
+    # family no draft of ours is trained for: its installations hold none
+    # unless --draft-model names one, and its models decode without one,
+    # each cycle verifying its anchor and its host chain alone.
+    draft_repo: str | None
     # How the family's model reasons and calls tools, and the tokens it
     # shares with the engine (server/chat_format.py).
     chat_format: ChatFormat

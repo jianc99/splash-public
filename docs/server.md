@@ -17,10 +17,10 @@ such as `nvidia/Qwen3.8-27B-NVFP4` or `unsloth/Qwen3.8-27B-NVFP4`, or a GGUF
 repository and variant, `OWNER/REPO:VARIANT`, such as
 `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.
 Splash identifies the model from its own metadata and pairs the DFlash2 draft
-trained for it. The first serve sets up Python dependencies and downloads the
-model and its draft; each start loads the weights into memory
-([Weight loading](internals.md#weight-loading)), follows the model's revision
-([Revisions](#revisions)) and warms up, the console counting the steps
+trained for it, where its family has one. The first serve sets up Python
+dependencies and downloads the model and its draft, if any; each start loads
+the weights into memory ([Weight loading](internals.md#weight-loading)),
+follows the model's revision ([Revisions](#revisions)) and warms up, the console counting the steps
 (`Warming up · 3 of 11 steps`): the first start after an update also prepares
 the GPU's programs then, which takes a couple of minutes
 ([Warmup and pipelines](internals.md#warmup-and-pipelines)). Splash packages, the prebuilt format of earlier

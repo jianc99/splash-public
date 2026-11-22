@@ -1,5 +1,6 @@
 """Install supported upstream models: a target repository and the draft
-trained for its architecture, as an assembly (assembly.py).
+trained for its architecture, where its family has one, as an assembly
+(assembly.py).
 
 The Hub owns downloads and snapshots; this module inspects the target,
 selects its components and decides when to follow the Hub. The engine owns
@@ -351,7 +352,7 @@ def check_model(target_format, vision_format, config, *, gguf_headers=None, draf
         arguments.append(str(draft))
     name = json.loads(models.run_engine(arguments, "model check"))["family"]
     if (family := families.named(name)) is None:
-        raise models.ModelError(f"no DFlash2 draft is known for the {name} family")
+        raise models.ModelError(f"this release serves no family named {name}")
     return family
 
 
@@ -782,7 +783,7 @@ def _install(selection, repo, installed, draft=None):
         vision = "disabled" if target.vision_format == "none" else "enabled"
         print(
             f"Installing {selection.model} as {target.family.name} ({target.format}); "
-            f"draft {draft.name}; vision {vision}.",
+            f"draft {draft.name if draft else 'none'}; vision {vision}.",
             flush=True,
         )
         downloaded = repo.download(names)
@@ -797,14 +798,18 @@ def _install(selection, repo, installed, draft=None):
 
 def assembly_record(model, target, repo, draft):
     """The record of model's assembly of target, inspected in repo, and the
-    draft repository draft, but for the files it links (publish)."""
+    draft repository draft, or none (its sources then name no draft), but for
+    the files it links (publish)."""
+    sources = {"target": repo.identity()}
+    if draft:
+        sources["draft"] = draft.identity()
     return {
         "version": 1,
         "model": model,
         "family": target.family.name,
         "target_format": target.format,
         "vision_format": target.vision_format,
-        "sources": {"target": repo.identity(), "draft": draft.identity()},
+        "sources": sources,
     }
 
 
@@ -870,19 +875,22 @@ def _file_records(previous, paths):
 
 def _changes(installed, family, draft):
     """What a start changes in a verified assembly of the target's installed
-    commit: the draft, when draft, as this start resolved it, is another
-    repository or commit, or the GGUF metadata, when this release derives it
-    otherwise."""
+    commit: the draft, when draft, as this start resolved it (None for none),
+    is another repository or commit than the recorded one, or the GGUF
+    metadata, when this release derives it otherwise."""
     if family is None:
         return [f"no supported family is named {installed['family']}"]
     changes = []
-    recorded = installed["sources"]["draft"]
-    if draft.identity() != recorded:
-        changes.append(
-            f"{draft.name} moved from {recorded['revision'][:12]} to {draft.revision[:12]}"
-            if draft.name == recorded["repo"]
-            else f"its draft is now {_at(draft)}"
-        )
+    recorded = installed["sources"].get("draft")
+    if (draft and draft.identity()) != recorded:
+        if draft is None:
+            changes.append("it has no draft")
+        elif recorded and draft.name == recorded["repo"]:
+            changes.append(
+                f"{draft.name} moved from {recorded['revision'][:12]} to {draft.revision[:12]}"
+            )
+        else:
+            changes.append(f"its draft is now {_at(draft)}")
     if installed["target_format"] == "gguf" and installed[
         "metadata"
     ] != assembly.metadata_key(installed["files"]):
@@ -895,9 +903,12 @@ def _resolve_draft(family, selection, installed, target):
     release, at its default branch's commit: one Hub request, made only when
     the Hub answered for the target. Otherwise, or when it cannot be
     resolved, the installed draft stands in; without one, a commit the Hub
-    cache holds, else it fails with the target's reason and class."""
+    cache holds, else it fails with the target's reason and class. None for
+    a family that names no draft, without --draft-model."""
     name = selection.draft_model or family.draft_repo
-    recorded = installed and installed["sources"]["draft"]
+    if name is None:
+        return None
+    recorded = installed and installed["sources"].get("draft")
     asked = _answered(target)
     if recorded and not asked:
         return hub.Repository(recorded["repo"], recorded["revision"], frozenset())
@@ -927,10 +938,13 @@ def _draft(target, installed, draft, following=0):
     """The draft repository and its downloaded files, by assembly path: draft,
     as this start resolved it, when it is not the installed draft, or else
     the installed one, which is kept too when draft cannot be fetched
-    (downloaded and checked for the target). following is the bytes of the
-    downloads after it (Repository.download's reserve)."""
+    (downloaded and checked for the target); none and no files without a
+    draft. following is the bytes of the downloads after it
+    (Repository.download's reserve)."""
+    if draft is None:
+        return None, {}
     family = target.family
-    recorded = installed and installed["sources"]["draft"]
+    recorded = installed and installed["sources"].get("draft")
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):

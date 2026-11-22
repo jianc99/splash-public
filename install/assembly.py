@@ -25,7 +25,8 @@ The paths an assembly links, and what reads each:
                          the DFlash2 checkpoint (ModelDescriptor.mm,
                          DraftCheckpoint.cpp), with the mask token's
                          embedding, draft/mask_embedding.safetensors, when
-                         the release ships one
+                         the release ships one; none for a model without a
+                         draft, whose record's sources name none
   vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
@@ -174,6 +175,10 @@ def _well_formed(record):
     gguf_target = record.get("target_format") == "gguf"
     sources = record.get("sources")
     files = record.get("files")
+    # Its sources name a draft exactly where it links one.
+    drafted = isinstance(files, dict) and any(
+        name.startswith("draft/") for name in files
+    )
     return (
         set(record) == RECORD_KEYS | ({"metadata"} if gguf_target else set())
         and type(record["version"]) is int
@@ -184,7 +189,7 @@ def _well_formed(record):
         and record["vision_format"] in VISION_FORMATS
         and (not gguf_target or models.is_hex_digest(record["metadata"], 64))
         and isinstance(sources, dict)
-        and set(sources) == {"target", "draft"}
+        and set(sources) == {"target"} | ({"draft"} if drafted else set())
         and all(
             isinstance(source, dict)
             and set(source) == {"repo", "revision"}
@@ -276,12 +281,14 @@ def family(path: Path):
 
 
 def vocabulary(path: Path) -> int:
-    """The vocabulary the assembly path names serves: its DFlash2 draft's
-    (draft/config.json), which the engine refuses unless it is its target's
-    (ModelDescriptor.mm readDraftLayout)."""
-    size = models.read_json(Path(path) / "draft/config.json").get("vocab_size")
+    """The vocabulary the assembly path names serves: its target's, as its
+    config.json states it, under text_config or, in a flat config, at its
+    root (ModelDescriptor.mm describeSourceModel), which a draft's equals
+    (readDraftLayout)."""
+    config = models.read_json(Path(path) / "config.json")
+    size = config.get("text_config", config).get("vocab_size")
     if type(size) is not int or size <= 0:
-        raise models.ModelError(f"{path}/draft/config.json names no vocabulary size")
+        raise models.ModelError(f"{path}/config.json names no vocabulary size")
     return size
 
 

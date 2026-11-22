@@ -17,14 +17,14 @@ a family's arrays) and each tensor's presence, type and shape. The target's
 text configuration is checked before its vision tower (a GGUF's projector, an
 MLX target's processor and the shards holding its tower) and the tower's
 configuration, so a model of no family Splash serves is told so whatever its
-tower, and the check runs again with the draft's `config.json` once the
-family's draft is chosen.
+tower, and the check runs again with the draft's `config.json` once a draft
+is chosen, where the model has one.
 A GGUF that holds most of its values unquantized is refused first
 (`gguf.require_quantized`, [GGUF targets](#gguf-targets)), and a model the
 engine refuses with its reason; no weight file is downloaded for either. An MLX
 target's tensor shapes, and an MLX vision tower's weights, which must not be
 quantized (`VisionLoader.cpp`), are checked only when the model loads.
-`families.FAMILIES` names the draft trained for each family; repository names
+`families.FAMILIES` names the draft trained for each family that has one; repository names
 and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
@@ -303,9 +303,11 @@ inputs (next-token KL 2.8e-4 against bf16, 13-16% less time a decode cycle on a
 
 ## Drafts
 
-Every model decodes with a DFlash2 draft. Each family names the repository
-of the DFlash2 checkpoint trained for it (`families.FAMILIES`), which holds
-it as the release publishes it: `config.json` and BF16 `model.safetensors`
+A model decodes with a DFlash2 draft, its family's or the one `--draft-model`
+names, and without one where neither names one. Each family with a draft
+names the repository of the DFlash2 checkpoint trained for it
+(`families.FAMILIES`, `None` for a family no draft of ours is trained for),
+which holds it as the release publishes it: `config.json` and BF16 `model.safetensors`
 (or the shards its index names), and `mask_embedding.safetensors` when the
 release ships its mask token's embedding. Installation downloads only those files and follows the repository's default
 branch as it follows the target's ([Revisions](server.md#revisions)); `--draft-model`
@@ -313,6 +315,22 @@ accepts another repository, followed the same way, or a local directory that
 holds them. A checkpoint is installed only when the engine accepts its
 configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads.
+
+A model without a draft (of a family that names none, installed without
+`--draft-model`) has no `draft/` in its installation, and its record names
+no draft source. It loads no draft, its lanes and cached states keep no
+draft rings or context window, and its target captures no layer for one.
+Its cycles are those below with no tree of a draft's: a lane verifies its
+anchor and its host chain alone (its lookup chain, or the tokens a grammar
+or a thinking end forces), a tree the host writes whole before the cycle as
+the selector grows a chain of no draft children, and the cycle's one GPU
+step before the target lays out the step's rows from it
+(`draft_verify_rows`). A lane without a chain verifies its anchor alone,
+the target's plain decode; the step costs weigh the chain's chances alone,
+and lookup tokens are estimated at their rate of no known agreement. The
+decode warmups and the steps whose costs a start measures fill each lane
+with a forced chain of its anchor's successors by id, as a draft's trees
+fill them, so that the table prices rows that belong to a lane.
 
 A draft's `config.json` states its layers, intermediate size, rotary base and
 the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
@@ -333,7 +351,7 @@ A quantized table can lose the row: Qwen3.5-122B-A10B's is of order 1e-6,
 below what the fp16 block scales of Q8_0 and the K-quants hold, so its GGUFs
 read zeros there: on an M5 Max serving unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL
 with every row verified, its draft accepted 2.3 tokens a cycle on code
-without the embedding, 4.7 with it. Every family loads and runs its draft
+without the embedding, 4.7 with it. Every model with a draft loads and runs it
 alike: a decode cycle drafts eight rows, the anchor and seven proposal
 positions, and the target verifies a tree of the draft's candidates at those
 positions and of its host chain (below), as many of its rows as the cycle's
@@ -798,9 +816,9 @@ name; it selects no files and makes no Hub request in this mode. Preparation
 never contacts the Hub, whether or not `--offline` is set. `--draft-model`
 must name a local compatible DFlash2 draft directory; without one, the
 family's released draft must already be in the Hub cache at the commit its
-default branch records, as `hf download REPO` or `splash serve` leaves it. A
-missing draft is refused with its download instruction; it is never downloaded
-implicitly.
+default branch records, as `hf download REPO` or `splash serve` leaves it (a
+family released without a draft needs none). A missing draft is refused with
+its download instruction; it is never downloaded implicitly.
 
 `--mmproj` supplies a local BF16, F32 or F16 GGUF vision projector. Without
 one, a GGUF serves text only. An MLX target uses its own vision tower unless
