@@ -21,19 +21,12 @@ namespace splash::engine {
 inline constexpr uint64_t kMiB = 1024ULL * 1024;
 inline constexpr uint64_t kGiB = 1024ULL * 1024 * 1024;
 
-// The pages of the KV runway in extents of extentPages pages: the whole
-// extents that hold the pages startup warmup runs on, which the KV pool
-// allocates when it is built.
-[[nodiscard]] constexpr uint64_t kvRunwayPages(uint32_t extentPages) noexcept {
-  return (uint64_t{model::ExecutionLimits::warmupKvPages} + extentPages - 1) /
-         extentPages * extentPages;
-}
-
 // What one request needs at the least: the fixed bytes, one lane's state and
-// the KV runway (smallest extents, lookup index too); nullopt on overflow.
+// the KV runway of `lanes` lanes (smallest extents, lookup index too);
+// nullopt on overflow.
 [[nodiscard]] std::optional<uint64_t>
 minimumRequiredBytes(uint64_t fixedBytes, uint64_t laneStateBytes,
-                     const kv::Layout &layout) noexcept;
+                     const kv::Layout &layout, uint32_t lanes) noexcept;
 
 // One request's KV capacity, in pages, of a budget of `pages` pages: the
 // whole extents of the size a pool of them takes (kv::Layout::extentPagesFor).
@@ -276,7 +269,9 @@ struct EngineMemoryBreakdown {
   uint64_t targetWeightsBytes = 0;
   uint64_t draftWeightsBytes = 0;
   uint64_t visionWeightsBytes = 0;
-  uint32_t maximumBatchWidth = model::ExecutionLimits::maximumBatchWidth;
+  // The lanes and the default's context (EngineMemoryPlan::compareDefaultLanes).
+  uint32_t maximumBatchWidth = model::ExecutionLimits::defaultLanes;
+  uint32_t defaultLanesContextTokens = 0;
   uint64_t laneStateBytes = 0;
   uint64_t sharedPrefillBytes = 0;
   uint64_t sharedDecodeBytes = 0;
@@ -400,6 +395,13 @@ public:
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept;
   // What admission decides which requests spill by (EngineSpillConfig).
   [[nodiscard]] SpillGeometry spillGeometry() const noexcept;
+  // Takes the context a first start of `defaultLanes`, the plan of the
+  // default's lanes, would serve, its most capped by `askedTokens`
+  // (--max-context, none uncapped), where it is more than `servedTokens`,
+  // this start's (EngineMemoryBreakdown::defaultLanesContextTokens), and
+  // returns it.
+  uint32_t compareDefaultLanes(const EngineMemoryPlan &defaultLanes, uint32_t servedTokens,
+                               uint32_t askedTokens) noexcept;
 
   // The plan as /status reports it (memory_plan): the device, the model and
   // the budget.

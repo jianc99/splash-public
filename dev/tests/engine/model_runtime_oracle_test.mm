@@ -44,6 +44,7 @@
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -52,6 +53,7 @@
 #include <optional>
 #include <random>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1006,8 +1008,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
               "full-lane resume setup failed");
       executor.suspend(text.id);
     }
-    for (uint32_t lane = 0; lane < model::ExecutionLimits::maximumBatchWidth;
-         ++lane) {
+    for (uint32_t lane = 0; lane < executor.commandLimits().lanes; ++lane) {
       text.id = 100 + lane;
       require(executor.begin(text.modelView()).granted(),
               "full-lane image setup failed");
@@ -1022,8 +1023,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                 backend.memoryStats().allocatedBytes == before,
             "full execution lanes attempted image memory admission");
     fault = {};
-    for (uint32_t lane = 0; lane < model::ExecutionLimits::maximumBatchWidth;
-         ++lane)
+    for (uint32_t lane = 0; lane < executor.commandLimits().lanes; ++lane)
       executor.end(100 + lane);
     require((resume ? executor.resume(image.modelView())
                     : executor.begin(image.modelView())).granted(),
@@ -3706,7 +3706,7 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
   };
   // Held for the check's lifetime: an item's page table is a view.
   std::vector<std::vector<uint32_t>> pageTables;
-  for (uint32_t request = 0; request < model::ExecutionLimits::maximumBatchWidth; ++request)
+  for (uint32_t request = 0; request < executor.commandLimits().lanes; ++request)
     pageTables.push_back(pageRange(40 + 6 * request, 6));
   const auto pages = [&](uint32_t request) -> const std::vector<uint32_t> & { return pageTables[request]; };
   // A batch's tokens per request and cycle, and each request's committed
@@ -3749,7 +3749,7 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
     for (uint32_t request = 0; request < width; ++request) executor.end(700 + request);
     return batch;
   };
-  for (const uint32_t width : {2U, 3U, 4U}) {
+  for (uint32_t width = 2; width <= executor.commandLimits().lanes; ++width) {
     const std::string label = "B" + std::to_string(width);
     const Batch ordered = decodeBatch(width, false, label);
     const Batch reversed = decodeBatch(width, true, label + " in reversed lanes");
@@ -3759,7 +3759,7 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
       requireSameCommittedState(ordered.committed[request], reversed.committed[request], which + " in two lanes");
     }
   }
-  std::cout << "batched_lanes_reordered=PASS widths=2,3,4\n";
+  std::cout << "batched_lanes_reordered=PASS widths=2-" << executor.commandLimits().lanes << '\n';
 }
 
 // Lanes whose prompts end in one prefill command, as a batch's do when it
@@ -3773,10 +3773,10 @@ void requireBatchedLanesMatchReordered(model::Runtime &executor, const model::Qw
 void requirePromptEndsShareOneHead(model::Runtime &executor, std::span<const uint32_t> seed) {
   constexpr uint32_t kPromptTokens = 40;
   const std::vector<uint32_t> options{11, 220, 1683};
-  const std::array<std::vector<uint32_t>, 4> pages{pageRange(80, 2), pageRange(82, 2), pageRange(84, 2),
-                                                   pageRange(86, 2)};
+  std::vector<std::vector<uint32_t>> pages;
+  for (uint32_t lane = 0; lane < executor.commandLimits().lanes; ++lane) pages.push_back(pageRange(80 + 2 * lane, 2));
   uint64_t id = 780;
-  for (const uint32_t width : {2U, 3U, 4U}) {
+  for (uint32_t width = 2; width <= executor.commandLimits().lanes; ++width) {
     std::vector<uint32_t> prompt(kPromptTokens);
     for (uint32_t index = 0; index < kPromptTokens; ++index) prompt[index] = seed[(index + 13 * width) % seed.size()];
     for (const bool scoring : {false, true}) {
@@ -3812,7 +3812,7 @@ void requirePromptEndsShareOneHead(model::Runtime &executor, std::span<const uin
       for (const ModelBatchItem &item : items) executor.end(item.requestId);
     }
   }
-  std::cout << "prompt_ends_share_one_head=PASS widths=2,3,4\n";
+  std::cout << "prompt_ends_share_one_head=PASS widths=2-" << executor.commandLimits().lanes << '\n';
 }
 
 // The decoded index fixture (requireDecodedIndexMatchesPrefill): a prompt of
@@ -4614,11 +4614,11 @@ private:
 
 // A lane whose retained path branches commits what its step stored for the
 // path's rows and what decoding its tokens one row a cycle, a chain, commits.
-// Two, three and four constrained greedy lanes end their prompts two tokens
-// before a page boundary and decode a step of sixteen rows a lane: each
-// lane's masks force its selections down its tree's path through a row's
-// second child, as deep as the tree goes, so the path branches and the path
-// commit moves its rows' K/V across the boundary; each lane captures its
+// Two up to the runtime's lanes of constrained greedy lanes end their prompts
+// two tokens before a page boundary and decode a step of sixteen rows a lane:
+// each lane's masks force its selections down its tree's path through a
+// row's second child, as deep as the tree goes, so the path branches and the
+// path commit moves its rows' K/V across the boundary; each lane captures its
 // state at the boundary where the target captures in decode
 // (Runtime::capturesInDecode).
 // The K/V, bit for bit: the path commit copies a path's rows with their int8
@@ -4714,7 +4714,7 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const kv::PageSto
   };
   double nextLeast = 1.0, nextTwinLeast = 1.0, restoredLeast = 1.0, restoredTwinLeast = 1.0;
   uint64_t comparedRows = 0, movedRows = 0;
-  for (const uint32_t width : {2U, 3U, 4U}) {
+  for (uint32_t width = 2; width <= executor.commandLimits().lanes; ++width) {
     const std::string label = "branched paths B" + std::to_string(width);
     // Each lane's tree as its mask request gave it: its rows' tokens and
     // parents.
@@ -4842,7 +4842,8 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const kv::PageSto
     // selection forced to the branched lane's next token, on pages past every
     // lane's, whose K/V the restores read.
     for (const Lane &original : branched) {
-      std::vector<Lane> chained{paths.start(1010 + original.index, original.index, 0, pageRange(120, 2))};
+      std::vector<Lane> chained{paths.start(1010 + original.index, original.index, 0,
+                                            pageRange(100 + 4 * executor.commandLimits().lanes, 2))};
       model::RuntimeInstrumentation::forceStepRows(executor, 1);
       while (chained.front().position + 1 < original.position)
         paths.cycle(chained, true, [&](const Lane &lane, const ModelMaskRequest &request) {
@@ -4875,7 +4876,7 @@ void requireBranchedPathsMatchChains(model::Runtime &executor, const kv::PageSto
       }
     }
   }
-  std::cout << "branched_paths_match_chains=PASS widths=2,3,4" << (captures ? "" : " (no decode captures)")
+  std::cout << "branched_paths_match_chains=PASS widths=2-" << executor.commandLimits().lanes << (captures ? "" : " (no decode captures)")
             << " kv_rows=" << comparedRows << " kv_moved=" << movedRows << " first_layer=" << (gdn.layers ? "gdn" : "attention")
             << " largest_gap=" << largestGap << " next_least_cosine=" << nextLeast << '/' << nextTwinLeast;
   if (captures) std::cout << " restored_least_cosine=" << restoredLeast << '/' << restoredTwinLeast;
@@ -4954,7 +4955,8 @@ void requirePathsIgnoreTheirSiblings(model::Runtime &executor, metal::MetalBacke
     const bool selects = boundary != kv::kPageTokens;
     const uint32_t lanePages = (boundary + model::ExecutionLimits::targetVerifyRows) / kv::kPageTokens + 1;
     const uint32_t firstPage = boundary == kv::kPageTokens ? 100 : 0;
-    for (const uint32_t lanesWide : boundary == kv::kPageTokens ? std::vector<uint32_t>{2, 3, 4} : std::vector<uint32_t>{2}) {
+    const uint32_t mostLanes = boundary == kv::kPageTokens ? executor.commandLimits().lanes : 2;
+    for (uint32_t lanesWide = 2; lanesWide <= mostLanes; ++lanesWide) {
       const std::string label = "sibling paths B" + std::to_string(lanesWide) +
                                 (boundary == kv::kPageTokens ? "" : " at " + std::to_string(lanes.promptTokens()) + " tokens");
       require(firstPage + lanePages * lanesWide <= pages.pageCount(), label + ": the KV pool cannot hold the lanes");
@@ -5134,8 +5136,9 @@ void requirePathsIgnoreTheirSiblings(model::Runtime &executor, metal::MetalBacke
       }
     }
   }
-  std::cout << "paths_ignore_siblings=PASS widths=2,3,4" << (executor.capturesInDecode() ? "" : " (no decode captures)")
-            << " path_rows=" << pathRows << " replaced_rows=" << replacedRows;
+  std::cout << "paths_ignore_siblings=PASS widths=2-" << executor.commandLimits().lanes
+            << (executor.capturesInDecode() ? "" : " (no decode captures)") << " path_rows=" << pathRows
+            << " replaced_rows=" << replacedRows;
   if (sparse)
     std::cout << " sparse_widths=2 selected_rows=" << selectedRows << " largest_gap=" << largestGap
               << " rows_least_cosine=" << rowsLeast << " next_least_cosine=" << nextLeast;
@@ -5568,8 +5571,19 @@ void requireBudgetedCyclesAreWellFormed(model::Runtime &executor, const model::Q
   constexpr uint32_t kRows = model::ExecutionLimits::targetVerifyRows;
   constexpr uint32_t kCycles = model::VerifyBudget::kRefitCycles + 1;
   const auto warmupsStarted = std::chrono::steady_clock::now();
-  for (uint32_t width = 1; width <= model::ExecutionLimits::maximumBatchWidth; ++width)
+  for (uint32_t width = 1; width <= executor.commandLimits().lanes; ++width) {
     static_cast<void>(executor.warmupDecodeBatch(width));
+    // A warmup forces a draft's block a lane, which past four lanes is more
+    // than a streamed store's round: it verifies no more than the round, as
+    // every step --verify-rows auto chooses for a target whose experts
+    // stream.
+    uint32_t verified = 0;
+    for (uint32_t lane = 0; lane < width; ++lane)
+      verified += model::RuntimeInstrumentation::lastVerifyRows(executor, lane);
+    require(!streamed || verified <= model::ExpertStore::cycleRows(),
+            "a decode warmup of " + std::to_string(width) + " lanes verified " + std::to_string(verified) +
+                " rows, past its expert store's round");
+  }
   const double warmupSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - warmupsStarted).count();
   struct Lane final {
     EngineRequest request;
@@ -6792,7 +6806,7 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
     require(prefill.lanes[0].step.finished &&
                 prefill.lanes[0].step.outputTokensWithoutKv == 1,
             "EOS fixture did not terminate synthetic prefill");
-    for (uint32_t width = 1; width <= 4; ++width) {
+    for (uint32_t width = 1; width <= executor.commandLimits().lanes; ++width) {
       const auto result = executor.warmupDecodeBatch(width);
       require(result.lanes.size() == width,
               "prefill EOS skipped the actual decode warmup");
@@ -6837,6 +6851,11 @@ int main(int argc, char **argv) {
     // serve's option serves it: with YaRN past the native window
     // (model::servedFor).
     uint32_t maxContext = 0;
+    // --lanes N: the runtime's lanes, as splash serve's
+    // --max-concurrent-requests sets them, four to eight: its lane checks run
+    // every width up to them, and its other checks place requests in four
+    // state lanes.
+    uint32_t lanes = model::ExecutionLimits::defaultLanes;
     // The evaluation of the split's program that fails, counted from 1 as
     // ane::ProgramInstrumentation counts them; 0 for none.
     uint64_t aneFfnFault = 0;
@@ -6862,7 +6881,7 @@ int main(int argc, char **argv) {
       fail("usage: model-runtime-oracle METALLIB MODEL_ROOT [--kv-format int8|bf16] [--state-format fp32|bf16] "
            "[--cached-states int8|exact] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
-           "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
+           "[--expert-memory SIZE] [--max-context TOKENS] [--lanes N] [--spill-tokens N] [--spill-window PAGES] "
            "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only | "
            "--siblings-only]");
     for (int i = 3; i < argc; ++i) {
@@ -6916,6 +6935,15 @@ int main(int argc, char **argv) {
         if (end == value || *end || !parsed || parsed > kv::kMaximumLogicalTokens)
           fail("--max-context takes a token count");
         maxContext = static_cast<uint32_t>(parsed);
+      } else if (option == "--lanes" && i + 1 < argc) {
+        const char *value = argv[++i];
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        if (end == value || *end || parsed < model::ExecutionLimits::defaultLanes ||
+            parsed > model::ExecutionLimits::maximumBatchWidth)
+          fail("--lanes takes " + std::to_string(model::ExecutionLimits::defaultLanes) + " to " +
+               std::to_string(model::ExecutionLimits::maximumBatchWidth));
+        lanes = static_cast<uint32_t>(parsed);
       } else fail("unknown model-runtime-oracle option");
     }
     metal::MetalBackend backend(argv[1]);
@@ -6963,8 +6991,8 @@ int main(int argc, char **argv) {
     if (loadOptions.streamedTableBytes)
       std::cout << "ple_memory=" << (model.streamedTable() ? "streamed" : "ignored") << '\n';
     ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
-    model::ModelMemoryPlan executorPlan =
-        model::plannedRuntimeMemory(model, operators, format, stateFormat, model::StreamedParts::loaded(model));
+    model::ModelMemoryPlan executorPlan = model::plannedRuntimeMemory(model, operators, format, stateFormat,
+                                                                      model::StreamedParts::loaded(model), lanes);
     // The memory plan with `aneFfnBytes` set aside for the prefill FFN's
     // Neural Engine split.
     const auto planMemory = [&](uint64_t aneFfnBytes) {
@@ -7010,12 +7038,13 @@ int main(int argc, char **argv) {
       return 0;
     }
 
-    // A pool of 128 pages, or the smallest extent if larger, and, where the
+    // A pool of 64 pages and 16 a lane, 128 at the default's four, or the
+    // smallest extent if larger, and, where the
     // target's experts stream, the prefill group fixture's pages, and with a
     // block index the decoded index fixture's, in whole extents of the size
     // the memory plan would pick for it.
     const kv::Layout kvLayout = model.targetKvLayout(format);
-    const uint32_t budgetPages = std::max({128U, kvLayout.minimumExtentPages(),
+    const uint32_t budgetPages = std::max({64 + 16 * lanes, kvLayout.minimumExtentPages(),
                                            model.expertStore() ? kGroupFixtureRows / kv::kPageTokens : 0U,
                                            kvLayout.indexDimension ? kDecodedIndexPages : 0U});
     const uint32_t extentPages = kvLayout.extentPagesFor(budgetPages);
@@ -7032,7 +7061,7 @@ int main(int argc, char **argv) {
     constexpr uint64_t kMostCachedStates = 6;
     const model::CompositeStateLayout stateLayout = model.stateLayout(stateFormat, !exactCachedStates);
     const uint64_t pageBytes = kvLayout.bytesPerModelPage();
-    const uint64_t checksBytes = model::ExecutionLimits::maximumBatchWidth * stateLayout.laneBytes() +
+    const uint64_t checksBytes = uint64_t{lanes} * stateLayout.laneBytes() +
                                  kMostCachedStates * stateLayout.cachedBytes() + uint64_t{pageCount} * pageBytes;
     const auto checksContext = static_cast<uint32_t>(
         (checksBytes - stateLayout.laneBytes() + pageBytes - 1) / pageBytes * kv::kPageTokens);
@@ -7127,6 +7156,7 @@ int main(int argc, char **argv) {
         backend, admission, model.stateLayout(stateFormat, !exactCachedStates),
         std::make_shared<model::SlotFile>(stateSlotBytes, std::make_shared<model::DiskBudget>(2 * stateSlotBytes)));
     model::RuntimeContext context{backend, model, pages, states, operators, aneFfn.get()};
+    context.lanes = lanes;
     // The checks compare runs of one schedule bit for bit, which a draft's
     // block a lane (--verify-rows all) keeps comparable on a MoE target: the
     // rows --verify-rows auto chooses follow the costs the start measured and
@@ -9228,40 +9258,34 @@ int main(int argc, char **argv) {
                     model::ExecutionLimits::prefillTokenBudget,
             "prefill warmup omitted production wall time or its deterministic result");
     const auto decodeWarmupsStarted = std::chrono::steady_clock::now();
-    model::WarmupStepResult batch1 = executor.warmupDecodeBatch(1);
-    model::WarmupStepResult batch2 = executor.warmupDecodeBatch(2);
-    model::WarmupStepResult batch3 = executor.warmupDecodeBatch(3);
-    model::WarmupStepResult batch4 = executor.warmupDecodeBatch(4);
+    // A decode warmup of each width up to the runtime's lanes, the widest's
+    // repeated.
+    std::vector<model::WarmupStepResult> batches;
+    for (uint32_t width = 1; width <= lanes; ++width) batches.push_back(executor.warmupDecodeBatch(width));
     const double decodeWarmupSeconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - decodeWarmupsStarted).count();
-    require(batch2.wallSeconds > 0.0,
-            "real B2 decode warmup did not report timing");
-    require(batch3.wallSeconds > 0.0,
-            "real B3 decode warmup did not report timing");
-    require(batch4.wallSeconds > 0.0,
-            "real B4 decode warmup did not report timing");
-    const std::array batches{&batch1, &batch2, &batch3, &batch4};
     for (size_t laneCount = 1; laneCount <= batches.size(); ++laneCount) {
-      const auto &batch = *batches[laneCount - 1];
+      const auto &batch = batches[laneCount - 1];
+      require(laneCount == 1 || batch.wallSeconds > 0.0,
+              "real B" + std::to_string(laneCount) + " decode warmup did not report timing");
       require(batch.lanes.size() == laneCount,
               "decode warmup omitted a batch-plan lane result");
       for (const auto &lane : batch.lanes)
         require(!lane.step.outputTokens.empty() && lane.committedTokens > 1,
                 "decode warmup omitted its committed deterministic result");
     }
-    const model::ModelTelemetry b4Telemetry =
+    const model::WarmupStepResult &widest = batches.back();
+    const model::ModelTelemetry widestTelemetry =
         executor.telemetry();
-    require(batch4.wallSeconds >= b4Telemetry.lastDecodeWallSeconds,
+    require(widest.wallSeconds >= widestTelemetry.lastDecodeWallSeconds,
             "decode warmup excluded production work from phase wall time");
-    const auto repeatedBatch4 = executor.warmupDecodeBatch(4);
-    require(repeatedBatch4.lanes == batch4.lanes,
-            "repeated baseline B4 decode changed its deterministic result");
-    std::cout << "prefill_2048_wall_seconds=" << prefillWarmup.wallSeconds
-              << " b1_cycle_wall_seconds=" << batch1.wallSeconds
-              << " b2_cycle_wall_seconds=" << batch2.wallSeconds
-              << " b3_cycle_wall_seconds=" << batch3.wallSeconds
-              << " b4_cycle_wall_seconds=" << batch4.wallSeconds << " decode_warmups_seconds=" << decodeWarmupSeconds
-              << '\n';
+    const auto repeatedWidest = executor.warmupDecodeBatch(lanes);
+    require(repeatedWidest.lanes == widest.lanes,
+            "repeated baseline B" + std::to_string(lanes) + " decode changed its deterministic result");
+    std::cout << "prefill_2048_wall_seconds=" << prefillWarmup.wallSeconds;
+    for (size_t laneCount = 1; laneCount <= batches.size(); ++laneCount)
+      std::cout << " b" << laneCount << "_cycle_wall_seconds=" << batches[laneCount - 1].wallSeconds;
+    std::cout << " decode_warmups_seconds=" << decodeWarmupSeconds << '\n';
     model::WarmupStepResult historical =
         executor.warmupCompositeStateRestore();
     require(historical.wallSeconds > 0.0,
@@ -9280,15 +9304,12 @@ int main(int argc, char **argv) {
             "an armed fault did not stop the split once");
     // --verify-rows auto's cycles, on a runtime of their own admitted in the
     // main one's place, whose decode warmups measure every lane count's step
-    // costs and remember those whose replays were steady; then a start that
-    // recalls them, which measures only the lane counts it did not recall.
-    // Which lane counts a start keeps is the runtime's decision by its replays'
-    // spread (StepCosts::kSteadySpread), a timing: the checks hold the
-    // mechanism, each lane count remembered at most once and only where
-    // measured, and print how many were kept. The 64 GB M5 Pro's
-    // Qwen3.6-35B-A3B read four lanes' replays 23.4% apart inside one oracle
-    // run (11-19), where an idle start reads them within 13%.
-    constexpr uint32_t kWidths = model::ExecutionLimits::maximumBatchWidth;
+    // costs and remember each; then starts that recall them, which check
+    // their level once and measure them all again only where that check
+    // finds them stale (StepCosts::stale). The checks hold the rule, not a
+    // timing: what a start measures follows the level the runtime reports.
+    // Every lane count the runtime runs.
+    const uint32_t kWidths = lanes;
     std::unordered_map<uint32_t, std::string> remembered;
     // The times each lane count was remembered since the last start.
     std::unordered_map<uint32_t, uint32_t> remembers;
@@ -9301,6 +9322,7 @@ int main(int argc, char **argv) {
       remembered[lanes] = line;
       ++remembers[lanes];
     };
+    context.forgetStepCosts = [&](uint32_t lanes) { remembered.erase(lanes); };
     // Whether the runtime holds a cost of every point of a lane count's
     // steps: measured, or recalled from a line of costs.
     const auto measured = [&](uint32_t lanes) {
@@ -9326,58 +9348,90 @@ int main(int argc, char **argv) {
       std::cout << "streamed_cost_line=PASS\n";
     }
     for (uint32_t lanes = 1; lanes <= kWidths && !streamed; ++lanes)
-      require(measured(lanes) && remembers[lanes] <= 1,
-              "the decode warmups did not measure " + std::to_string(lanes) +
-                  " lanes' step costs, or remembered them more than once");
-    if (!streamed)
-      std::cout << "remembered_step_costs=" << remembered.size() << " of " << kWidths << '\n';
-    // A start that recalls its table measures only the lane counts it did not
-    // recall (none to recall where its experts stream).
+      require(measured(lanes) && remembers[lanes] == 1,
+              "the decode warmups did not measure and remember " + std::to_string(lanes) + " lanes' step costs");
     if (!streamed) {
       const std::unordered_map<uint32_t, std::string> first = remembered;
-      remembers.clear();
-      budgeted();
-      // Each lane count's points as the start recalled them.
-      std::array<std::vector<model::StepCosts::Point>, kWidths + 1> recalled;
-      for (uint32_t lanes = 1; lanes <= kWidths; ++lanes) {
-        recalled[lanes] = model::RuntimeInstrumentation::stepPoints(*runtime, lanes);
-        require(measured(lanes) == first.contains(lanes),
-                "a start did not recall exactly the lane counts remembered (" + std::to_string(lanes) + " lanes)");
-      }
-      const auto recalledStarted = std::chrono::steady_clock::now();
-      for (uint32_t width = 1; width <= kWidths; ++width)
-        static_cast<void>(runtime->warmupDecodeBatch(width));
-      const double recalledSeconds =
-          std::chrono::duration<double>(std::chrono::steady_clock::now() - recalledStarted).count();
-      const auto same = [](const model::StepCosts::Point &a, const model::StepCosts::Point &b) {
-        return a.first == b.first && a.last == b.last && a.cap == b.cap && a.milliseconds == b.milliseconds &&
-               a.rises == b.rises;
-      };
-      for (uint32_t lanes = 1; lanes <= kWidths; ++lanes) {
-        const std::vector<model::StepCosts::Point> points = model::RuntimeInstrumentation::stepPoints(*runtime, lanes);
-        if (first.contains(lanes))
-          require(std::ranges::equal(points, recalled[lanes], same) && !remembers[lanes] &&
-                      remembered.at(lanes) == first.at(lanes),
-                  "a start that recalled " + std::to_string(lanes) + " lanes' step costs measured them again");
-        else
-          require(measured(lanes) && remembers[lanes] <= 1,
-                  "a start that recalled no step costs of " + std::to_string(lanes) +
-                      " lanes did not measure them, or remembered them more than once");
-      }
-      // That start's runtime has served no cycle: its cost of history is none.
-      requireServedCyclesTeachHistoryCost(*runtime, samplingSeedTokens);
-      // A remembered line of a point at no cost, or of points another build's
-      // classes made: a start measures the lane count again and keeps its line.
-      for (const std::string_view stale : {std::string_view("2:8:-1"), std::string_view("8:8:20 16:16:30")}) {
-        remembered[1] = stale;
+      // A start that warms one lane up to `widths`, as a start whose memory
+      // affords no more does.
+      const auto warmups = [&](uint32_t widths = 0) {
         remembers.clear();
         budgeted();
-        for (uint32_t width = 1; width <= kWidths; ++width)
+        for (uint32_t width = 1; width <= (widths ? widths : kWidths); ++width)
           static_cast<void>(runtime->warmupDecodeBatch(width));
-        require(measured(1) && remembers[1] <= 1 && (remembered[1] == stale) == !remembers[1],
-                "a start that recalled a line of no step's cost did not measure it again, or remembered "
-                "what it did not keep");
+      };
+      // A start that recalls every lane count checks their level once and
+      // measures them all again exactly where the check found them stale
+      // (its step more than kStale cheaper than the table), else none.
+      const auto followsTheRule = [&](const std::unordered_map<uint32_t, std::string> &recalled,
+                                      const std::string &what) {
+        const std::optional<double> level = model::RuntimeInstrumentation::levelRatio(*runtime);
+        require(level.has_value(), what + " did not check their level");
+        const bool stale = model::StepCosts::stale(*level);
+        for (uint32_t lanes = 1; lanes <= kWidths; ++lanes)
+          require(measured(lanes) && remembers[lanes] == (stale ? 1U : 0U) &&
+                      (remembered.at(lanes) != recalled.at(lanes)) == stale,
+                  what + (stale ? " found them stale and did not measure " : " found them level and measured ") +
+                      std::to_string(lanes) + " lanes again");
+        return *level;
+      };
+      const auto recalledStarted = std::chrono::steady_clock::now();
+      warmups();
+      const double recalledSeconds =
+          std::chrono::duration<double>(std::chrono::steady_clock::now() - recalledStarted).count();
+      std::cout << "step_costs_level_ratio=" << followsTheRule(first, "a start that recalled its step costs") << '\n';
+      // That start's runtime has served no cycle: its cost of history is none.
+      requireServedCyclesTeachHistoryCost(*runtime, samplingSeedTokens);
+      // Tables remembered at twice their cost, as a start on a busy Mac would
+      // measure them: the next start finds them stale, as no Mac halves its
+      // speed between two starts of one run, and measures them all again.
+      for (auto &[lanes, line] : remembered) {
+        std::istringstream text(first.at(lanes));
+        std::ostringstream doubled;
+        doubled << std::setprecision(9);
+        for (std::string point; text >> point;) {
+          const size_t colon = point.rfind(':');
+          doubled << (doubled.tellp() > 0 ? " " : "") << point.substr(0, colon + 1) << 2.0 * std::stod(point.substr(colon + 1));
+        }
+        line = doubled.str();
       }
+      const std::unordered_map<uint32_t, std::string> slowed = remembered;
+      warmups();
+      const double slowedLevel = followsTheRule(slowed, "a start that recalled tables twice their cost");
+      require(model::StepCosts::stale(slowedLevel), "a start that recalled tables twice their cost found them level");
+      std::cout << "step_costs_slowed_ratio=" << slowedLevel << '\n';
+      // The kept tables are one start's. A start that warms a width the kept
+      // set has no table for measures every width it warms and replaces the
+      // set; one that finds them stale replaces it too, so the tables of
+      // widths it does not warm go.
+      if (kWidths > 1) {
+        remembered.erase(kWidths);
+        warmups();
+        for (uint32_t lanes = 1; lanes <= kWidths; ++lanes)
+          require(measured(lanes) && remembers[lanes] == 1,
+                  "a start that warmed past the kept tables did not measure and remember " + std::to_string(lanes) +
+                      " lanes again");
+        for (auto &[lanes, line] : remembered) line = slowed.at(lanes);
+        warmups(kWidths - 1);
+        const std::optional<double> level = model::RuntimeInstrumentation::levelRatio(*runtime);
+        require(level && model::StepCosts::stale(*level) && !remembered.contains(kWidths),
+                "a start of fewer widths that recalled tables twice their cost kept the table of " +
+                    std::to_string(kWidths) + " lanes");
+      }
+      // A remembered line of points another build's classes made, beside the
+      // first start's tables of the other lane counts: the lane count is not
+      // recalled, so the start forgets the others and measures and remembers
+      // them all. Its costs lie far below any step's, so that a line recalled
+      // in error would pass its level check and keep every table. verify-budget
+      // holds the refusal of a line of a point at no cost.
+      remembered = first;
+      const std::string foreign = "8:8:0.001 16:16:0.001";
+      remembered[1] = foreign;
+      warmups();
+      for (uint32_t lanes = 1; lanes <= kWidths; ++lanes)
+        require(measured(lanes) && remembers[lanes] == 1 && remembered[1] != foreign,
+                "a start that recalled a line of another build's steps did not measure and remember " +
+                    std::to_string(lanes) + " lanes again");
       std::cout << "recalled_step_costs=PASS decode_warmups_seconds=" << recalledSeconds << '\n';
     }
     std::cout << "model_runtime_oracle_test: PASS\n";
