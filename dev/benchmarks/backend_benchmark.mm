@@ -771,6 +771,34 @@ uint32_t parseAneFfnMinimumRows(std::string_view value) {
   return rows;
 }
 
+// --context-lengths: the context and exact scenarios' lengths, ascending
+// token counts separated by commas.
+std::vector<uint32_t> parseContextLengths(std::string_view value) {
+  std::vector<uint32_t> lengths;
+  for (;;) {
+    const size_t comma = value.find(',');
+    const std::string_view length = value.substr(0, comma);
+    uint32_t parsed = 0;
+    const auto [end, error] = std::from_chars(length.data(), length.data() + length.size(), parsed);
+    if (error != std::errc{} || end != length.data() + length.size() || !parsed ||
+        (!lengths.empty() && parsed <= lengths.back()))
+      throw std::invalid_argument("--context-lengths takes ascending token counts");
+    lengths.push_back(parsed);
+    if (comma == std::string_view::npos) return lengths;
+    value.remove_prefix(comma + 1);
+  }
+}
+
+// --short-idle: the seconds the short scenario leaves the engine idle before
+// each prompt, at most an hour.
+double parseShortIdle(std::string_view value) {
+  double seconds = 0.0;
+  const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), seconds);
+  if (error != std::errc{} || end != value.data() + value.size() || !(seconds >= 0.0 && seconds <= 3600.0))
+    throw std::invalid_argument("--short-idle takes seconds from 0 to 3600");
+  return seconds;
+}
+
 // --ane-ffn-share: the prefill FFN's Neural Engine share, in [0, 1).
 double parseAneFfnShare(std::string_view value) {
   double share = 0.0;
@@ -915,13 +943,16 @@ int main(int argc, char **argv) {
       std::cerr << "usage: backend-benchmark METALLIB MODEL_ROOT "
                    "[--samples COUNT] [--progress PATH] "
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
-                   "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
+                   "[--ane-ffn-minimum-rows ROWS]] [--ane-calibration again] [--max-context TOKENS] "
                    "[--activations auto|bf16] [--verify-rows all|auto] "
-                   "[--logits DIR [--logits-from DIR] [--logits-width LANES] [--logits-cache evict|keep]]\n"
+                   "[--logits DIR [--logits-from DIR] [--logits-width LANES] [--logits-cache evict|keep]] "
+                   "[--context-lengths TOKENS[,TOKENS...]] [--short-idle SECONDS]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
                    "to run instead of calibrating one (0: GPU alone)\n"
+                   "  --ane-calibration again: calibrate the split again instead of taking "
+                   "this Mac's record, as serve's --recalibrate-ane\n"
                    "  ROWS: the least rows of a chunk that share takes "
                    "(default: 512)\n"
                    "  TOKENS: the context the engine serves, as serve's "
@@ -937,14 +968,21 @@ int main(int argc, char **argv) {
                    "(default: 1)\n"
                    "  --logits-cache: keep leaves the cache between score requests, so that "
                    "a prefix that extends an earlier one resumes from its KV as a "
-                   "conversation's next turn does (default: evict, each cold)\n";
+                   "conversation's next turn does (default: evict, each cold)\n"
+                   "  TOKENS: the context and exact scenarios' lengths, ascending "
+                   "(default: 2048,10000,50000,128000)\n"
+                   "  SECONDS: how long the short scenario leaves the engine idle before each "
+                   "prompt (default: 0)\n";
       return 2;
     }
     uint32_t samples = 1;
+    double shortIdleSeconds = 0.0;
     BenchmarkScenarios selected;
     std::optional<std::filesystem::path> progressPath;
     std::optional<double> aneFfnShare;
     std::optional<uint32_t> aneFfnMinimumRows;
+    bool recalibrateAne = false;
+    std::vector<uint32_t> contextLengths{2048, 10000, 50000, 128000};
     uint32_t maxContext = 0;
     ops::Int8Activations int8Activations = ops::Int8Activations::On;
     model::VerifyRows verifyRows = model::VerifyRows::All;
@@ -964,6 +1002,10 @@ int main(int argc, char **argv) {
         selected = parseScenarios(argv[index + 1]);
       } else if (option == "--ane-ffn-share") {
         aneFfnShare = parseAneFfnShare(argv[index + 1]);
+      } else if (option == "--ane-calibration") {
+        if (std::string_view(argv[index + 1]) != "again")
+          throw std::invalid_argument("--ane-calibration takes again");
+        recalibrateAne = true;
       } else if (option == "--ane-ffn-minimum-rows") {
         aneFfnMinimumRows = parseAneFfnMinimumRows(argv[index + 1]);
       } else if (option == "--max-context") {
@@ -975,6 +1017,10 @@ int main(int argc, char **argv) {
         if (value != "all" && value != "auto")
           throw std::invalid_argument("--verify-rows takes all or auto");
         verifyRows = value == "all" ? model::VerifyRows::All : model::VerifyRows::Auto;
+      } else if (option == "--context-lengths") {
+        contextLengths = parseContextLengths(argv[index + 1]);
+      } else if (option == "--short-idle") {
+        shortIdleSeconds = parseShortIdle(argv[index + 1]);
       } else if (option == "--logits") {
         logitsDirectory = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits-from") {
@@ -1009,6 +1055,7 @@ int main(int argc, char **argv) {
     config.model = model::servedFor(model::inspectModelRoot(config.modelRoot), maxContext);
     config.buildId = SPLASH_BUILD_ID;
     config.aneFfn = engine::AneFfnSetting::fromGiven(aneFfnShare, aneFfnMinimumRows);
+    config.aneFfn.recalibrate = recalibrateAne;
     config.int8Activations = int8Activations;
     config.verifyRows = verifyRows;
     bootstrapConfig.nativeLoop.engine.maxContext = maxContext;
@@ -1181,7 +1228,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    constexpr std::array<uint32_t, 4> lengths{2048, 10000, 50000, 128000};
+    const std::vector<uint32_t> &lengths = contextLengths;
     // The rolling request, a length's longest, appends this many tokens.
     constexpr uint32_t rollingSuffixTokens = 256;
     std::vector<Measurement> measurements;
@@ -1431,6 +1478,7 @@ int main(int argc, char **argv) {
       for (uint32_t sample = 0; sample < samples; ++sample) {
         for (uint32_t rows : shortRows) {
           evictAllCache(resources->cache());
+          std::this_thread::sleep_for(std::chrono::duration<double>(shortIdleSeconds));
           Measurement result = runRequest(
               engine, driver, *executor, events, progress.get(), requestId++, "short", sample,
               prompt(rows, (uint64_t{rows} << 32 | sample) ^ 0x53484f5254ULL));
