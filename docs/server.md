@@ -323,8 +323,9 @@ than the host's memory leaves the engine when it starts (below); on a Mac that
 also runs other applications, `--max-memory` leaves them room whatever they hold
 later: the automatic expert store and PLE row cache are planned smaller with it.
 The budget caps Metal allocations, not combined process RSS. The context limit
-is the model's native window, 256K tokens for every supported family, when the
-budget holds it beside the weights and, unless `--disable-ane`, the largest
+is the model's native window, 256K tokens for the Qwen families and Flint and
+1,010,000 for Inkling 2, when the budget holds it beside the weights and,
+unless `--disable-ane`, the largest
 [Neural Engine split](internals.md#neural-engine-prefill) a dense model could
 take (none once the Neural Engine refused this Mac's split twice), and
 otherwise as much as the budget holds beside them.
@@ -412,7 +413,9 @@ as Qwen describes for them: the factor is the context over the native window,
 so that the stretched window is the context asked for, such as 2 for
 `--max-context 512K` and about 3.81 for `1M`. Flint's full layers have no RoPE
 to stretch, so its native window is its most, and a longer `--max-context`
-stops its startup. Without `--max-context`, or at 256K or less, YaRN stays off, so
+stops its startup. Inkling 2 has no RoPE either; its own window is 1,048,576
+tokens, and it is served up to Splash's ceiling of 1,010,000. Without
+`--max-context`, or at 256K or less, YaRN stays off, so
 answers and the persistent cache are the native window's. The budget must
 hold the context: about a million tokens of the 27B's int8 KV on a 64 GB Mac,
 more of the 35B's, whose KV per token is a third of the 27B's; where it does
@@ -1237,6 +1240,15 @@ nothing; a reply whose output opens with `<think>` returns that block as its
 reasoning, and any other reply is all answer
 ([chat formats](models.md#chat-formats)).
 
+Inkling 2's template tells the model the effort, `Thinking effort level: 0.9`
+unless the request names one, `0` for `none` and `enable_thinking: false`, and
+appends no generation prompt: the model opens its reasoning itself and decides
+how long it reasons, and at `none` it still reasons, briefly. Its effort
+reaches the model, so `/v1/models` lists its efforts and `--reasoning-effort`
+and `--default-reasoning-effort` set them, but turns nothing on or off:
+`/status` reports `reasoning_switch` `false`, as for Flint, and a client must
+leave room for the reasoning in a request's output limit.
+
 ```sh
 splash serve --model mlx-community/Qwen3.8-27B-4bit --default-reasoning-effort none
 ```
@@ -1263,7 +1275,8 @@ variable. A [thinking token budget](#thinking-token-budget), the server's or a
 request's own, still caps the thinking of a request that thinks: the effort
 says whether and how hard a request thinks, the budget for how long. A model
 that decides itself whether to reason takes no effort, so the server refuses to
-start one, such as Flint, with the option.
+start one, such as Flint, with the option; Inkling 2's model takes the effort
+its template tells it.
 
 `/v1/models` reports, as `reasoning`, what efforts do to the model's default
 template, rendered as at startup: `thinks`, whether a request without an effort
@@ -1361,8 +1374,11 @@ the budget keeps its share of that room, and the answer the rest, a limit past
 the budget plus the room counting as the budget plus the room: a budget of
 24,576 under a limit of 32,768 with 20,000 tokens of context left ends thinking
 at 15,000, and one of 8,192 under a limit of 2,147,483,647 with 122,072 left at
-7,676. A model that opens its thinking itself, as Flint does, never starts
-in one, and a budget caps nothing for it. Where the output may call a tool, a
+7,676. A model that opens its thinking itself, as Flint and Inkling 2 do,
+never starts in one, and a budget caps nothing for it: the family's option
+report (`install/families.py`), which the app reads, lists
+`--thinking-token-budget` and `--thinking-end-text` as acting on none of its
+models. Where the output may call a tool, a
 call's opening ends thinking too, so the end never lands inside a call. The
 engine takes any `<tool_call>` token for that opening, while the reply's
 reasoning ends only where `<tool_call>` is followed by `\n<function=`: a stray

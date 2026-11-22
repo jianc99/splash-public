@@ -67,7 +67,11 @@ std::vector<uint8_t> slice(const std::vector<uint8_t> &bytes, uint64_t offset, u
 // and the embedding's.
 void loadImages(MetalBackend &backend, model::WeightImages &images, const std::filesystem::path &path,
                 const model::QwenTargetDimensions &geometry) {
-  model::GgufTargetLoader loader(backend, images, {path}, architecture(geometry), geometry);
+  const model::GgufTargetPlan plan{geometry.layers, geometry.leadingDenseLayers,
+                                   [&](const model::GgufFile &file, model::gguf::PlanOptions options) {
+                                     return model::gguf::planImages(file, architecture(geometry), geometry, options);
+                                   }};
+  model::GgufTargetLoader loader(backend, images, {path}, plan);
   for (uint32_t layer = 0; layer < geometry.layers; ++layer) static_cast<void>(loader.layer(layer));
   static_cast<void>(loader.head());
   static_cast<void>(loader.embedding());
@@ -495,7 +499,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
                                    {"token_embd.weight", kIQ4_XS}}),
             layout);
   model::WeightImages images(backend, "fixture");
-  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), layout.ggufArchitecture, layout);
+  model::GgufTargetLoader files(backend, images, model::findTargetGgufs(target), model::ggufTargetPlan(layout));
   const model::Qwen3_8Weights weights = model::loadQwen3_8Weights(backend, layout, files);
   check(weights.layers.size() == layout.layers, "GGUF target: every layer");
   check(weights.finalNorm.float32, "GGUF target: F32 final norm");
@@ -516,8 +520,7 @@ void checkDenseTarget(MetalBackend &backend, const std::filesystem::path &direct
     const uint64_t before = backend.memoryStats().allocatedBytes;
     model::WeightImages reserved(backend, "fixture");
     reserved.release();
-    model::GgufTargetLoader planned(backend, reserved, model::findTargetGgufs(target), layout.ggufArchitecture,
-                                    layout);
+    model::GgufTargetLoader planned(backend, reserved, model::findTargetGgufs(target), model::ggufTargetPlan(layout));
     const model::QwenTargetGeometry read =
         model::qwenTargetGeometry(model::loadQwen3_8Weights(backend, layout, planned), captured);
     check(backend.memoryStats().allocatedBytes == before && read.prefillProjections == geometry.prefillProjections &&
@@ -590,7 +593,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   const uint32_t stride = rowBytes(f, windows * K), windowBytes = rowBytes(f, K);
   std::vector<uint8_t> native = fixture(f, shape.rows, windows * K, seed);
   // llama.cpp's NVFP4 without a .scale tensor: g is 1.
-  if (blockNvfp4) setTensorScales(native, NVFP4, windows * K, [](uint32_t) { return 1.0f; });
+  if (blockNvfp4) setTensorScales(native, f, windows * K, [](uint32_t) { return 1.0f; });
   const std::vector<uint8_t> ordered = orderedRows(native, stride, shape.order);
   std::vector<uint8_t> windowRows;
   for (uint32_t window = 0; window < windows; ++window)
@@ -609,7 +612,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   const auto inputPath = directory / "repack-source";
   try {
     std::vector<uint8_t> input(kSourceOffset, 0);
-    const std::vector<uint8_t> stored = blockNvfp4 ? blockNvfp4Rows(native) : native;
+    const std::vector<uint8_t> stored = blockNvfp4 ? blockNvfp4Rows(native, f) : native;
     input.insert(input.end(), stored.begin(), stored.end());
     splash::test::writeFile(inputPath, input);
     model::WeightSource source(inputPath);
@@ -680,6 +683,9 @@ void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory
   checkRepack(backend, directory, Q80, {256, widerThanStaging(Q80), {}, 2}, 743);
   checkRepack(backend, directory, NVFP4, {2048, 512, {}, 2}, 744, true);
   checkRepack(backend, directory, NVFP4, {768, 512, {256, 16, 8, 4}, 3}, 745, true);
+  // llama.cpp's NVFP4 rows that are not whole 256-element blocks (an expert down projection of 1152
+  // inputs) as NVFP4's form of 64-element blocks.
+  checkRepack(backend, directory, NVFP464, {256, 1152, {}}, 746, true);
 }
 
 // The writer's chunk order (model::pipelineChunks), with tickets that record

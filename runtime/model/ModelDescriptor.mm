@@ -235,27 +235,45 @@ struct SizeDifference final {
   size_t matched;
   std::string difference;
 };
-std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
-                                             TargetSource source) {
-  const std::initializer_list<ExpectedNumber> sizes{
-      {"hidden_size", target.hiddenSize},
-      {"num_hidden_layers", target.layers},
-      {"vocab_size", target.vocabularySize},
-      {"max_position_embeddings", target.nativeContextTokens},
-      {"num_attention_heads", target.attentionQueryHeads},
-      {"num_key_value_heads", target.attentionKvHeads},
-      {"head_dim", target.attentionHeadDimension}};
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, std::string_view family, TargetSource source,
+                                             std::initializer_list<ExpectedNumber> sizes) {
   size_t matched = 0;
   for (const ExpectedNumber &size : sizes) {
     const std::string label = std::string("text config ") + size.key;
     NSNumber *value = requireNumber(text[@(size.key)], label);
     if (value.doubleValue != size.value)
       return SizeDifference{matched, label + ": " + std::string(sourceName(source)) + " " +
-                                         value.description.UTF8String + ", " + std::string(target.family) +
-                                         " " + @(size.value).description.UTF8String};
+                                         value.description.UTF8String + ", " + std::string(family) + " " +
+                                         @(size.value).description.UTF8String};
     ++matched;
   }
   return std::nullopt;
+}
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybridLayout &target,
+                                             TargetSource source) {
+  return sizeDifference(text, target.family, source,
+                        {{"hidden_size", target.hiddenSize},
+                         {"num_hidden_layers", target.layers},
+                         {"vocab_size", target.vocabularySize},
+                         {"max_position_embeddings", target.nativeContextTokens},
+                         {"num_attention_heads", target.attentionQueryHeads},
+                         {"num_key_value_heads", target.attentionKvHeads},
+                         {"head_dim", target.attentionHeadDimension}});
+}
+// Inkling-2-Mini's sizes: its weight layers, which its steps run more
+// applications of, and its own window (modelContextTokens, above the context
+// it is served at) at model_max_length, its release config's key, which the
+// config the installer derives states too.
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const Inkling2LoopLayout &target,
+                                             TargetSource source) {
+  return sizeDifference(text, target.family, source,
+                        {{"hidden_size", target.hiddenSize},
+                         {"num_hidden_layers", target.weightLayers},
+                         {"vocab_size", target.vocabularySize},
+                         {"model_max_length", target.modelContextTokens},
+                         {"num_attention_heads", target.attentionQueryHeads},
+                         {"num_key_value_heads", target.attentionKvHeads},
+                         {"head_dim", target.attentionHeadDimension}});
 }
 
 // The target's text configuration, of its family (describeSourceModel), whose
@@ -407,6 +425,75 @@ void validateTextConfig(NSDictionary *text, const FlintLayout &target, TargetSou
     requireEqual(requireString(text, @"hidden_act", "text config hidden_act"), "silu", name, "text config hidden_act");
   for (const char *key : {"attention_bias", "tie_word_embeddings"})
     if (text[@(key)]) requireBooleans(text, "text config", {{key, false}});
+}
+
+// Inkling-2-Mini's text configuration, in its config.json's text_config (its
+// release's, or the one the installer derives from its GGUF), of a GGUF
+// target alone, whose metadata its plan checks (ggufTargetPlan): the sizes
+// (sizeDifference), then the rest as the layout's values make them: its
+// tokens (unpadded_vocab_size), its window and sliding layers
+// (local_layer_ids), its loop (loop_config: its layers, passes and gate
+// rank, the same passes for every token), and the experts a token takes and
+// their width (intermediate_size). Where a config states them (the release's
+// states most, the derived one those its header holds), its sliding heads,
+// relative bias, clips, log scaling, value norm, convolutions, block
+// residual, softcaps, router bias and scale, shared experts (none), stop
+// token, RMS epsilon and bias-free attention; its clip and log-scaling alpha
+// are held as the layout's F32 values, the nearest F32 of the config's.
+void validateTextConfig(NSDictionary *text, const Inkling2LoopLayout &target, TargetSource source) {
+  const std::string_view name = sourceName(source);
+  if (source != TargetSource::Gguf)
+    throw std::invalid_argument(std::string(target.family) + " loads from a GGUF, not a " + std::string(name) +
+                                " checkpoint");
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  requireNumbers(text, name, "text config",
+                 {{"unpadded_vocab_size", target.vocabularyTokens},
+                  {"sliding_window_size", target.slidingWindow},
+                  {"num_experts_per_tok", target.expertsPerToken},
+                  {"intermediate_size", target.expertIntermediateSize}});
+  std::vector<uint32_t> sliding;
+  for (uint32_t layer = 0; layer < target.weightLayers; ++layer)
+    if (target.slides(layer)) sliding.push_back(layer);
+  requireWholes(requireArray(text, @"local_layer_ids", "text config local_layer_ids"), sliding, name,
+                "text config local_layer_ids");
+  NSDictionary *loop = requireObject(text, @"loop_config", "text config loop_config");
+  requireNumbers(loop, name, "text config loop_config",
+                 {{"core_start", target.loopFirstLayer},
+                  {"core_end", target.loopEndLayer},
+                  {"num_passes", target.loopPasses},
+                  {"gate_rank", target.loopGateRank}});
+  if (loop[@"is_varloop"]) requireBooleans(loop, "text config loop_config", {{"is_varloop", false}});
+  for (const ExpectedNumber &stated : {ExpectedNumber{"swa_head_dim", target.attentionHeadDimension},
+                                       ExpectedNumber{"swa_num_attention_heads", target.attentionQueryHeads},
+                                       ExpectedNumber{"swa_num_key_value_heads", target.attentionKvHeads},
+                                       ExpectedNumber{"d_rel", target.relativeRank},
+                                       ExpectedNumber{"rel_extent", target.relativeExtent},
+                                       ExpectedNumber{"rel_l2_clip_threshold", target.relativeClip},
+                                       ExpectedNumber{"log_scaling_n_floor", target.logScalingFloor},
+                                       ExpectedNumber{"sconv_kernel_size", target.convolutionTaps},
+                                       ExpectedNumber{"n_layers_per_attn_res_block", target.blockResidualPeriod},
+                                       ExpectedNumber{"mlp_gate_softcap", target.expertGateSoftcap},
+                                       ExpectedNumber{"mlp_up_softcap", target.expertUpSoftcap},
+                                       ExpectedNumber{"final_logit_softcapping", target.logitSoftcap},
+                                       ExpectedNumber{"route_scale", target.expertRoutedScale},
+                                       ExpectedNumber{"n_shared_experts", target.sharedExpertSlices},
+                                       ExpectedNumber{"eos_token_id", target.stopTokens.ids[0]},
+                                       ExpectedNumber{"rms_norm_eps", SPLASH_RMS_EPSILON}})
+    if (text[@(stated.key)]) requireNumbers(text, name, "text config", {stated});
+  for (const auto &[key, expected] : {std::pair{"qk_l2_clip_threshold", target.queryClip},
+                                      std::pair{"log_scaling_alpha", target.logScalingAlpha}}) {
+    if (!text[@(key)]) continue;
+    const std::string label = std::string("text config ") + key;
+    NSNumber *number = requireNumber(text[@(key)], label);
+    if (number.floatValue != expected)
+      throw std::invalid_argument(label + " mismatch: " + std::string(name) + " " + number.description.UTF8String +
+                                  ", runtime " + @(expected).description.UTF8String);
+  }
+  for (const auto &[key, expected] : {std::pair{"use_value_norm_no_gamma", true},
+                                      std::pair{"attn_res_normalize_values", true},
+                                      std::pair{"use_gate_bias", true}, std::pair{"q_bias", false},
+                                      std::pair{"o_bias", false}})
+    if (text[@(key)]) requireBooleans(text, "text config", {{key, expected}});
 }
 
 // The mask token a DFlash2 draft of a family whose drafts choose theirs
@@ -696,10 +783,10 @@ template <class Layout> void requireQuantization(NSDictionary *config, const Lay
 
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
 // window, convolutions and selector must be those the draft kernels are built
-// for, and its block at least their rows; its hidden size, vocabulary and
-// mask token the target's; and the target layers it reads (target_layer_ids)
-// some of the target's, ascending. Its layers, intermediate size and rotary
-// base are its own.
+// for, and its block at least their rows; its hidden size, vocabulary, mask
+// token, the finish of its logits and how it reads its target the target's;
+// and the target layers it reads (target_layer_ids) some of the target's,
+// ascending. Its layers, intermediate size and rotary base are its own.
 DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimensions &target) {
   NSArray *architectures =
       requireArray(draft, @"architectures", "draft architectures");
@@ -718,6 +805,12 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {{"is_causal", false},
                    {"attention_bias", false},
                    {"tie_word_embeddings", false}});
+  // The count of target layers its ids number, where its config states it
+  // (num_target_layers): its target's, so that its ids name the target's
+  // layers (a draft numbered by another count, such as Inkling 2's weight
+  // layers beside its 48 applications, would read other rows).
+  if (draft[@"num_target_layers"])
+    requireNumbers(draft, "checkpoint", "draft config", {{"num_target_layers", target.layers}});
   requireEqual(requireString(draft, @"hidden_act", "draft config hidden_act"),
                "silu", "checkpoint", "draft config hidden_act");
   NSDictionary *rope =
@@ -733,6 +826,11 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
                   {"selector_rank", SPLASH_DRAFT_SELECTOR_RANK},
                   {"selector_top_k", SPLASH_DRAFT_CANDIDATES},
                   {"mask_token_id", target.maskToken}});
+  // Scales the draft kernels do not take, 1 where a config states them: its
+  // logits' multiplier before any softcap (output_multiplier) and its token
+  // rows' scale (input_embedding_scale).
+  for (const char *scale : {"output_multiplier", "input_embedding_scale"})
+    if (flash[@(scale)]) requireNumbers(flash, "checkpoint", "draft config dflash_config", {{scale, 1.0}});
   // The block it was trained to fill: the kernels' rows or more, of which a
   // cycle drafts the first (Ornith-1.5-122B's fills 16). Its weights have no
   // part of the block's length.
@@ -749,14 +847,42 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   if (flash[@"target_hidden_reduction"])
     requireEqual(requireString(flash, @"target_hidden_reduction", "draft config target_hidden_reduction"),
                  reduction, "checkpoint", "draft config dflash_config target_hidden_reduction");
+  // Its rows of its own tokens as they were made (embedding_normalization):
+  // the token table's rows through their norm where its target's first layer
+  // reads them so (QwenTargetDimensions::draftEmbeddingNorm), which its config
+  // then states, else as stored.
+  if (target.draftEmbeddingNorm || flash[@"embedding_normalization"])
+    requireEqual(requireString(flash, @"embedding_normalization", "draft config embedding_normalization"),
+                 target.draftEmbeddingNorm ? "folded_rmsnorm" : "none", "checkpoint",
+                 "draft config dflash_config embedding_normalization");
+  // Its head's finish, its target's (QwenTargetDimensions::logitSoftcap and
+  // vocabularyTokens), stated where its target has one: the softcap, which
+  // its selector's scores take after their edges (selector_softcap_mode
+  // after_correction, the one placement the selector runs), and its tokens
+  // (valid_vocab_size).
+  if (target.logitSoftcap != 0.0F || flash[@"final_logit_softcapping"]) {
+    requireNumbers(flash, "checkpoint", "draft config dflash_config",
+                   {{"final_logit_softcapping", target.logitSoftcap}});
+    requireEqual(requireString(flash, @"selector_softcap_mode", "draft config selector_softcap_mode"),
+                 "after_correction", "checkpoint", "draft config dflash_config selector_softcap_mode");
+  }
+  if (target.tokens() != target.vocabularySize || flash[@"valid_vocab_size"])
+    requireNumbers(flash, "checkpoint", "draft config dflash_config", {{"valid_vocab_size", target.tokens()}});
+  // The ids of the rows it reads (QwenTargetDimensions::draftReadsLayerInputs):
+  // a target layer's output rows, or the rows passed into a layer, the id
+  // past the target's layers its final norm's rows, which its config then
+  // states it reads (capture_final_norm).
   NSArray *ids = requireArray(flash, @"target_layer_ids", "draft config target_layer_ids");
   std::vector<uint32_t> targetLayers;
   for (id value : ids) {
     targetLayers.push_back(
         requireWhole(value, "draft config target_layer_ids " + std::to_string(targetLayers.size())));
-    if (targetLayers.back() >= target.layers)
+    if (targetLayers.back() >= target.draftReadableLayers())
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
   }
+  const bool finalNorm = !targetLayers.empty() && targetLayers.back() == target.layers;
+  if (finalNorm || flash[@"capture_final_norm"])
+    requireBooleans(flash, "draft config dflash_config", {{"capture_final_norm", finalNorm}});
   const DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,
                   requireWhole(draft[@"num_hidden_layers"], "draft config num_hidden_layers"),
@@ -910,7 +1036,7 @@ bool ModelDescriptor::valid() const noexcept {
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
                layout.hiddenSize == draft.hiddenSize &&
                draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+               draft.targetLayers[draft.targetLayerCount - 1] < layout.draftReadableLayers() &&
                // A family whose drafts choose the mask token holds its draft's.
                (!layout.draftChoosesMaskToken() ||
                 (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
@@ -988,7 +1114,7 @@ std::string_view inspectSourceConfiguration(std::string_view targetFormat, std::
       const OpenGguf headers(findTargetGgufs(*ggufHeaders), GgufContents::Headers);
       std::visit(
           [&](const auto &layout) {
-            static_cast<void>(gguf::planImages(headers.file(), layout.ggufArchitecture, layout));
+            static_cast<void>(ggufTargetPlan(layout).images(headers.file(), {}));
           },
           descriptor.target);
     }

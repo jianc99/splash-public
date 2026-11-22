@@ -29,9 +29,10 @@ and model-card `base_model` fields play no part. Families of one model type,
 Qwen3.6-35B-A3B and Qwen3.5-122B-A10B (`qwen3_5_moe_text`, GGUF `qwen35moe`),
 are told apart by their sizes, and a fine-tune of either, such as
 Ornith-1.5-35B-A3B or Ornith-1.5-122B, is its family. A layout type
-(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp` in
-`runtime/model/`) is an architecture, whose code its families share, and each
-family is a value of it in one list, `model::kFamilies` (`ModelDescriptor.hpp`):
+(`Qwen3_8.hpp`, `Qwen3_6Moe.hpp`, `Qwen4Exp.hpp`, `Flint.hpp`,
+`Inkling2Loop.hpp` in `runtime/model/`) is an architecture, whose code its
+families share, and each family is a value of it in one list,
+`model::kFamilies` (`ModelDescriptor.hpp`):
 another size of an architecture is one more value there, built by the
 constructor from a `QwenHybridLayout` its layout type gains with its second
 family (as `Qwen3_6MoeLayout`'s builds `kQwen3_5_122BLayout`), its draft in
@@ -46,6 +47,21 @@ reads only for a model type whose configs are flat (a layout type's
 Flint's values key by key (its widths, router, window, `layer_types`,
 `no_rope_layer_indices`, `mlp_only_layers` and `eos_token_id`; `softmax_type`,
 `rope_theta` and the rest where it states them).
+Inkling 2's layout states the dimensions the shared runtime runs on as the
+layers a step runs, one per layer application (48: its 24 weight layers, the
+loop's twelve three times), and keeps its weight layers, its loop and the
+mapping of an application to its weight layer in its own members
+(`Inkling2LoopSchedule`); its layers attend through its own operator, not the
+shared attention (a layout type's `sharedAttention`), so the kernel tests'
+attention shapes leave it out. It is served up to Splash's serving ceiling,
+1,010,000 tokens, below its own window of 1,048,576. It loads from a GGUF
+alone; its configuration, under `text_config`, is held to its values key by
+key (its weight layers, its own window at `model_max_length`,
+`unpadded_vocab_size`, `local_layer_ids`, `loop_config`, its experts' width;
+the relative bias, clips, softcaps, routing and the rest where it states
+them), its clip and log-scaling alpha as F32 values. Its vocabulary keeps
+no mask token: its draft reads its last unused special token,
+`<|unused_200056|>` ([Drafts](#drafts)).
 An MLX target must declare `quantization` in `config.json` in formats it loads
 ([MLX targets](#mlx-targets)). Every start checks the configuration again.
 Remote Python code is not loaded.
@@ -168,7 +184,9 @@ have it (`ffn_gate_exps.weight (Q8_1) in 40 layers`). The types it accepts:
 
 - linears and experts: Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_0, Q4_0, Q4_1,
   Q5_0, Q5_1, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS,
-  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16;
+  IQ4_NL, MXFP4, NVFP4, PQ2_0, Q2_0, BF16 or F16; a tensor of a format of
+  256-value blocks (the K-quants, BF16, F16) whose rows are not whole blocks
+  of it, such as a BF16 expert tensor of 1152 inputs, is refused by name;
 - token embeddings: any of the linears' formats;
 - norms: F32, BF16 or F16, loaded as the F32 values they hold;
 - the MoE router: F32, BF16 or any of the linears' quantized formats (not
@@ -203,6 +221,35 @@ unsloth's), the IDs of Flint's stop tokens in its vocabulary, each a control
 token, one of them its EOS; the engine's check holds each to the family's,
 and the header's layer patterns to them. The token table must be of a format:
 RecursiveSI's int4 GGUF, whose table is F32, is refused before its download.
+
+Inkling 2's GGUFs (`inkling2_loop`) state their head counts once per layer,
+which every layer must share. Their derived configuration holds the text model
+under `text_config`, as Inkling 2's config.json does, with the keys of that
+`text_config` the header states (`gguf.inkling2_text_config`): every size, the
+vocabulary padded to the token table's rows (`vocab_size`) and its tokens
+(`unpadded_vocab_size`, which must be the tokenizer's), the relative bias
+(`d_rel` from `attention.relative_length`, `rel_extent`), the full layers'
+log scaling, the clips, `local_layer_ids` from
+`attention.sliding_window_pattern` with the window and heads of those layers,
+`sconv_kernel_size` from `shortconv.l_cache`, `n_layers_per_attn_res_block`
+from `attn_res.block_size`, the logits' and the experts' softcaps
+(`mlp_gate_softcap` and `mlp_up_softcap` from `activation.situ_beta` and
+`situ_linear_beta`), the experts each token takes, their width and
+`route_scale` from `expert_weights_scale`, and `loop_config` from the `loop`
+keys; besides those, the sizes every family's configuration states
+(`max_position_embeddings`, `num_experts`) and `eos_token_id`, which the
+release states beside `text_config`. A float is the shortest decimal of the
+header's float32 (`1e-06`), as the release writes it.
+`unsloth/Inkling-2-Mini-GGUF` keeps these GGUFs in `Mainline_Support/` with
+the extension `.gguf_file`, which target selection does not read: such a file
+installs from a local copy named `.gguf` ([Local model
+files](#local-model-files)). An installation of one holds its draft,
+`incoai-internal/Inkling-2-Mini-DFlash2`, an internal preview that installs
+with a Hub token that reads it or from a local copy (`--draft-model`,
+[Drafts](#drafts)), and serves text only ([Vision](#vision)). Its states are
+captured in prefill alone ([Replay points and
+checkpoints](internals.md#replay-points-and-checkpoints)), so a conversation's
+next turn finds its earlier prompts in the cache but prefills each reply again.
 
 A split GGUF is the parts of one name, `NAME-0000K-of-0000N.gguf`: every part
 from 1 to N must be present, at the root or in its folder, and a folder that
@@ -272,7 +319,12 @@ values as `.scale`) plays no part, as in Model Optimizer's targets; beside any
 other weight, or alone, it is refused. It loads as Model Optimizer's NVFP4 does
 ([Model Optimizer targets](#model-optimizer-targets)): four blocks make one
 256-element NVFP4 block, whose meta unit holds the `.scale` value as its `g`
-(1 without one), at 4.625 bits per weight for the file's 4.5.
+(1 without one), at 4.625 bits per weight for the file's 4.5. A tensor whose
+rows are not whole 256-element blocks (llama.cpp writes any multiple of 64,
+an expert down projection of 1152 inputs among them) loads in NVFP4's form of
+64-element blocks instead (`nvfp464`): each block's four E4M3 scales and `g`
+make its meta unit, which spans two 32-input groups, at 5 bits per weight;
+every tile that takes the formats' list takes it.
 
 Q2_0 is GGUF tensor type 42, `block_q2_0`, as in the GSQ-RCO GGUFs:
 2-bit codes q worth d (q - 1) with one half d per 64 weights. Its planes are
@@ -315,7 +367,7 @@ configuration with the target's (its `model-check`), so a draft of another
 architecture never replaces one that loads.
 
 A draft's `config.json` states its layers, intermediate size, rotary base and
-the target layers whose outputs it reads (`dflash_config.target_layer_ids`,
+the target layers whose rows it reads (`dflash_config.target_layer_ids`,
 ascending, at most eight); its hidden size, vocabulary and mask token are its
 target's (Flint's vocabulary keeps no mask token: a Flint draft chooses one of
 its reserved special tokens, 150019 to 150143, as its
@@ -325,7 +377,30 @@ its reserved special tokens, 150019 to 150143, as its
 those the kernels are built for, and its block at least their 8 rows, of which a
 cycle drafts the first (the Qwen3.5-122B-A10B draft was trained to fill 16;
 `readDraftLayout` in `ModelDescriptor.mm`); the kernels take any hidden width of
-whole 16-channel convolution groups. A draft's rows after its anchor read the
+whole 16-channel convolution groups. How a draft reads its target is its
+target's family's, as its drafts' producer captured it
+(`QwenTargetDimensions`): at each id the rows that target layer writes, or, for
+a family whose drafts read layer inputs (`draftReadsLayerInputs`), the rows
+passed into the layer, as the layer before wrote them, and at the id past its
+layers the final norm's rows the head reads
+(`dflash_config.capture_final_norm`); and its own rows, its anchor's and its
+mask's, are the token table's rows as the target's first layer reads them,
+through the table's norm where the family's input takes one (`draftEmbeddingNorm`,
+`embedding_normalization` `folded_rmsnorm`). Inkling 2's drafts read layer
+inputs, as its producer captures its block residual's partial sum before each
+layer application, with no shift by one: its draft's ids 5, 23 and 41 read the
+rows passed into those applications, the outputs of applications 4, 22 and 40
+(not the mixes of the block residual their norms read), and 48 its final
+norm's; their own rows take its table's norm. Its logits take the finish of its
+target's head (`QwenTargetDimensions::logitSoftcap` and `vocabularyTokens`,
+`DFlashDraft`): no padding row past the head's tokens is a candidate
+(`dflash_config.valid_vocab_size`), and the head's softcap
+(`final_logit_softcapping`) applies to each candidate's score after the
+selector's edge (`selector_softcap_mode` `after_correction`, the one placement
+the selector runs), before the probabilities its tree and a sampled verify
+read; a config states each where its target's head has one (Inkling 2's:
+200,058 tokens of 201,024 rows, and a softcap of 30).
+A draft's rows after its anchor read the
 target's token table row of the mask token, unless its release ships that
 token's BF16 embedding, which they read instead (`DFlashDraft::addMaskRows`):
 `mask_embedding.safetensors`, one tensor `mask_embedding` of the hidden size.
@@ -500,10 +575,10 @@ different text from run to run, even alone on an idle server
 cycle verifies a draft's block a lane whatever output its lanes have left, which caps only what they
 retain, so that an answer under a lower output limit starts the one under a higher. The speculation counts ([Output limits and
 streaming](api.md#output-limits-and-streaming)) count the proposals a cycle verified.
-The target writes the outputs of the layers the draft reads for each row it
-reads; Qwen3.8-Flash-Next's, whose layers carry four hyper-connection streams,
-as the streams' mean, summed in fp32 and stored as bf16, as the draft was
-trained on it. `dflash_config.target_hidden_reduction` states that reduction
+The target writes the rows of the layers the draft reads, as its family names
+them, for each row it reads; Qwen3.8-Flash-Next's, whose layers carry four
+hyper-connection streams, as the streams' mean, summed in fp32 and stored as
+bf16, as the draft was trained on it. `dflash_config.target_hidden_reduction` states that reduction
 (`stream_mean` for a hyper-connected target, `none` for another); a config
 without it takes its target's, and one that names another is refused. Native
 loading validates the configuration against the target again and loads the draft
@@ -516,7 +591,10 @@ target's projections run on.
 
 The draft's logits are its target's vocabulary head's, which a cycle runs twice,
 for the draft's proposals and for the target's verify; the draft's pass reads
-only the head's rows of the tokens it may propose (`DFlashDraft`). The Qwen
+the head's rows of the tokens it may propose (`DFlashDraft`), a padded head's
+rows past its tokens too, which its logits leave out (Inkling 2's 966: its
+200,058 tokens end inside a 64-row tile of the head, and the last tile's 58
+tokens hold its chat format's message tags, which its drafts propose). The Qwen
 families' vocabulary of 248,320 holds English and code first, Chinese from
 95,726 to 148,274, then its other scripts, and its chat, tool and thinking
 tokens from 248,044: a step's draft proposes from its first 148,288 tokens and
@@ -556,8 +634,9 @@ BF16. The processor configuration (MLX `preprocessor_config.json`, or the
 releases save it; the GGUF's `clip.vision` metadata) must describe the one
 preprocessing Splash implements (`server/images.py`); it is checked before any
 weight download and not installed. The models of a family without a vision
-tower (Flint; `vision` in `install/families.py`) serve text only: their
-installation reads no projector, with or without `--language-only`.
+tower (Flint; `vision` in `install/families.py`), or whose tower Splash does
+not serve yet (Inkling 2), serve text only: their installation reads no
+projector, with or without `--language-only`.
 
 Both sources are written into one image, which the one BF16 vision operator
 reads: BF16 tensors are
@@ -599,8 +678,10 @@ ranks, control/user-defined token types, BOS/EOS/padding IDs and template text
 come from that file; the supported profiles supply the pre-tokenization
 algorithms: `gpt2/qwen35` NFC and Qwen's split, `gpt2/flint` Flint's three
 splits (digits in runs of up to three, runs of Han and kana, then o200k's
-pattern) without a normalizer, each before byte-level BPE, as the release's
-own tokenizer.json has them. Unknown profiles, malformed metadata
+pattern) without a normalizer, `gpt2/inkling2` o200k's pattern alone without a
+normalizer, its BPE taking a piece its vocabulary holds whole as that token
+before any merge (`ignore_merges`), each before byte-level BPE, as the
+release's own tokenizer.json has them. Unknown profiles, malformed metadata
 and automatic BOS/EOS insertion are rejected, with no cross-repository
 fallback; GGUF sidecar tokenizer/config files do not override embedded metadata.
 Model geometry is translated from the same metadata, subtracting any declared
@@ -757,20 +838,49 @@ format of the family its installation found, which the assembly records:
   `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value></tool_call>`,
   each tag a token; `<|end_of_text|>`, `<|user|>`, `<|observation|>` and
   `<|developer|>` stop.
+- Inkling 2's (`INKLING2`): the template appends no generation prompt, and the
+  model opens each of its messages itself, `<|message_model|>`, a content kind
+  and its text, closed by `<|end_message|>`: reasoning in
+  `<|content_thinking|>` blocks, which may come again after text, the answer in
+  `<|content_text|>` blocks (a `<|content_tool_error|>` or
+  `<|content_invoke_tool_text|>` block is the answer's too), every tag a
+  special token; calls are a JSON object in the model's message named for the
+  function (`INKLING2_JSON`),
+  `<|message_model|>NAME<|content_invoke_tool_json|>{"name":NAME,"args":{...}}<|end_message|>`;
+  `<|content_model_end_sampling|>` stops.
 
 A format holds the model's vocabulary and the engine's stop tokens, which are
-its target layout's; the tokens of `</think>`, of `<think>` where the model
-opens its reasoning itself, and of `<tool_call>`; the call syntax; and the
+its target layout's; the tags that open and close its reasoning (`<think>` and
+`</think>` for Qwen and Flint), with their tokens where the model opens its
+reasoning itself, and those that frame its answer's text where it has any;
+the call syntax, with the tags a call opens and closes with and the token of
+its opening, its arguments either tags around each argument or one JSON
+object; whether the model opens its own message; the special tokens decoding
+keeps in the text it reads (`visible_tags`: Inkling 2's tags, every other
+special token, its stop token among them, decoding to nothing); and the
 special token after which prompt tokenization reuses a cached prompt's tokens,
-`<|im_end|>` or `<|assistant|>`. Startup checks that the tokenizer encodes each
-as the format has it, and that it can keep its added tokens out of a request's
-text ([tokenizer and chat templates](#tokenizer-and-chat-templates)). Grammars
-write reasoning and calls as the format lays
+`<|im_end|>`, `<|assistant|>` or `<|end_message|>`. Startup checks that the
+tokenizer encodes each as the format has it, and that it can keep its added
+tokens out of a request's text ([tokenizer and chat
+templates](#tokenizer-and-chat-templates)). Grammars write reasoning and calls
+as the format lays
 them out: Flint's optional think block may come before any constrained output,
 and its tags, which the grammar compiler takes as tokens rather than text, are
 written as their tokens. A model that opens its reasoning itself closes it
 before a call, so a `<tool_call>` inside its think block is reasoning, as
-Flint's own parser reads it.
+Flint's own parser reads it. A call of JSON arguments streams them as the
+model writes them, after the object's name, and its grammar writes them to
+the tool's schema as JSON; where the format frames the answer's text, a
+grammar's text and JSON answer are written in that frame.
+
+Inkling 2's template renders as shipped, and tells the model the request's
+effort in a system message before the first message that is not one
+(`Thinking effort level: 0.9` unless the request names one; none and
+`enable_thinking: false` render 0): `/v1/models` lists its efforts, and
+`--reasoning-effort` sets every request's. A thinking budget caps only
+reasoning the generation prompt opens, so it caps nothing here, as for Flint.
+Reasoning the model writes after text stays where it is in Messages and
+Responses, and joins the rest in Chat Completions' `reasoning_content`.
 
 Flint's template renders as shipped: its roles, the tools block it adds before
 the first message that is not a system message, each assistant turn's
